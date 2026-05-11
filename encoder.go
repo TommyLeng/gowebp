@@ -402,25 +402,11 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 				}
 			}
 
-			// Compare i16 vs i4 using post-quantization distortion.
-			// Both scores are: SSD + lambdaI4 * approximate_mode_bits.
-			//
-			// i16: distortion + lambdaI4 * i16ModeBits
-			//   i16ModeBits: DC=1, VE=2, HE=2, TM=2 (raw bits, approximate)
-			//
-			// i4: bestI4Score already uses lambdaI4 scale for sub-block mode bits.
-			//   Add 1 bit for MB type encoding: + lambdaI4 * 1
-			//
-			// Note: no additional i4_penalty here — that is only in RefineUsingDistortion
-			// (low-quality path). PickBestIntra4 does not add i4_penalty.
-			//
-			// RD decision: compare i4 vs i16.
-			// Mirrors libwebp PickBestIntra4 vs PickBestIntra16:
-			//   i16 score = post-quant distortion + lambdaI16 * i16 header bits
-			//   i4 score  = bestI4Score (distortion + lambdaI4 * block mode bits)
-			//               + lambdaMode * 211 (MB-level header cost)
-			// lambdaI16 >> lambdaI4 >> lambdaMode, so at high quality i4 wins
-			// almost always when its distortion is comparable to i16.
+			// MB-level RD decision: compare i4 vs i16.
+			// i16Score uses lambdaI16 (large) which inflates the bit-cost term,
+			// biasing the comparison toward i4. This matches libwebp's intent:
+			// at high quality, i4 wins whenever its distortion is comparable to
+			// i16, resulting in better compression for natural images.
 			i16Score := i16PostQuantDistortion + int64(lambdaI16)*i16ModeBitCost(bestI16Mode)
 			i4HeaderCost := int64(lambdaMode) * 211
 			i4Score := bestI4Score + i4HeaderCost

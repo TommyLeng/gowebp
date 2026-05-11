@@ -78,13 +78,19 @@ Encode()
 
 ## Known hacks & tech debt
 
-### Lambda asymmetry (`encoder.go:41–52`)
-RD mode selection uses different lambda scales for i4 vs i16:
-- `lambdaI4 = (3 * q * q) >> 7` — small, so i4 wins easily on fine detail
-- `lambdaI16 = 3 * q * q` — large, heavily penalises i16 bit cost
+### Remaining size gap vs libwebp (`encoder.go`)
+gowebp produces ~13.5kb vs cwebp ~12kb (+12.5%) at quality=90 on 300×300 photo.
 
-These constants were empirically tuned to achieve 12.3kb output. Not derived from
-libwebp's approach. Could be improved by studying `VP8Decimate` more carefully.
+Lambda values are correct — `lambdaI4`, `lambdaI16`, `lambdaMode` all match
+libwebp's `SetupMatrices()` exactly. The i16/i4 comparison intentionally biases
+toward i4 (because lambdaI16 inflates i16Score), which improves compression for
+natural images (verified: changing to lambdaMode scale makes files larger, not smaller).
+
+**Actual root causes of the size gap (unimplemented):**
+1. **Coefficient probability adaptation** — we use fixed `default_coeff_probs`;
+   libwebp adapts after each frame, reducing arithmetic coding cost.
+2. **Trellis quantization** — libwebp's `VP8TrellisQuantizeBlock` refines
+   coefficient levels post-DCT to minimise actual entropy cost; we do not.
 
 ### Debug test files (safe to delete)
 21 test files exist. Most were created to diagnose bugs during development and are
@@ -114,11 +120,12 @@ no longer needed. The ones worth keeping:
 
 1. ~~**Update Go version to 1.25.10**~~ ✅ done
 2. ~~**Fix red colour bias**~~ ✅ fixed: UV DC prediction now uses reconstructed UV, not original samples
-3. **Clean up debug test files** — delete the ❌ ones above
+3. ~~**Clean up debug test files**~~ ✅ done: 16 one-off debug test files removed
 4. ~~**Speed optimisation** — SAD pre-screening~~ ✅ done: top-4 SAD candidates per i4 block, ~2.5× i4 speedup
 5. ~~**Fix quality remapping**~~ ✅ done: quality-4 hack removed; quality=90 now honest
-6. **EncodeAll / animation** — lossless subpackage has it; lossy does not
-7. **Decode support** — currently only encode; could wrap `golang.org/x/image/webp`
+6. **Reduce size gap vs libwebp** — implement coefficient probability adaptation and/or trellis quantization (see Known hacks section)
+7. **EncodeAll / animation** — lossless subpackage has it; lossy does not
+8. **Decode support** — currently only encode; could wrap `golang.org/x/image/webp`
 
 ## Performance (Apple M1 Max)
 
