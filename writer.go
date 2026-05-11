@@ -46,12 +46,12 @@ func encodeLossy(w io.Writer, img image.Image, quality int) error {
 	// Convert to YUV 4:2:0
 	yuv := rgbaToYUV420(img)
 
-	// Build quantization matrices from internal quality
-	qm := buildQuantMatrices(internalQuality)
+	// Compute base quantizer index; per-MB quantizers are determined inside encodeFrame
+	// via the SNS two-segment scheme (computeSNSSegmentQualities).
 	baseQ := qualityToLevel(internalQuality)
 
 	// Encode the VP8 frame
-	vp8Data := encodeFrame(yuv, qm, baseQ)
+	vp8Data := encodeFrame(yuv, baseQ)
 
 	// Write WebP container
 	return writeWebPHeader(w, vp8Data)

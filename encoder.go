@@ -10,34 +10,39 @@ type mbInfo struct {
 	i16Mode int       // if !isI4: intra16 mode (0..3)
 	i4Modes [16]int   // if isI4: per 4x4 block mode (0..9), scan order
 	uvMode  int       // UV prediction mode (0=DC, 1=VE, 2=HE, 3=TM — libwebp order)
+	segment int       // segment ID (0=coarse/smooth, 1=fine/textured) for SNS
 }
 
-// encodeFrame encodes a YUV image into a VP8 bitstream.
-// Returns the raw VP8 bytes (frame header + partition0 + token partition).
-// Phase 2: per-MB RD selection between intra16 (4 modes) and intra4 (10 modes).
-func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
-	w := yuv.width
-	h := yuv.height
-	// mbW/mbH come from the padded yuvImage so they match the YUV plane dimensions.
-	mbW := yuv.mbW / 16
-	mbH := yuv.mbH / 16
+// segmentParams holds per-segment quantizer matrices and associated lambda values.
+type segmentParams struct {
+	qm              quantMatrices
+	baseQ           int
+	lambdaI4        int
+	lambdaI16       int
+	lambdaMode      int
+	lambdaTrellisI4  int
+	lambdaTrellisI16 int
+	lambdaTrellisUV  int
+	trellisI4Costs  trellisCostTables
+	trellisI16Costs trellisCostTables
+	trellisUVCosts  trellisCostTables
+}
 
-	// Lambda for RD scoring mirrors libwebp SetupMatrices():
-	//   q_i4  = ExpandMatrix(y1)  = average of all 16 y1.q values
-	//   q_i16 = ExpandMatrix(y2)  = average of all 16 y2.q values
-	//   lambda_i4  = (3 * q_i4  * q_i4 ) >> 7
-	//   lambda_i16 = (3 * q_i16 * q_i16)        (no shift)
-	//   lambda_mode = (1 * q_i4 * q_i4) >> 7    (for MB-level i4 vs i16 decision)
-	//
-	// We use lambda_mode for the MB-level decision (same as libwebp PickBestIntra4
-	// which calls SetRDScore(dqm->lambda_mode, &rd_best) before comparing to rd->score).
-	var y1qSum, y2qSum int
+// makeSegmentParams builds a segmentParams for a given quality level.
+func makeSegmentParams(quality int) segmentParams {
+	qm := buildQuantMatrices(quality)
+	q := qualityToLevel(quality)
+
+	var y1qSum, y2qSum, uvqSum int
 	for i := 0; i < 16; i++ {
 		y1qSum += int(qm.y1.q[i])
 		y2qSum += int(qm.y2.q[i])
+		uvqSum += int(qm.uv.q[i])
 	}
 	qI4 := (y1qSum + 8) >> 4
 	qI16 := (y2qSum + 8) >> 4
+	qUV := (uvqSum + 8) >> 4
+
 	lambdaI4 := (3 * qI4 * qI4) >> 7
 	if lambdaI4 < 1 {
 		lambdaI4 = 1
@@ -46,22 +51,10 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 	if lambdaI16 < 1 {
 		lambdaI16 = 1
 	}
-	// lambdaMode is used for MB-level i4 vs i16 decision, same scale as i4
 	lambdaMode := (1 * qI4 * qI4) >> 7
 	if lambdaMode < 1 {
 		lambdaMode = 1
 	}
-
-	// Trellis quantization lambdas (libwebp SetupMatrices()):
-	//   lambda_trellis_i4  = (7 * q_i4  * q_i4)  >> 3
-	//   lambda_trellis_i16 = (q_i16 * q_i16) >> 2
-	//   lambda_trellis_uv  = (q_uv  * q_uv)  << 1
-	//   DO_TRELLIS_UV = 0 in libwebp, but we keep UV trellis as it saves bytes.
-	var uvqSum int
-	for i := 0; i < 16; i++ {
-		uvqSum += int(qm.uv.q[i])
-	}
-	qUV := (uvqSum + 8) >> 4
 	lambdaTrellisI4 := (7 * qI4 * qI4) >> 3
 	if lambdaTrellisI4 < 1 {
 		lambdaTrellisI4 = 1
@@ -74,11 +67,69 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 	if lambdaTrellisUV < 1 {
 		lambdaTrellisUV = 1
 	}
-	// Precompute level cost tables for trellis quantization.
-	// Built once from defaultCoeffProbs and reused for all blocks in the frame.
-	trellisI4Costs := buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]))
-	trellisI16Costs := buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0]))
-	trellisUVCosts := buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2]))
+
+	return segmentParams{
+		qm:               qm,
+		baseQ:            q,
+		lambdaI4:         lambdaI4,
+		lambdaI16:        lambdaI16,
+		lambdaMode:       lambdaMode,
+		lambdaTrellisI4:  lambdaTrellisI4,
+		lambdaTrellisI16: lambdaTrellisI16,
+		lambdaTrellisUV:  lambdaTrellisUV,
+		trellisI4Costs:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])),
+		trellisI16Costs:  buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])),
+		trellisUVCosts:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])),
+	}
+}
+
+// encodeFrame encodes a YUV image into a VP8 bitstream.
+// Returns the raw VP8 bytes (frame header + partition0 + token partition).
+// Phase 2: per-MB RD selection between intra16 (4 modes) and intra4 (10 modes).
+//
+// SNS: uses 2 segments — segment 0 (smooth MBs, coarser quant) and
+// segment 1 (textured MBs, finer quant = baseQ). Segment quantizers are
+// signaled in partition 0 using the VP8 segment header.
+func encodeFrame(yuv *yuvImage, baseQ int) []byte {
+	w := yuv.width
+	h := yuv.height
+	// mbW/mbH come from the padded yuvImage so they match the YUV plane dimensions.
+	mbW := yuv.mbW / 16
+	mbH := yuv.mbH / 16
+
+	// SNS (Spatial Noise Shaping): pre-compute per-MB luma activity scores.
+	// Mirrors VP8EncAnalyze() / MBAnalyze() in libwebp/src/enc/analysis_enc.c.
+	mbAlpha := make([]int, mbW*mbH)
+	for mbY := 0; mbY < mbH; mbY++ {
+		for mbX := 0; mbX < mbW; mbX++ {
+			mbAlpha[mbY*mbW+mbX] = computeMBAlpha(yuv, mbX, mbY)
+		}
+	}
+
+	// Compute per-segment quantizers using the libwebp SNS formula.
+	// VP8SetSegmentParams: for each segment alpha, expn = 1 - amp*alpha,
+	// c = c_base^expn, q = 127*(1-c). With snsStrength=50, SNS_TO_DQ=0.9:
+	//   amp = 0.9 * 50 / 100 / 128 ≈ 0.003516
+	// We use 2 segments: segment 0 = smooth (higher q), segment 1 = textured (baseQ).
+	// The alpha threshold separates the two groups.
+	seg0Quality, seg1Quality := computeSNSSegmentQualities(baseQ, mbAlpha)
+
+	// Build per-segment quantizer matrices and lambdas.
+	seg0 := makeSegmentParams(seg0Quality)
+	seg1 := makeSegmentParams(seg1Quality)
+	segs := [2]segmentParams{seg0, seg1}
+
+	// Assign each MB to a segment: below threshold → segment 0 (coarse/smooth).
+	// Use median alpha as threshold (50th percentile).
+	alphaThreshold := computeAlphaThreshold(mbAlpha)
+	mbSegment := make([]int, mbW*mbH)
+	for i, a := range mbAlpha {
+		if a <= alphaThreshold {
+			mbSegment[i] = 0 // smooth → coarser quant
+		} else {
+			mbSegment[i] = 1 // textured → finer quant
+		}
+	}
 
 	// Reconstructed luma: used to build intra4 contexts across 4x4 blocks.
 	// We maintain a reconstructed frame buffer so intra4 predictions use
@@ -134,6 +185,20 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 			px := mbX * 16
 			py := mbY * 16
 
+			// SNS: select per-MB segment params based on activity score.
+			// segment 0 = smooth/coarse quant, segment 1 = textured/fine quant.
+			seg := &segs[mbSegment[mbIdx]]
+			qm := seg.qm
+			mbLambdaI4 := seg.lambdaI4
+			mbLambdaI16 := seg.lambdaI16
+			mbLambdaMode := seg.lambdaMode
+			mbLambdaTrellisI4 := seg.lambdaTrellisI4
+			mbLambdaTrellisI16 := seg.lambdaTrellisI16
+			mbLambdaTrellisUV := seg.lambdaTrellisUV
+			trellisI4Costs := &seg.trellisI4Costs
+			trellisI16Costs := &seg.trellisI16Costs
+			trellisUVCosts := &seg.trellisUVCosts
+
 			// Extract full 16x16 source block
 			var src16 [256]int16
 			for y := 0; y < 16; y++ {
@@ -165,7 +230,7 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 				// VP8FixedCostsI16: DC=0,TM=1,VE=2,HE=3 -> bit costs in millibits
 				// Use rough estimate: all modes cost ~2-4 bits
 				modeBits := i16ModeBitCost(mode)
-				score := distortion + int64(lambdaI16)*modeBits
+				score := distortion + int64(mbLambdaI16)*modeBits
 				if score < bestI16Score {
 					bestI16Score = score
 					bestI16Mode = mode
@@ -298,7 +363,7 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 								trellisCtx0 = 2
 							}
 							var acQ [16]int16
-							trellisQuantize(dctOut[:], acQ[:], &qm.y1, 0, lambdaTrellisI4, &trellisI4Costs,
+							trellisQuantize(dctOut[:], acQ[:], &qm.y1, 0, mbLambdaTrellisI4, trellisI4Costs,
 								(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]), trellisCtx0)
 
 							// Inverse DCT → reconstructed block.
@@ -316,7 +381,7 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 							// Mode bit cost
 							modeBits := i4ModeBitCost(mode, topPred, leftPred)
 
-							score := distortion + int64(lambdaI4)*modeBits
+							score := distortion + int64(mbLambdaI4)*modeBits
 							if score < bestBlkScore {
 								bestBlkScore = score
 								bestBlkMode = mode
@@ -422,7 +487,7 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 					fTransform(src4[:], pred4[:], dctOut[:])
 					yDcRaw16[n] = dctOut[0]
 					dctOut[0] = 0
-					trellisQuantize(dctOut[:], mbI16AcLevels[n][:], &qm.y1, 1, lambdaTrellisI16, &trellisI16Costs,
+					trellisQuantize(dctOut[:], mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
 						(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0]), 0)
 				}
 			}
@@ -468,8 +533,8 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 			// biasing the comparison toward i4. This matches libwebp's intent:
 			// at high quality, i4 wins whenever its distortion is comparable to
 			// i16, resulting in better compression for natural images.
-			i16Score := i16PostQuantDistortion + int64(lambdaI16)*i16ModeBitCost(bestI16Mode)
-			i4HeaderCost := int64(lambdaMode) * 211
+			i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
+			i4HeaderCost := int64(mbLambdaMode) * 211
 			i4Score := bestI4Score + i4HeaderCost
 
 			info := &mbInfos[mbIdx]
@@ -483,6 +548,8 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 
 			// UV: always use DC (simplest, good for chroma)
 			info.uvMode = 0
+			// SNS: record which segment this MB belongs to.
+			info.segment = mbSegment[mbIdx]
 
 			// -------------------------------------------------------
 			// Update global recon buffer with chosen mode's reconstruction
@@ -628,7 +695,7 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 						var dctOut [16]int16
 						fTransform(src4[:], pred4[:], dctOut[:])
 						var quant [16]int16
-						trellisQuantize(dctOut[:], quant[:], &qm.uv, 0, lambdaTrellisUV, &trellisUVCosts,
+						trellisQuantize(dctOut[:], quant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
 							(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2]), 0)
 						uvLevels[bn] = quant
 					}
@@ -713,8 +780,11 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 	tokenData := tokenBW.finish()
 
 	// --- Partition 0: frame-level headers + intra modes + updated probs ---
+	// Pass SNS segment quantizer indices so the segment header can be emitted.
+	// seg0.baseQ = quantizer for smooth MBs (segment 0)
+	// seg1.baseQ = quantizer for textured MBs (segment 1)
 	part0BW := newBoolEncoder()
-	encodePartition0WithProbs(part0BW, mbW, mbH, baseQ, mbInfos, &adaptedProbs, &updatedFlags)
+	encodePartition0WithProbs(part0BW, mbW, mbH, seg0.baseQ, seg1.baseQ, mbInfos, &adaptedProbs, &updatedFlags)
 	part0Data := part0BW.finish()
 
 	// --- Assemble VP8 bitstream ---

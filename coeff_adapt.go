@@ -627,18 +627,77 @@ func encodeTokenPartition(bw *boolEncoder, mbCoeffs []mbCoeffData, mbW, mbH int,
 	}
 }
 
+// putSegmentID encodes a 2-bit segment ID using the 3-node probability tree.
+// Mirrors PutSegment() in libwebp/src/enc/tree_enc.c:
+//   VP8PutBit(bw, s >= 2, p[0])
+//   VP8PutBit(bw, s &  1, p[1])  if s < 2
+//   VP8PutBit(bw, s &  1, p[2])  if s >= 2
+//
+// The default segment probabilities are all 255. The probability value matters
+// for the VP8 range coder — encoder and decoder must use the same value, so we
+// use putBit with the stored default (255), not putBitUniform (which uses 128).
+func putSegmentID(bw *boolEncoder, s int, prob [3]uint8) {
+	highBit := boolInt(s >= 2)
+	bw.putBit(highBit, int(prob[0]))
+	if highBit == 0 {
+		bw.putBit(s&1, int(prob[1]))
+	} else {
+		bw.putBit(s&1, int(prob[2]))
+	}
+}
+
 // encodePartition0WithProbs encodes partition 0 (frame headers + intra modes +
 // coefficient probability updates) using the adapted probability table.
 // Mirrors VP8WriteProbas() from libwebp/src/enc/tree_enc.c for the prob section.
-func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH, baseQ int, infos []mbInfo,
+//
+// segQ0, segQ1: quantizer indices for SNS segments 0 (smooth) and 1 (textured).
+// When segQ0 == segQ1, single-segment mode is used (no segment header overhead).
+func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH, segQ0, segQ1 int, infos []mbInfo,
 	probs *adaptedCoeffProbs, updated *[numTypes][numBands][numCtx][numProbas]bool) {
+
+	useSegments := segQ0 != segQ1
 
 	// colorspace = 0, clamp_type = 0
 	bw.putBitUniform(0)
 	bw.putBitUniform(0)
 
-	// Segment header: no segmentation
-	bw.putBitUniform(0)
+	// Segment header (VP8 spec §9.3 / libwebp PutSegmentHeader in syntax_enc.c).
+	// Bit order must match exactly: update_map, then update_data, then data, then probs.
+	if useSegments {
+		bw.putBitUniform(1) // update_mb_segmentation = 1
+
+		// update_mb_segmentation_map (1 bit): whether per-MB segment IDs are signaled.
+		bw.putBitUniform(1) // update_map = 1
+
+		// update_segment_feature_data (1 bit): whether quantizer/filter tables follow.
+		// If 1: segment_feature_mode + 4 quantizer values + 4 filter strength values.
+		bw.putBitUniform(1) // update_data = 1
+
+		// segment_feature_mode (1 bit): 1 = absolute values (not relative deltas).
+		bw.putBitUniform(1)
+
+		// Quantizer absolute values for 4 segments (7-bit signed each).
+		// Unused segments (2, 3) replicate segment 1's value.
+		bw.putSignedBits(segQ0, 7)
+		bw.putSignedBits(segQ1, 7)
+		bw.putSignedBits(segQ1, 7) // segment 2 — unused, same as 1
+		bw.putSignedBits(segQ1, 7) // segment 3 — unused, same as 1
+
+		// Filter strength absolute values for 4 segments (6-bit signed).
+		// All 0: loop filtering is disabled.
+		for s := 0; s < 4; s++ {
+			bw.putSignedBits(0, 6)
+		}
+
+		// Segment map probability updates (only when update_map=1).
+		// Each of probs[0..2]: 1-bit flag "update this prob?"; if 1, emit 8-bit value.
+		// We keep defaults (255) so emit 0 for all three flags.
+		for s := 0; s < 3; s++ {
+			bw.putBitUniform(0) // no update (keep default prob=255)
+		}
+	} else {
+		bw.putBitUniform(0) // update_mb_segmentation = 0
+	}
 
 	// Filter header
 	bw.putBitUniform(0) // filter_type = 0 (simple)
@@ -649,13 +708,18 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH, baseQ int, infos []mbI
 	// Number of DCT partitions: log2(1) = 0
 	bw.putBits(0, 2)
 
-	// Quantizer indices
+	// Quantizer indices.
+	// base_q is the nominal quantizer (used for MBs without explicit segment override).
+	// With update_map=1, every MB gets an explicit segment ID, so base_q is not
+	// directly used for reconstruction. We set it to segQ1 (textured segment)
+	// to match libwebp's enc->base_quant convention.
+	baseQ := segQ1
 	bw.putBits(uint32(baseQ), 7)
-	bw.putSignedBits(0, 4)
-	bw.putSignedBits(0, 4)
-	bw.putSignedBits(0, 4)
-	bw.putSignedBits(0, 4)
-	bw.putSignedBits(0, 4)
+	bw.putSignedBits(0, 4) // y1_dc_delta = 0
+	bw.putSignedBits(0, 4) // y2_dc_delta = 0
+	bw.putSignedBits(0, 4) // y2_ac_delta = 0
+	bw.putSignedBits(0, 4) // uv_dc_delta = 0
+	bw.putSignedBits(0, 4) // uv_ac_delta = 0
 
 	// refreshLastFrameBuffer = 0 (key frame)
 	bw.putBitUniform(0)
@@ -683,7 +747,7 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH, baseQ int, infos []mbI
 	// use_skip_proba = 0
 	bw.putBitUniform(0)
 
-	// Per-MB mode encoding (identical to encodePartition0Phase2).
+	// Per-MB data: [optional segment ID] + [optional skip] + mb_type + modes.
 	topI4 := make([]int, mbW*4)
 
 	for mbY := 0; mbY < mbH; mbY++ {
@@ -691,6 +755,12 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH, baseQ int, infos []mbI
 
 		for mbX := 0; mbX < mbW; mbX++ {
 			info := &infos[mbY*mbW+mbX]
+
+			// Emit segment ID if update_map is active.
+			// Use default segment probs (255, 255, 255) — no prob updates signaled.
+			if useSegments {
+				putSegmentID(bw, info.segment, [3]uint8{255, 255, 255})
+			}
 
 			if info.isI4 {
 				bw.putBit(0, 145)
