@@ -19,9 +19,15 @@ package gowebp
 //
 // This gives ~5-6% file size reduction with ~1.5 dB PSNR loss on natural photos.
 
-// snsQDelta is the quantizer-index offset applied to smooth MBs.
-// Increasing this value saves more bits but reduces PSNR on flat regions.
-const snsQDelta = 12
+// snsQDeltaForMBCount returns the SNS quantizer delta for the smooth segment.
+// Larger images benefit from more aggressive noise shaping; small images
+// (portraits, uniform backgrounds) need a gentler touch to avoid crushing detail.
+func snsQDeltaForMBCount(mbCount int) int {
+	if mbCount > 500 {
+		return 12 // large images: aggressive (current behaviour)
+	}
+	return 6 // small images: conservative
+}
 
 // computeMBAlpha computes the luma activity score for a 16×16 macroblock.
 // Returns a value in [0, 255] where 0 = flat/smooth, 255 = highly textured.
@@ -94,14 +100,16 @@ func computeAlphaThreshold(mbAlpha []int) int {
 
 // computeSNSSegmentQualities returns the quality levels for SNS segments 0 and 1.
 //
-// seg0 (smooth): baseQ + snsQDelta → coarser quantizer → fewer bits on flat areas
-// seg1 (textured): baseQ           → unchanged quality
+// seg0 (smooth): baseQ + delta → coarser quantizer → fewer bits on flat areas
+// seg1 (textured): baseQ       → unchanged quality
+//
+// mbCount is mbW*mbH; the delta is smaller for small images to avoid crushing
+// detail in portraits and other uniform subjects.
 //
 // Returns (qual0, qual1) as quality levels [0..100] for use with makeSegmentParams.
-func computeSNSSegmentQualities(baseQ int, mbAlpha []int) (int, int) {
-	_ = mbAlpha // reserved for future adaptive delta tuning
-
-	q0 := clipQ(baseQ+snsQDelta, 0, 127)
+func computeSNSSegmentQualities(baseQ, mbCount int) (int, int) {
+	delta := snsQDeltaForMBCount(mbCount)
+	q0 := clipQ(baseQ+delta, 0, 127)
 	q1 := baseQ
 
 	return qIndexToQuality(q0), qIndexToQuality(q1)

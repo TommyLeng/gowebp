@@ -112,7 +112,7 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 	//   amp = 0.9 * 50 / 100 / 128 ≈ 0.003516
 	// We use 2 segments: segment 0 = smooth (higher q), segment 1 = textured (baseQ).
 	// The alpha threshold separates the two groups.
-	seg0Quality, seg1Quality := computeSNSSegmentQualities(baseQ, mbAlpha)
+	seg0Quality, seg1Quality := computeSNSSegmentQualities(baseQ, mbW*mbH)
 
 	// Build per-segment quantizer matrices and lambdas.
 	seg0 := makeSegmentParams(seg0Quality)

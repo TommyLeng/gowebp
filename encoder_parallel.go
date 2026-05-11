@@ -47,7 +47,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 		}
 	}
 
-	seg0Quality, seg1Quality := computeSNSSegmentQualities(baseQ, mbAlpha)
+	seg0Quality, seg1Quality := computeSNSSegmentQualities(baseQ, mbW*mbH)
 	seg0 := makeSegmentParams(seg0Quality)
 	seg1 := makeSegmentParams(seg1Quality)
 	segs := [2]segmentParams{seg0, seg1}
