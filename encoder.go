@@ -52,6 +52,34 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 		lambdaMode = 1
 	}
 
+	// Trellis quantization lambdas (libwebp SetupMatrices()):
+	//   lambda_trellis_i4  = (7 * q_i4  * q_i4)  >> 3
+	//   lambda_trellis_i16 = (q_i16 * q_i16) >> 2
+	//   lambda_trellis_uv  = (q_uv  * q_uv)  << 1
+	//   DO_TRELLIS_UV = 0 in libwebp, but we keep UV trellis as it saves bytes.
+	var uvqSum int
+	for i := 0; i < 16; i++ {
+		uvqSum += int(qm.uv.q[i])
+	}
+	qUV := (uvqSum + 8) >> 4
+	lambdaTrellisI4 := (7 * qI4 * qI4) >> 3
+	if lambdaTrellisI4 < 1 {
+		lambdaTrellisI4 = 1
+	}
+	lambdaTrellisI16 := (qI16 * qI16) >> 2
+	if lambdaTrellisI16 < 1 {
+		lambdaTrellisI16 = 1
+	}
+	lambdaTrellisUV := (qUV * qUV) << 1
+	if lambdaTrellisUV < 1 {
+		lambdaTrellisUV = 1
+	}
+	// Precompute level cost tables for trellis quantization.
+	// Built once from defaultCoeffProbs and reused for all blocks in the frame.
+	trellisI4Costs := buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]))
+	trellisI16Costs := buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0]))
+	trellisUVCosts := buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2]))
+
 	// Reconstructed luma: used to build intra4 contexts across 4x4 blocks.
 	// We maintain a reconstructed frame buffer so intra4 predictions use
 	// previously decoded pixels within and across MBs.
@@ -168,6 +196,20 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 				}
 				leftBlkMode := [4]int{leftI4Mode[0], leftI4Mode[1], leftI4Mode[2], leftI4Mode[3]}
 
+				// NZ context tracking for trellis: mirrors it->top_nz / it->left_nz in libwebp.
+				// topNzI4[bx] = 1 if the last block in column bx had a non-zero coeff.
+				// leftNzI4[by] = 1 if the last block in row by had a non-zero coeff.
+				// Seeded from the global topNzY which tracks across MBs.
+				var topNzI4 [4]int
+				var leftNzI4 [4]int
+				for bx := 0; bx < 4; bx++ {
+					topNzI4[bx] = topNzY[mbX*4+bx]
+				}
+				// leftNzY[by] from previous MB (already tracks left edge)
+				for by := 0; by < 4; by++ {
+					leftNzI4[by] = leftNzY[by]
+				}
+
 				var i4TotalScore int64
 				var localI4AcLevels [16][16]int16
 				var localI4DcLevels [16]int16
@@ -248,18 +290,21 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 							var dctOut [16]int16
 							fTransform(src4[:], pred4[:], dctOut[:])
 
-							// Quantize all 16 coefficients (i4: no WHT, first=0)
-							var acQ [16]int16
-							quantizeBlock(dctOut[:], acQ[:], &qm.y1, 0)
-
-							// Dequantize + inverse DCT → reconstructed block
-							var raster [16]int16
-							for n := 0; n < 16; n++ {
-								j := int(kZigzag[n])
-								raster[j] = int16(int32(acQ[n]) * int32(qm.y1.q[j]))
+							// Trellis-quantize all 16 coefficients (i4: no WHT, first=0).
+							// ctx0 = topNzI4[bx] + leftNzI4[by] mirrors libwebp's NZ context.
+							// trellisQuantize writes dequantized values back into dctOut.
+							trellisCtx0 := topNzI4[bx] + leftNzI4[by]
+							if trellisCtx0 > 2 {
+								trellisCtx0 = 2
 							}
+							var acQ [16]int16
+							trellisQuantize(dctOut[:], acQ[:], &qm.y1, 0, lambdaTrellisI4, &trellisI4Costs,
+								(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]), trellisCtx0)
+
+							// Inverse DCT → reconstructed block.
+							// dctOut now holds dequantized raster-order coefficients.
 							var recBlock [16]int16
-							iTransform4x4(raster[:], pred4[:], recBlock[:])
+							iTransform4x4(dctOut[:], pred4[:], recBlock[:])
 
 							// Distortion = SSD of source vs actual reconstructed pixels
 							var distortion int64
@@ -286,6 +331,14 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 						localI4AcLevels[blkIdx] = bestBlkAcLevels
 						localI4DcLevels[blkIdx] = 0 // i4 has no WHT DC
 						i4TotalScore += bestBlkScore
+
+						// Update NZ context for subsequent blocks' trellis decisions.
+						bestNZ := 0
+						if findLast(bestBlkAcLevels[:], 0) >= 0 {
+							bestNZ = 1
+						}
+						topNzI4[bx] = bestNZ
+						leftNzI4[by] = bestNZ
 
 						// Update mbReconI4 with actual reconstructed pixels.
 						for y := 0; y < 4; y++ {
@@ -369,7 +422,8 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 					fTransform(src4[:], pred4[:], dctOut[:])
 					yDcRaw16[n] = dctOut[0]
 					dctOut[0] = 0
-					quantizeBlock(dctOut[:], mbI16AcLevels[n][:], &qm.y1, 1)
+					trellisQuantize(dctOut[:], mbI16AcLevels[n][:], &qm.y1, 1, lambdaTrellisI16, &trellisI16Costs,
+						(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0]), 0)
 				}
 			}
 			var whtOut16 [16]int16
@@ -574,13 +628,15 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 						var dctOut [16]int16
 						fTransform(src4[:], pred4[:], dctOut[:])
 						var quant [16]int16
-						quantizeBlock(dctOut[:], quant[:], &qm.uv, 0)
+						trellisQuantize(dctOut[:], quant[:], &qm.uv, 0, lambdaTrellisUV, &trellisUVCosts,
+							(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2]), 0)
 						uvLevels[bn] = quant
 					}
 				}
 			}
 
 			// Reconstruct chroma and update reconU/reconV for subsequent MBs.
+			// Re-dequantize from levels (since we need a fresh raster for iDCT).
 			for ch := 0; ch < 2; ch++ {
 				reconPlane := reconU
 				if ch == 1 {

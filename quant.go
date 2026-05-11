@@ -56,11 +56,19 @@ const qfix = 17
 
 // quantMatrix holds the per-block quantization parameters.
 type quantMatrix struct {
-	q      [16]uint16  // step sizes (q[0]=DC, q[1..15]=AC)
-	iq     [16]uint32  // reciprocals: (1<<QFIX) / q[i]
-	bias   [16]uint32  // rounding bias
+	q       [16]uint16 // step sizes (q[0]=DC, q[1..15]=AC)
+	iq      [16]uint32 // reciprocals: (1<<QFIX) / q[i]
+	bias    [16]uint32 // rounding bias
 	zthresh [16]uint32 // zero-threshold: coeff <= zthresh -> quantized to 0
+	sharpen [16]int16  // sharpening bias added to coeff before trellis (luma AC only)
 }
+
+// kFreqSharpening[j] is the sharpening weight for raster position j.
+// Only used for y1 (luma AC, type=0). Zero for y2 and uv.
+// From libwebp/src/enc/quant_enc.c kFreqSharpening[].
+var kFreqSharpening = [16]int{0, 30, 60, 90, 30, 60, 90, 90, 60, 90, 90, 90, 90, 90, 90, 90}
+
+const sharpenBits = 11 // descaling shift for sharpening bias
 
 // quantMatrices holds Y1 (luma AC), Y2 (WHT/DC), UV quantization matrices.
 type quantMatrices struct {
@@ -106,6 +114,13 @@ func setupMatrix(m *quantMatrix, biasType int) {
 		// zthresh: largest coeff that rounds to 0
 		// zthresh = ((1<<QFIX) - 1 - bias) / iq
 		m.zthresh[i] = ((1 << qfix) - 1 - m.bias[i]) / m.iq[i]
+		// sharpen: frequency-dependent boost for luma AC (biasType==0 only).
+		// Mirrors ExpandMatrix() in libwebp: sharpen[i] = (kFreqSharpening[i] * q[i]) >> SHARPEN_BITS
+		if biasType == 0 {
+			m.sharpen[i] = int16((kFreqSharpening[i] * int(m.q[i])) >> sharpenBits)
+		} else {
+			m.sharpen[i] = 0
+		}
 	}
 }
 
