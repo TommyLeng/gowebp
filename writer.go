@@ -50,8 +50,14 @@ func encodeLossy(w io.Writer, img image.Image, quality int) error {
 	// via the SNS two-segment scheme (computeSNSSegmentQualities).
 	baseQ := qualityToLevel(internalQuality)
 
-	// Encode the VP8 frame
-	vp8Data := encodeFrame(yuv, baseQ)
+	// Encode the VP8 frame — use wave-front parallel encoding for large images.
+	mbCount := (yuv.mbW / 16) * (yuv.mbH / 16)
+	var vp8Data []byte
+	if mbCount > parallelThreshold {
+		vp8Data = encodeFrameParallel(yuv, baseQ)
+	} else {
+		vp8Data = encodeFrame(yuv, baseQ)
+	}
 
 	// Write WebP container
 	return writeWebPHeader(w, vp8Data)
