@@ -74,17 +74,24 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 
 	mbInfos := make([]mbInfo, mbW*mbH)
 
-	// --- Token partition (partition 1): encode all DCT coefficients ---
-	tokenBW := newBoolEncoder()
-
-	topNzY := make([]int, mbW*4+1)
-	topNzU := make([]int, mbW*2+1)
-	topNzV := make([]int, mbW*2+1)
-	topNzDC := make([]int, mbW+1)
+	// mbCoeffs stores quantized coefficient levels for every MB.
+	// Used for the two-pass coefficient probability adaptation:
+	// pass 1 collects statistics, pass 2 emits entropy-coded bits.
+	mbCoeffs := make([]mbCoeffData, mbW*mbH)
 
 	// per-MB top/left i4 mode arrays for entropy context
 	// topI4Modes[mbX*4 + bx]: top neighbor mode for 4x4 block column bx in mbX
 	topI4Modes := make([]int, mbW*4)
+
+	// NZ context arrays — still tracked during the MB loop so that we know
+	// which ctx value to pass to recordCoeffs/putCoeffsWithProbs in the
+	// second pass.  We re-derive them from mbCoeffs in encodeTokenPartition.
+	// They are kept here only to compute the correct nz flags that we store
+	// alongside the coefficient levels (ctx is implicit; we store it too).
+	topNzY := make([]int, mbW*4+1)
+	topNzU := make([]int, mbW*2+1)
+	topNzV := make([]int, mbW*2+1)
+	topNzDC := make([]int, mbW+1)
 
 	for mbY := 0; mbY < mbH; mbY++ {
 		leftNzY := [5]int{}
@@ -490,16 +497,21 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 			// -------------------------------------------------------
 			// Encode coefficients
 			// -------------------------------------------------------
+			// -------------------------------------------------------
+			// Store coefficient levels in mbCoeffs for the two-pass
+			// probability adaptation (stats → adapted probs → entropy coding).
+			// Also update NZ context arrays so subsequent MBs use the correct ctx.
+			// -------------------------------------------------------
+			cd := &mbCoeffs[mbIdx]
+			cd.isI4 = info.isI4
+
 			if info.isI4 {
-				// Intra4: i4AcLevels[n] contains the quantized coefficients
-				// (all 16, zigzag order, first=0) computed during mode selection.
-				// Encode using coefficient type 3 (i4-AC), first=0.
+				// i4: store all 16 block × 16 coeff levels and update NZ ctx.
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
-						ctx := topNzY[mbX*4+bx] + leftNzY[by]
+						cd.i4AC[n] = i4AcLevels[n]
 						last := findLast(i4AcLevels[n][:], 0)
-						putCoeffs(tokenBW, ctx, i4AcLevels[n][:], 3, 0, last)
 						nz := 0
 						if last >= 0 {
 							nz = 1
@@ -508,20 +520,14 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 						leftNzY[by] = nz
 					}
 				}
-				// DC nz: for i4, there's no WHT; set DC context to 0
 				topNzDC[mbX] = 0
 				leftNzY[4] = 0
-				_ = i4DcLevels // not used in i4 path
+				_ = i4DcLevels
 
 			} else {
-				// Intra16: encode pre-computed coefficients (from recon-update pass above).
-				// mbI16DcQuantLevels = quantized WHT DC levels (zigzag).
-				// mbI16AcLevels[n]   = quantized AC levels for each 4x4 block (zigzag, DC slot=0).
-
-				// DC WHT plane (type=1, first=0)
-				dcCtx := topNzDC[mbX] + leftNzY[4]
+				// i16: store DC and AC levels, update NZ ctx.
+				cd.i16DC = mbI16DcQuantLevels
 				lastDC := findLast(mbI16DcQuantLevels[:], 0)
-				putCoeffs(tokenBW, dcCtx, mbI16DcQuantLevels[:], 1, 0, lastDC)
 				dcNZ := 0
 				if lastDC >= 0 {
 					dcNZ = 1
@@ -529,13 +535,11 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 				topNzDC[mbX] = dcNZ
 				leftNzY[4] = dcNZ
 
-				// Luma AC (type=0, first=1)
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
-						ctx := topNzY[mbX*4+bx] + leftNzY[by]
+						cd.i16AC[n] = mbI16AcLevels[n]
 						last := findLast(mbI16AcLevels[n][:], 1)
-						putCoeffs(tokenBW, ctx, mbI16AcLevels[n][:], 0, 1, last)
 						nz := 0
 						if last >= 1 {
 							nz = 1
@@ -546,9 +550,7 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 				}
 			}
 
-			// UV encoding — always DC prediction.
-			// Read DC from the reconstructed chroma buffers so the prediction
-			// matches exactly what the decoder will compute.
+			// UV quantization — always DC prediction.
 			dcU := computeDCUV(reconU, yuv.uvStride, mbX, mbY, yuv.width, yuv.height)
 			dcV := computeDCUV(reconV, yuv.uvStride, mbX, mbY, yuv.width, yuv.height)
 
@@ -578,9 +580,7 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 				}
 			}
 
-			// Reconstruct chroma blocks and store in reconU/reconV so that
-			// subsequent MBs compute their DC prediction from the values the
-			// decoder will actually produce (not the original source samples).
+			// Reconstruct chroma and update reconU/reconV for subsequent MBs.
 			for ch := 0; ch < 2; ch++ {
 				reconPlane := reconU
 				if ch == 1 {
@@ -613,12 +613,12 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 				}
 			}
 
+			// Store UV levels and update NZ ctx.
 			for by := 0; by < 2; by++ {
 				for bx := 0; bx < 2; bx++ {
 					n := by*2 + bx
-					ctx := topNzU[mbX*2+bx] + leftNzU[by]
+					cd.uv[n] = uvLevels[n]
 					last := findLast(uvLevels[n][:], 0)
-					putCoeffs(tokenBW, ctx, uvLevels[n][:], 2, 0, last)
 					nz := 0
 					if last >= 0 {
 						nz = 1
@@ -627,13 +627,11 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 					leftNzU[by] = nz
 				}
 			}
-
 			for by := 0; by < 2; by++ {
 				for bx := 0; bx < 2; bx++ {
 					n := by*2 + bx
-					ctx := topNzV[mbX*2+bx] + leftNzV[by]
+					cd.uv[4+n] = uvLevels[4+n]
 					last := findLast(uvLevels[4+n][:], 0)
-					putCoeffs(tokenBW, ctx, uvLevels[4+n][:], 2, 0, last)
 					nz := 0
 					if last >= 0 {
 						nz = 1
@@ -645,11 +643,22 @@ func encodeFrame(yuv *yuvImage, qm quantMatrices, baseQ int) []byte {
 		}
 	}
 
+	// --- Two-pass coefficient probability adaptation ---
+	// Pass 1: collect statistics over all stored coefficient levels.
+	var stats coeffStats
+	collectCoeffStats(mbCoeffs, mbW, mbH, &stats)
+
+	// Compute adapted probabilities and which entries to update.
+	adaptedProbs, updatedFlags := finalizeTokenProbas(&stats)
+
+	// Pass 2: entropy-encode all coefficients using the adapted probabilities.
+	tokenBW := newBoolEncoder()
+	encodeTokenPartition(tokenBW, mbCoeffs, mbW, mbH, &adaptedProbs)
 	tokenData := tokenBW.finish()
 
-	// --- Partition 0: frame-level headers + intra modes ---
+	// --- Partition 0: frame-level headers + intra modes + updated probs ---
 	part0BW := newBoolEncoder()
-	encodePartition0Phase2(part0BW, mbW, mbH, baseQ, mbInfos)
+	encodePartition0WithProbs(part0BW, mbW, mbH, baseQ, mbInfos, &adaptedProbs, &updatedFlags)
 	part0Data := part0BW.finish()
 
 	// --- Assemble VP8 bitstream ---
