@@ -447,7 +447,58 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 					info.i16Mode = bestI16Mode
 				}
 
-				info.uvMode = 0
+				// UV: RD-optimal prediction mode selection.
+				bestUVMode := 0
+				bestUVScore := int64(1<<62 - 1)
+				for uvMode := 0; uvMode < 4; uvMode++ {
+					if uvMode == 1 && ry == 0 {
+						continue // VE needs top row
+					}
+					if uvMode == 2 && mbX == 0 {
+						continue // HE needs left column
+					}
+					if uvMode == 3 && (mbX == 0 || ry == 0) {
+						continue // TM needs both top and left
+					}
+					var scoreU, scoreV int64
+					for ch := 0; ch < 2; ch++ {
+						rPlane := reconU
+						sPlane := yuv.u
+						if ch == 1 {
+							rPlane = reconV
+							sPlane = yuv.v
+						}
+						var pred8 [64]int16
+						predictUV(uvMode, rPlane, yuv.uvStride, mbX, ry, yuv.width, yuv.height, pred8[:])
+						uvW := (yuv.width + 1) / 2
+						uvH := (yuv.height + 1) / 2
+						for j := 0; j < 8; j++ {
+							for i := 0; i < 8; i++ {
+								bpx := mbX*8 + i
+								bpy := ry*8 + j
+								if bpx >= uvW {
+									bpx = uvW - 1
+								}
+								if bpy >= uvH {
+									bpy = uvH - 1
+								}
+								src := int64(sPlane[bpy*yuv.uvStride+bpx])
+								d := src - int64(pred8[j*8+i])
+								if ch == 0 {
+									scoreU += d * d
+								} else {
+									scoreV += d * d
+								}
+							}
+						}
+					}
+					score := scoreU + scoreV
+					if score < bestUVScore {
+						bestUVScore = score
+						bestUVMode = uvMode
+					}
+				}
+				info.uvMode = bestUVMode
 				info.segment = mbSegment[mbIdx]
 
 				// -------------------------------------------------------
@@ -502,20 +553,20 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				}
 
 				// -------------------------------------------------------
-				// UV quantization
+				// UV quantization using RD-selected prediction mode.
 				// -------------------------------------------------------
-				dcU := computeDCUV(reconU, yuv.uvStride, mbX, ry, yuv.width, yuv.height)
-				dcV := computeDCUV(reconV, yuv.uvStride, mbX, ry, yuv.width, yuv.height)
+				var predU8 [64]int16
+				var predV8 [64]int16
+				predictUV(info.uvMode, reconU, yuv.uvStride, mbX, ry, yuv.width, yuv.height, predU8[:])
+				predictUV(info.uvMode, reconV, yuv.uvStride, mbX, ry, yuv.width, yuv.height, predV8[:])
 
 				var uvLevels [8][16]int16
 				for ch := 0; ch < 2; ch++ {
 					plane := yuv.u
+					pred8 := predU8
 					if ch == 1 {
 						plane = yuv.v
-					}
-					dcUV := dcU
-					if ch == 1 {
-						dcUV = dcV
+						pred8 = predV8
 					}
 					for by := 0; by < 2; by++ {
 						for bx := 0; bx < 2; bx++ {
@@ -523,7 +574,12 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 							var src4 [16]int16
 							var pred4 [16]int16
 							extractBlock4x4UV(plane, yuv.uvStride, mbX*8+bx*4, ry*8+by*4, yuv.width, yuv.height, src4[:])
-							fillPred4x4(pred4[:], uint8(dcUV))
+							// Extract 4×4 sub-block from the 8×8 prediction.
+							for y := 0; y < 4; y++ {
+								for x := 0; x < 4; x++ {
+									pred4[y*4+x] = pred8[(by*4+y)*8+(bx*4+x)]
+								}
+							}
 							var dctOut [16]int16
 							fTransform(src4[:], pred4[:], dctOut[:])
 							var quant [16]int16
@@ -537,18 +593,20 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				// Reconstruct chroma and update reconU/reconV.
 				for ch := 0; ch < 2; ch++ {
 					reconPlane := reconU
+					pred8 := predU8
 					if ch == 1 {
 						reconPlane = reconV
-					}
-					dcUV := dcU
-					if ch == 1 {
-						dcUV = dcV
+						pred8 = predV8
 					}
 					for by := 0; by < 2; by++ {
 						for bx := 0; bx < 2; bx++ {
 							bn := ch*4 + by*2 + bx
 							var pred4 [16]int16
-							fillPred4x4(pred4[:], uint8(dcUV))
+							for y := 0; y < 4; y++ {
+								for x := 0; x < 4; x++ {
+									pred4[y*4+x] = pred8[(by*4+y)*8+(bx*4+x)]
+								}
+							}
 							var raster [16]int16
 							for n := 0; n < 16; n++ {
 								j := int(kZigzag[n])

@@ -805,8 +805,8 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH, segQ0, segQ1 int, info
 				}
 			}
 
-			// UV mode: always DC
-			bw.putBit(0, 142)
+			// UV mode encoding using the RD-selected mode.
+			putUVMode(bw, info.uvMode)
 		}
 	}
 }

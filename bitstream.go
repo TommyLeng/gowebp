@@ -326,15 +326,29 @@ func encodePartition0Phase2(bw *boolEncoder, mbW, mbH, baseQ int, infos []mbInfo
 				}
 			}
 
-			// UV mode encoding (PutUVMode in tree_enc.c):
-			// VP8PutBit(bw, uv_mode != DC_PRED, 142)
-			// if true:
-			//   VP8PutBit(bw, uv_mode != V_PRED, 114)
-			//   if true: VP8PutBit(bw, uv_mode != H_PRED, 183)  // else TM
-			// We always use DC (uvMode=0).
-			bw.putBit(0, 142) // uv_mode == DC_PRED
+			// UV mode encoding using the RD-selected mode.
+			putUVMode(bw, info.uvMode)
 		}
 	}
+}
+
+// putUVMode encodes a UV prediction mode (0=DC, 1=VE, 2=HE, 3=TM) using
+// the VP8 probability tree from tree_enc.c PutUVMode().
+func putUVMode(bw *boolEncoder, uvMode int) {
+	// bit 0: uv_mode != DC_PRED (0)
+	if uvMode == 0 {
+		bw.putBit(0, 142)
+		return
+	}
+	bw.putBit(1, 142)
+	// bit 1: uv_mode != VE (1)
+	if uvMode == 1 {
+		bw.putBit(0, 114)
+		return
+	}
+	bw.putBit(1, 114)
+	// bit 2: uv_mode != HE (2); if true → TM (3)
+	bw.putBit(boolInt(uvMode != 2), 183)
 }
 
 // putCoeffs encodes one set of DCT coefficients using the bool encoder.
