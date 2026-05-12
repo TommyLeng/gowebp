@@ -4,7 +4,10 @@
 
 package gowebp
 
-import "sync"
+import (
+	"math"
+	"sync"
+)
 
 // Spatial Noise Shaping (SNS) — faithful port of libwebp's analysis_enc.c + quant_enc.c.
 //
@@ -406,15 +409,15 @@ type snsResult struct {
 // computeSNS runs the SNS pipeline:
 //   - Per-MB alpha: libwebp's DCT-based metric (0=textured, 255=smooth).
 //   - K-means with 4 clusters for segment assignment (adaptive boundaries).
-//   - Segment quantizers: delta distributed proportionally across clusters
-//     based on their smoothness relative to the alpha range.
+//   - Segment quantizers: VP8SetSegmentParams power-law formula (SNS_TO_DQ=0.9,
+//     sns_strength=50) — faithful port of libwebp's analysis_enc.c + quant_enc.c.
 //
-// The DCT-based alpha (ported from libwebp's CollectHistogram/GetAlpha/FinalAlphaValue)
-// more accurately distinguishes smooth from textured regions than the old MAD metric.
-// K-means finds the natural cluster boundaries rather than using fixed thresholds.
+// Quantizer direction (matches libwebp):
+//   - Smooth segments (positive alpha): finer quantizer (lower q-index, better quality).
+//   - Textured segments (negative alpha): coarser quantizer (higher q-index, saves bits).
 //
 // K-means cluster ordering: 0=most textured (lowest alpha), 3=most smooth (highest alpha).
-// Encoder segment ordering: 0=coarsest (smooth, highest Q), 3=finest (textured, base Q).
+// Encoder segment ordering: 0=coarsest (textured, highest Q), 3=finest (smooth, lowest Q).
 // Mapping: encoder_seg = 3 - kmCluster  (reversal).
 func computeSNS(yuv *yuvImage, mbW, mbH, baseQ int) snsResult {
 	mbCount := mbW * mbH
@@ -444,42 +447,64 @@ func computeSNS(yuv *yuvImage, mbW, mbH, baseQ int) snsResult {
 	// centers[0] = most textured cluster (lowest alpha).
 	// centers[3] = most smooth cluster (highest alpha).
 	// segMap[a] = cluster ID in [0..3].
-	centers, segMap, _ := assignSegments(alphaHist, 4)
+	// weightedAvg = weighted mean of centers, used as "mid" in SetSegmentAlphas.
+	centers, segMap, mid := assignSegments(alphaHist, 4)
 
-	// Step 4: determine quantizer delta based on image size.
-	// Small images (portraits): delta=8.
-	// Large images: delta=12.
-	delta := 8
-	if mbCount > snsSmallImageThreshold {
-		delta = 12
+	// Step 4: libwebp's SetSegmentAlphas + VP8SetSegmentParams power-law formula.
+	//
+	// SetSegmentAlphas (analysis_enc.c):
+	//   alpha[n] = clip(255 * (centers[n] - mid) / (max - min), -127, 127)
+	//   smooth segments (centers[n] > mid): positive alpha
+	//   textured segments (centers[n] < mid): negative alpha
+	//
+	// VP8SetSegmentParams (quant_enc.c):
+	//   amp = SNS_TO_DQ * sns_strength / 100 / 128  (= 0.9 * 50/100/128 ≈ 0.003516)
+	//   c_base = QualityToCompression(quality/100)  (≈ 1 - baseQ/127)
+	//   expn = 1 - amp * alpha[n]
+	//   c = pow(c_base, expn)
+	//   q[n] = int(127 * (1 - c))
+	//
+	// Effect: smooth → expn<1 → c>c_base → lower q (finer quantizer, better quality)
+	//         textured → expn>1 → c<c_base → higher q (coarser quantizer, more compression)
+
+	minC, maxC := centers[0], centers[numMBSegments-1]
+	if maxC == minC {
+		maxC = minC + 1
 	}
 
-	// Step 5: distribute delta proportionally across 4 clusters.
-	// Most textured cluster (centers[0]) → delta = 0 (base quality).
-	// Most smooth cluster   (centers[3]) → delta = full delta.
-	// Intermediate clusters → proportional to their smoothness relative to range.
-	minAlphaC := centers[0] // most textured (lowest alpha)
-	maxAlphaC := centers[3] // most smooth (highest alpha)
-	alphaRange := maxAlphaC - minAlphaC
-	if alphaRange == 0 {
-		alphaRange = 1
+	// c_base: inferred from baseQ = int(127*(1-v)) so v = 1 - baseQ/127.
+	cBase := 1.0 - float64(baseQ)/127.0
+	if cBase < 1e-6 {
+		cBase = 1e-6 // guard against log(0) in math.Pow
 	}
 
-	// segQIdx[i] = quantizer for K-means cluster i (0=textured, 3=smooth).
-	var segQIdx [4]int
-	for i := 0; i < 4; i++ {
-		smoothness := centers[i] - minAlphaC // 0..alphaRange
-		segDelta := delta * smoothness / alphaRange
-		segQIdx[i] = clipI(baseQ+segDelta, 0, 127)
+	const snsToDQ = 0.9
+	const snsStrength = 50.0
+	amp := snsToDQ * snsStrength / 100.0 / 128.0
+
+	// segQKmeans[n] = quantizer index for K-means cluster n.
+	var segQKmeans [numMBSegments]int
+	for n := 0; n < numMBSegments; n++ {
+		alpha := 255 * (centers[n] - mid) / (maxC - minC)
+		alpha = clipI(alpha, -127, 127)
+		expn := 1.0 - amp*float64(alpha)
+		c := math.Pow(cBase, expn)
+		q := int(127.0 * (1.0 - c))
+		segQKmeans[n] = clipI(q, 0, 127)
 	}
 
 	// Reverse cluster→segment mapping:
-	// encoder seg0 = smoothest (coarsest quant), encoder seg3 = most textured (finest quant).
-	// K-means cluster 0 = most textured → encoder seg3.
-	// K-means cluster 3 = most smooth   → encoder seg0.
-	segQs := [4]int{segQIdx[3], segQIdx[2], segQIdx[1], segQIdx[0]}
+	// encoder seg0 = most textured (coarsest quant), encoder seg3 = most smooth (finest quant).
+	// K-means cluster 0 = most textured → encoder seg0.
+	// K-means cluster 3 = most smooth   → encoder seg3.
+	// But MB assignment uses 3-kmCluster, so segQs must be reversed accordingly:
+	//   encoder seg (3-n) uses segQKmeans[n]  →  segQs[3-n] = segQKmeans[n]
+	var segQs [4]int
+	for n := 0; n < numMBSegments; n++ {
+		segQs[3-n] = segQKmeans[n]
+	}
 
-	// Step 6: assign each MB to its encoder segment.
+	// Step 5: assign each MB to its encoder segment.
 	mbSegment := make([]int, mbCount)
 	for i, a := range mbAlphaSlice {
 		kmCluster := segMap[a] // 0=most textured, 3=most smooth
