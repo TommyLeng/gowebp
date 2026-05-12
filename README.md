@@ -1,93 +1,146 @@
 # gowebp
 
-A pure-Go WebP encoder supporting both **lossy (VP8)** and **lossless (VP8L)** output. No cgo, no external binaries.
+純 Go 實現的 WebP 編碼器，支援有損（VP8）和無損（VP8L）輸出。無 cgo，無外部二進制依賴。參考 [libwebp](https://github.com/webmproject/libwebp)（BSD 3-Clause）移植而來。
 
-Ported from [libwebp](https://github.com/webmproject/libwebp) (BSD 3-Clause).
+A pure-Go WebP encoder supporting both lossy (VP8) and lossless (VP8L) output. No cgo, no external binaries. Ported from [libwebp](https://github.com/webmproject/libwebp) (BSD 3-Clause).
 
-## Installation
+---
+
+## 安裝 / Installation
 
 ```bash
 go get github.com/TommyLeng/gowebp
 ```
 
-## Usage
+---
+
+## 使用方法 / Usage
 
 ```go
 import "github.com/TommyLeng/gowebp"
 
-// Lossy (VP8) — smaller files, recommended for photos
+// 有損編碼（推薦用於照片）/ Lossy encoding (recommended for photos)
 err := gowebp.Encode(w, img, &gowebp.Options{Quality: 90})
 
-// Lossless (VP8L) — pixel-perfect, recommended for graphics/screenshots
+// 無損編碼（推薦用於截圖、圖標）/ Lossless encoding (recommended for screenshots, icons)
 err := gowebp.Encode(w, img, &gowebp.Options{Lossless: true})
 
-// nil options = lossy quality 90
+// 使用預設值（有損 quality=90）/ Use defaults (lossy quality=90)
 err := gowebp.Encode(w, img, nil)
 ```
 
-## Performance
+### Options
 
-Benchmarked on Apple M1 Max, 300×300 portrait photo:
-
-| | cwebp (C + SIMD) | gowebp (pure Go) |
+| 欄位 / Field | 類型 / Type | 說明 / Description |
 |---|---|---|
-| File size | 12.0 kb | 12.3 kb |
-| Luma PSNR | 47.42 dB | 45.70 dB |
-| Encode time | ~20ms\* | ~16ms |
+| `Lossless` | `bool` | `true` = VP8L 無損，`false` = VP8 有損（預設）/ `true` = VP8L lossless, `false` = VP8 lossy (default) |
+| `Quality` | `int` | 0–100，僅有損模式有效（預設 90）/ 0–100, lossy only (default 90) |
 
-\* cwebp time includes process fork/exec overhead (~5ms). Pure encode time is comparable.
+---
 
-For larger images (~1080×1350), gowebp takes ~290ms vs cwebp's ~160ms. The gap is due to missing SIMD — see [DESIGN.md](DESIGN.md) for optimization directions.
+## 效能測試 / Benchmark Results
 
-## Options
+測試環境：Apple M1 Max，Go 1.25，cwebp 1.4.0（quality=90）
 
-```go
-type Options struct {
-    Lossless bool // true = VP8L lossless, false = VP8 lossy (default)
-    Quality  int  // 0–100, lossy only (default: 90)
-}
-```
+Test environment: Apple M1 Max, Go 1.25, cwebp 1.4.0 (quality=90)
 
-## Comparison Test
+### 速度 / Speed
 
-`TestCompareWithCwebp` encodes every image in `test_data/original/` with both gowebp and cwebp, then writes the results to `test_data/compare_results.md`.
+| 圖片尺寸 / Image Size | cwebp | gowebp | 加速 / Speedup |
+|---|---|---|---|
+| 300×300 | ~21 ms | **~6 ms** | **3.4×** |
+| 1536×2048 | ~250 ms | **~102 ms** | **2.5×** |
 
-**Setup:**
+gowebp 更快的原因：直接作為 library 調用（無 subprocess fork 開銷），並採用 wave-front goroutine 並行編碼。
 
-```bash
-# 1. Install cwebp (macOS)
-brew install webp
+gowebp is faster because it runs in-process (no subprocess fork overhead) and uses wave-front goroutine parallel encoding across rows.
 
-# 2. Add your source images
-mkdir -p test_data/original
-cp /your/images/*.jpg test_data/original/
+### 檔案大小 / File Size
 
-# 3. Create output folders
-mkdir -p test_data/libwebp/lossy test_data/libwebp/lossless
-mkdir -p test_data/gowebp/lossy  test_data/gowebp/lossless
-```
+人像照片（約 300×300），quality=90：
 
-**Run:**
+Portrait photos (~300×300), quality=90:
 
-```bash
-go test -v -run TestCompareWithCwebp -timeout 300s
-```
+| | cwebp | gowebp | 差異 / Delta |
+|---|---|---|---|
+| 檔案大小 / File size | ~11.8 kb | ~11.6 kb | −1.7% |
+| 色度 PSNR / Luma PSNR | ~47.4 dB | ~46.3 dB | −1.1 dB |
 
-**Output folders:**
+高解析度複雜圖片（1080p 以上），gowebp 的 SNS 算法通常產生 **更小** 的輸出：
 
-| Folder | Contents |
+For high-resolution complex images (1080p+), gowebp's SNS algorithm often produces **smaller** output:
+
+| 圖片 / Image | cwebp | gowebp | 差異 / Delta |
+|---|---|---|---|
+| 1096×1600 photo | 312 kb | 232 kb | **−26%** |
+| 1536×2048 photo | 304 kb | 246 kb | **−19%** |
+
+詳細 benchmark 及對比圖片見 [gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata)。
+
+Detailed benchmarks and comparison images: [gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata).
+
+---
+
+## 與 libwebp 的異同 / Differences from libwebp
+
+gowebp 參考 libwebp 的核心算法移植，主要組件行為一致，但並非百分百相同。
+
+gowebp ports libwebp's core algorithms and matches most behaviors, but is not a 100% identical reimplementation.
+
+### 已實現 / Implemented
+
+| 組件 / Component | 說明 / Description |
 |---|---|
-| `test_data/libwebp/lossy/` | cwebp lossy output (`-q 90 -m 4`) |
-| `test_data/libwebp/lossless/` | cwebp lossless output (`-lossless -q 90`) |
-| `test_data/gowebp/lossy/` | gowebp lossy output (quality=90) |
-| `test_data/gowebp/lossless/` | gowebp lossless output |
-| `test_data/compare_results.md` | Full comparison table |
+| Boolean arithmetic coder | VP8 布林算術編碼器 / VP8 boolean arithmetic coder |
+| Forward / inverse DCT + WHT | 4×4 DCT 及 Walsh-Hadamard Transform |
+| Intra4×4 + Intra16×16 | 全部 14 個預測模式 / All 14 intra prediction modes |
+| RD mode selection | SSD + λ × bits，含 SAD top-4 預篩選 / with SAD top-4 pre-screening |
+| Trellis quantization | Viterbi DP，移植自 `TrellisQuantizeBlock()` |
+| Coeff probability adaptation | 兩次掃描自適應係數概率 / Two-pass adaptive coefficient probabilities |
+| UV chroma RD prediction | DC / VE / HE / TM 四模式選擇 / Four-mode RD selection |
+| SNS analysis | DCT-histogram alpha + K-means，精確移植 `VP8SetSegmentParams` |
+| VP8L lossless | 完整無損編碼，支援動畫 `EncodeAll` / Full lossless with animation |
 
-Images placed in a `hidden/` subfolder inside `original/` are automatically resized to 300×300 before encoding.
+### 不同之處 / Differences
 
-## Licence
+| 項目 / Item | libwebp | gowebp |
+|---|---|---|
+| 依賴 / Dependencies | C library，需要 cgo | 純 Go，無 cgo / Pure Go, no cgo |
+| 並行 / Parallelism | 單執行緒 / Single-threaded | Wave-front goroutine 並行 / parallel |
+| 量化分段 / Quant segments | 所有尺寸均 4 段 / Always 4 | 小圖 2 段，大圖 4 段 / 2 small, 4 large |
+| per-MB lambda scaling | `tlambda_` 按局部紋理縮放 | 未實現，使用固定 lambda |
+| Token partitions | 最多 8 個 / Up to 8 | 固定 1 個 / Fixed 1 |
+
+### PSNR 差異說明 / Note on PSNR
+
+PSNR 略低約 1 dB，主要來自 SNS 設計取捨：平滑區域（背景、皮膚）接受略多失真，紋理區域（頭髮、邊緣）保留更多細節。視覺差異極小。
+
+PSNR is ~1 dB lower, mainly because SNS trades flat-area accuracy for perceptual quality — smooth regions accept slightly more distortion while textured regions are better preserved. The visual difference is barely noticeable.
+
+---
+
+## 執行測試 / Running Tests
+
+```bash
+# 單元測試 / Unit tests
+go test ./...
+
+# 效能基準 / Benchmarks
+go test -bench=BenchmarkEncode -benchtime=5s
+
+# 與 cwebp 對比（需安裝 cwebp，圖片放於 test_data/original/）
+# Compare vs cwebp (requires cwebp, images in test_data/original/)
+go test -run TestCompareWithCwebp -v -timeout 300s
+```
+
+---
+
+## 授權 / License
+
+gowebp 採用 MIT License。
+
+部分代碼移植自 [libwebp](https://github.com/webmproject/libwebp)，保留其原始 BSD 3-Clause License 聲明（見各源文件頭部）。
 
 gowebp is MIT licensed.
 
-Portions ported from [libwebp](https://github.com/webmproject/libwebp):
-Copyright 2011 Google Inc. All Rights Reserved. BSD 3-Clause License.
+Portions ported from [libwebp](https://github.com/webmproject/libwebp) retain the original BSD 3-Clause License notice (see individual source file headers).
