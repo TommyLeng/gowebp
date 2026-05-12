@@ -98,7 +98,7 @@ gowebp ports libwebp's core algorithms and matches most behaviors, but is not a 
 |---|---|---|
 | 依賴 / Dependencies | C library，需要 cgo | 純 Go，無 cgo / Pure Go, no cgo |
 | 並行 / Parallelism | 單執行緒 / Single-threaded | Wave-front goroutine 並行 / parallel |
-| 量化分段 / Quant segments | 所有尺寸均 4 段 / Always 4 | 小圖 2 段，大圖 4 段 / 2 small, 4 large |
+| 量化分段 / Quant segments | 所有尺寸均 4 段 / Always 4 | 4 段（所有尺寸）/ 4 (all sizes) |
 | per-MB lambda scaling | `tlambda_` 按局部紋理縮放 | 未實現，使用固定 lambda |
 | Token partitions | 最多 8 個 / Up to 8 | 固定 1 個 / Fixed 1 |
 
