@@ -6,6 +6,63 @@ package gowebp
 
 import "sync"
 
+// mbWorkspace holds all temporary buffers for one MB's encoding work.
+// Pre-allocated once per goroutine (parallel path) or once per frame (serial path)
+// and reused across all MBs, avoiding repeated stack frame setup and improving
+// CPU cache locality.
+type mbWorkspace struct {
+	// 16×16 luma source
+	src16 [256]int16
+	// i16 prediction
+	pred16Best [256]int16
+	pred16     [256]int16 // scratch for each i16 mode trial
+	// i16 coefficients and reconstruction
+	mbI16Pred          [256]int16
+	mbI16AcLevels      [16][16]int16
+	mbI16DcQuantLevels [16]int16
+	yDcRaw16           [16]int16
+	whtOut16           [16]int16
+	whtRaster16        [16]int16
+	dcBlockCoeffs16    [16]int16
+	// i4 per-MB accumulators
+	i4AcLevels  [16][16]int16
+	i4DcLevels  [16]int16
+	localI4Modes [16]int
+	mbReconI4   [256]uint8
+	// i4 per-block temporaries
+	src4           [16]int16
+	pred4          [16]int16
+	dctOut         [16]int16
+	acQ            [16]int16
+	recBlock       [16]int16
+	bestBlkAcLevels [16]int16
+	bestBlkRecon   [16]uint8
+	// SAD pre-screening temporaries
+	sadPred   [16]int16 // scratch for one SAD prediction
+	sadScores [numI4Modes]int64
+	sadTmp    [numI4Modes]int64
+	// UV
+	predU8      [64]int16
+	predV8      [64]int16
+	uvLevels    [8][16]int16
+	uvSrc4      [16]int16
+	uvPred4     [16]int16
+	uvDctOut    [16]int16
+	uvQuant     [16]int16
+	uvRaster    [16]int16
+	uvRecBlock  [16]int16
+	// i16 inner loop
+	i16Src4     [16]int16
+	i16Pred4    [16]int16
+	i16DctOut   [16]int16
+	i16RasterCoeffs [16]int16
+	i16RecBlock [16]int16
+	i16Pred4b   [16]int16
+	// local copies of i4 accumulators (used within the i4 block, then assigned to ws fields)
+	localI4AcLevels [16][16]int16
+	localI4DcLevels [16]int16
+}
+
 // parallelThreshold is the minimum total MB count (mbW*mbH) above which
 // encodeFrameParallel is used instead of the serial encodeFrame.
 // Set to 0 so ALL images use the wave-front parallel encoder regardless of size.
@@ -114,6 +171,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 		go func(ry int, prevDone []chan struct{}) {
 			defer wg.Done()
 
+			// Allocate workspace once per goroutine; reused for every MB in this row.
+			ws := new(mbWorkspace)
+
 			// Per-row left-neighbor NZ state (reset at each row start).
 			var leftNzY [5]int
 			var leftNzU [3]int
@@ -169,8 +229,8 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				trellisI16Costs := &seg.trellisI16Costs
 				trellisUVCosts := &seg.trellisUVCosts
 
-				// Extract full 16x16 source block
-				var src16 [256]int16
+				// Extract full 16x16 source block into workspace.
+				src16 := &ws.src16
 				for y := 0; y < 16; y++ {
 					for x := 0; x < 16; x++ {
 						sx := px + x
@@ -190,30 +250,24 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				// -------------------------------------------------------
 				bestI16Mode := I16_DC_PRED
 				bestI16Score := int64(1<<62 - 1)
-				var pred16Best [256]int16
 
 				for mode := 0; mode < numI16Modes; mode++ {
-					var pred16 [256]int16
-					intra16Predict(mode, yuv, mbX, ry, pred16[:])
-					distortion := ssd16x16(src16[:], pred16[:])
+					intra16Predict(mode, yuv, mbX, ry, ws.pred16[:])
+					distortion := ssd16x16(src16[:], ws.pred16[:])
 					modeBits := i16ModeBitCost(mode)
 					score := distortion + int64(mbLambdaI16)*modeBits
 					if score < bestI16Score {
 						bestI16Score = score
 						bestI16Mode = mode
-						copy(pred16Best[:], pred16[:])
+						copy(ws.pred16Best[:], ws.pred16[:])
 					}
 				}
-				_ = pred16Best
+				_ = ws.pred16Best
 
 				// -------------------------------------------------------
 				// Try intra4
 				// -------------------------------------------------------
 				var bestI4Score int64
-				var i4AcLevels [16][16]int16
-				var i4DcLevels [16]int16
-				var localI4Modes [16]int
-				var mbReconI4 [16 * 16]uint8
 
 				{
 					topBlkMode := make([]int, 4)
@@ -232,8 +286,6 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 					}
 
 					var i4TotalScore int64
-					var localI4AcLevels [16][16]int16
-					var localI4DcLevels [16]int16
 
 					for by := 0; by < 4; by++ {
 						for bx := 0; bx < 4; bx++ {
@@ -241,9 +293,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 							bpx := px + bx*4
 							bpy := py + by*4
 
-							ctx := buildPred4ContextWithMBRecon(yuv, recon, reconStride, mbReconI4[:], px, py, bpx, bpy)
+							ctx := buildPred4ContextWithMBRecon(yuv, recon, reconStride, ws.mbReconI4[:], px, py, bpx, bpy)
 
-							var src4 [16]int16
+							src4 := &ws.src4
 							for y := 0; y < 4; y++ {
 								for x := 0; x < 4; x++ {
 									sx := bpx + x
@@ -261,60 +313,50 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 							topPred := topBlkMode[bx]
 							leftPred := 0
 							if bx > 0 {
-								leftPred = localI4Modes[blkIdx-1]
+								leftPred = ws.localI4Modes[blkIdx-1]
 							} else {
 								leftPred = leftBlkMode[by]
 							}
 
 							const sadTopN = 4
-							var sadScores [numI4Modes]int64
 							for i := 0; i < numI4Modes; i++ {
-								var p [16]int16
-								intra4Predict(i, ctx, p[:])
-								sadScores[i] = sad4x4(src4[:], p[:])
+								intra4Predict(i, ctx, ws.sadPred[:])
+								ws.sadScores[i] = sad4x4(src4[:], ws.sadPred[:])
 							}
-							var sadTmp [numI4Modes]int64
-							copy(sadTmp[:], sadScores[:])
+							copy(ws.sadTmp[:], ws.sadScores[:])
 							for k := 0; k < sadTopN; k++ {
 								minIdx := k
 								for j := k + 1; j < numI4Modes; j++ {
-									if sadTmp[j] < sadTmp[minIdx] {
+									if ws.sadTmp[j] < ws.sadTmp[minIdx] {
 										minIdx = j
 									}
 								}
-								sadTmp[k], sadTmp[minIdx] = sadTmp[minIdx], sadTmp[k]
+								ws.sadTmp[k], ws.sadTmp[minIdx] = ws.sadTmp[minIdx], ws.sadTmp[k]
 							}
-							sadCutoff := sadTmp[sadTopN-1]
+							sadCutoff := ws.sadTmp[sadTopN-1]
 
 							bestBlkMode := B_DC_PRED
 							bestBlkScore := int64(1<<62 - 1)
-							var bestBlkRecon [16]uint8
-							var bestBlkAcLevels [16]int16
 
 							for mode := 0; mode < numI4Modes; mode++ {
-								if sadScores[mode] > sadCutoff {
+								if ws.sadScores[mode] > sadCutoff {
 									continue
 								}
-								var pred4 [16]int16
-								intra4Predict(mode, ctx, pred4[:])
-
-								var dctOut [16]int16
-								fTransform(src4[:], pred4[:], dctOut[:])
+								intra4Predict(mode, ctx, ws.pred4[:])
+								fTransform(src4[:], ws.pred4[:], ws.dctOut[:])
 
 								trellisCtx0 := topNzI4[bx] + leftNzI4[by]
 								if trellisCtx0 > 2 {
 									trellisCtx0 = 2
 								}
-								var acQ [16]int16
-								trellisQuantize(dctOut[:], acQ[:], &qm.y1, 0, mbLambdaTrellisI4, trellisI4Costs,
+								trellisQuantize(ws.dctOut[:], ws.acQ[:], &qm.y1, 0, mbLambdaTrellisI4, trellisI4Costs,
 									(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]), trellisCtx0)
 
-								var recBlock [16]int16
-								iTransform4x4(dctOut[:], pred4[:], recBlock[:])
+								iTransform4x4(ws.dctOut[:], ws.pred4[:], ws.recBlock[:])
 
 								var distortion int64
 								for i := 0; i < 16; i++ {
-									d := int64(src4[i]) - int64(recBlock[i])
+									d := int64(src4[i]) - int64(ws.recBlock[i])
 									distortion += d * d
 								}
 
@@ -323,20 +365,20 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 								if score < bestBlkScore {
 									bestBlkScore = score
 									bestBlkMode = mode
-									copy(bestBlkAcLevels[:], acQ[:])
+									copy(ws.bestBlkAcLevels[:], ws.acQ[:])
 									for i := 0; i < 16; i++ {
-										bestBlkRecon[i] = uint8(recBlock[i])
+										ws.bestBlkRecon[i] = uint8(ws.recBlock[i])
 									}
 								}
 							}
 
-							localI4Modes[blkIdx] = bestBlkMode
-							localI4AcLevels[blkIdx] = bestBlkAcLevels
-							localI4DcLevels[blkIdx] = 0
+							ws.localI4Modes[blkIdx] = bestBlkMode
+							ws.localI4AcLevels[blkIdx] = ws.bestBlkAcLevels
+							ws.localI4DcLevels[blkIdx] = 0
 							i4TotalScore += bestBlkScore
 
 							bestNZ := 0
-							if findLast(bestBlkAcLevels[:], 0) >= 0 {
+							if findLast(ws.bestBlkAcLevels[:], 0) >= 0 {
 								bestNZ = 1
 							}
 							topNzI4[bx] = bestNZ
@@ -344,76 +386,61 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 
 							for y := 0; y < 4; y++ {
 								for x := 0; x < 4; x++ {
-									mbReconI4[(by*4+y)*16+(bx*4+x)] = bestBlkRecon[y*4+x]
+									ws.mbReconI4[(by*4+y)*16+(bx*4+x)] = ws.bestBlkRecon[y*4+x]
 								}
 							}
 
 							topBlkMode[bx] = bestBlkMode
 						}
-						leftBlkMode[by] = localI4Modes[by*4+3]
+						leftBlkMode[by] = ws.localI4Modes[by*4+3]
 					}
 
 					bestI4Score = i4TotalScore
-					i4AcLevels = localI4AcLevels
-					i4DcLevels = localI4DcLevels
 				}
 
 				// -------------------------------------------------------
 				// i16 post-quantization RD
 				// -------------------------------------------------------
-				var mbI16AcLevels [16][16]int16
-				var mbI16DcQuantLevels [16]int16
-				var mbI16Pred [256]int16
-
-				intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, ry, yuv.mbW, yuv.mbH, mbI16Pred[:])
-				var yDcRaw16 [16]int16
+				intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, ry, yuv.mbW, yuv.mbH, ws.mbI16Pred[:])
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
-						var src4, pred4 [16]int16
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								src4[y*4+x] = src16[(by*4+y)*16+(bx*4+x)]
-								pred4[y*4+x] = mbI16Pred[(by*4+y)*16+(bx*4+x)]
+								ws.i16Src4[y*4+x] = src16[(by*4+y)*16+(bx*4+x)]
+								ws.i16Pred4[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
 							}
 						}
-						var dctOut [16]int16
-						fTransform(src4[:], pred4[:], dctOut[:])
-						yDcRaw16[n] = dctOut[0]
-						dctOut[0] = 0
-						trellisQuantize(dctOut[:], mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
+						fTransform(ws.i16Src4[:], ws.i16Pred4[:], ws.i16DctOut[:])
+						ws.yDcRaw16[n] = ws.i16DctOut[0]
+						ws.i16DctOut[0] = 0
+						trellisQuantize(ws.i16DctOut[:], ws.mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
 							(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0]), 0)
 					}
 				}
-				var whtOut16 [16]int16
-				fTransformWHT(yDcRaw16[:], whtOut16[:])
-				quantizeBlockWHT(whtOut16[:], mbI16DcQuantLevels[:], &qm.y2)
+				fTransformWHT(ws.yDcRaw16[:], ws.whtOut16[:])
+				quantizeBlockWHT(ws.whtOut16[:], ws.mbI16DcQuantLevels[:], &qm.y2)
 
-				var whtRaster16 [16]int16
 				for n := 0; n < 16; n++ {
 					j := int(kZigzag[n])
-					whtRaster16[j] = int16(int32(mbI16DcQuantLevels[n]) * int32(qm.y2.q[j]))
+					ws.whtRaster16[j] = int16(int32(ws.mbI16DcQuantLevels[n]) * int32(qm.y2.q[j]))
 				}
-				var dcBlockCoeffs16 [16]int16
-				inverseWHT16(whtRaster16[:], dcBlockCoeffs16[:])
+				inverseWHT16(ws.whtRaster16[:], ws.dcBlockCoeffs16[:])
 
 				var i16PostQuantDistortion int64
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
-						var pred4 [16]int16
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								pred4[y*4+x] = mbI16Pred[(by*4+y)*16+(bx*4+x)]
+								ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
 							}
 						}
-						var rasterCoeffs [16]int16
-						dequantizeBlock(mbI16AcLevels[n][:], rasterCoeffs[:], &qm.y1, dcBlockCoeffs16[n])
-						var recBlock [16]int16
-						iTransform4x4(rasterCoeffs[:], pred4[:], recBlock[:])
+						dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
+						iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(recBlock[y*4+x])
+								d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(ws.i16RecBlock[y*4+x])
 								i16PostQuantDistortion += d * d
 							}
 						}
@@ -427,7 +454,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				info := &mbInfos[mbIdx]
 				if i4Score < i16Score {
 					info.isI4 = true
-					copy(info.i4Modes[:], localI4Modes[:])
+					copy(info.i4Modes[:], ws.localI4Modes[:])
 				} else {
 					info.isI4 = false
 					info.i16Mode = bestI16Mode
@@ -454,8 +481,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 							rPlane = reconV
 							sPlane = yuv.v
 						}
-						var pred8 [64]int16
-						predictUV(uvMode, rPlane, yuv.uvStride, mbX, ry, yuv.width, yuv.height, pred8[:])
+						predictUV(uvMode, rPlane, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.predU8[:])
 						uvW := (yuv.width + 1) / 2
 						uvH := (yuv.height + 1) / 2
 						for j := 0; j < 8; j++ {
@@ -469,7 +495,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 									bpy = uvH - 1
 								}
 								src := int64(sPlane[bpy*yuv.uvStride+bpx])
-								d := src - int64(pred8[j*8+i])
+								d := src - int64(ws.predU8[j*8+i])
 								if ch == 0 {
 									scoreU += d * d
 								} else {
@@ -493,26 +519,23 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				if info.isI4 {
 					for y := 0; y < 16; y++ {
 						for x := 0; x < 16; x++ {
-							recon[(py+y)*reconStride+(px+x)] = mbReconI4[y*16+x]
+							recon[(py+y)*reconStride+(px+x)] = ws.mbReconI4[y*16+x]
 						}
 					}
 				} else {
 					for by := 0; by < 4; by++ {
 						for bx := 0; bx < 4; bx++ {
 							n := by*4 + bx
-							var pred4 [16]int16
 							for y := 0; y < 4; y++ {
 								for x := 0; x < 4; x++ {
-									pred4[y*4+x] = mbI16Pred[(by*4+y)*16+(bx*4+x)]
+									ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
 								}
 							}
-							var rasterCoeffs [16]int16
-							dequantizeBlock(mbI16AcLevels[n][:], rasterCoeffs[:], &qm.y1, dcBlockCoeffs16[n])
-							var recBlock [16]int16
-							iTransform4x4(rasterCoeffs[:], pred4[:], recBlock[:])
+							dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
+							iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
 							for y := 0; y < 4; y++ {
 								for x := 0; x < 4; x++ {
-									recon[(py+by*4+y)*reconStride+(px+bx*4+x)] = uint8(recBlock[y*4+x])
+									recon[(py+by*4+y)*reconStride+(px+bx*4+x)] = uint8(ws.i16RecBlock[y*4+x])
 								}
 							}
 						}
@@ -541,37 +564,29 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				// -------------------------------------------------------
 				// UV quantization using RD-selected prediction mode.
 				// -------------------------------------------------------
-				var predU8 [64]int16
-				var predV8 [64]int16
-				predictUV(info.uvMode, reconU, yuv.uvStride, mbX, ry, yuv.width, yuv.height, predU8[:])
-				predictUV(info.uvMode, reconV, yuv.uvStride, mbX, ry, yuv.width, yuv.height, predV8[:])
+				predictUV(info.uvMode, reconU, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.predU8[:])
+				predictUV(info.uvMode, reconV, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.predV8[:])
 
-				var uvLevels [8][16]int16
 				for ch := 0; ch < 2; ch++ {
 					plane := yuv.u
-					pred8 := predU8
+					predSlice := ws.predU8
 					if ch == 1 {
 						plane = yuv.v
-						pred8 = predV8
+						predSlice = ws.predV8
 					}
 					for by := 0; by < 2; by++ {
 						for bx := 0; bx < 2; bx++ {
 							bn := ch*4 + by*2 + bx
-							var src4 [16]int16
-							var pred4 [16]int16
-							extractBlock4x4UV(plane, yuv.uvStride, mbX*8+bx*4, ry*8+by*4, yuv.width, yuv.height, src4[:])
-							// Extract 4×4 sub-block from the 8×8 prediction.
+							extractBlock4x4UV(plane, yuv.uvStride, mbX*8+bx*4, ry*8+by*4, yuv.width, yuv.height, ws.uvSrc4[:])
 							for y := 0; y < 4; y++ {
 								for x := 0; x < 4; x++ {
-									pred4[y*4+x] = pred8[(by*4+y)*8+(bx*4+x)]
+									ws.uvPred4[y*4+x] = predSlice[(by*4+y)*8+(bx*4+x)]
 								}
 							}
-							var dctOut [16]int16
-							fTransform(src4[:], pred4[:], dctOut[:])
-							var quant [16]int16
-							trellisQuantize(dctOut[:], quant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
+							fTransform(ws.uvSrc4[:], ws.uvPred4[:], ws.uvDctOut[:])
+							trellisQuantize(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
 								(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2]), 0)
-							uvLevels[bn] = quant
+							ws.uvLevels[bn] = ws.uvQuant
 						}
 					}
 				}
@@ -579,32 +594,29 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				// Reconstruct chroma and update reconU/reconV.
 				for ch := 0; ch < 2; ch++ {
 					reconPlane := reconU
-					pred8 := predU8
+					predSlice := ws.predU8
 					if ch == 1 {
 						reconPlane = reconV
-						pred8 = predV8
+						predSlice = ws.predV8
 					}
 					for by := 0; by < 2; by++ {
 						for bx := 0; bx < 2; bx++ {
 							bn := ch*4 + by*2 + bx
-							var pred4 [16]int16
 							for y := 0; y < 4; y++ {
 								for x := 0; x < 4; x++ {
-									pred4[y*4+x] = pred8[(by*4+y)*8+(bx*4+x)]
+									ws.uvPred4[y*4+x] = predSlice[(by*4+y)*8+(bx*4+x)]
 								}
 							}
-							var raster [16]int16
 							for n := 0; n < 16; n++ {
 								j := int(kZigzag[n])
-								raster[j] = int16(int32(uvLevels[bn][n]) * int32(qm.uv.q[j]))
+								ws.uvRaster[j] = int16(int32(ws.uvLevels[bn][n]) * int32(qm.uv.q[j]))
 							}
-							var recBlock [16]int16
-							iTransform4x4(raster[:], pred4[:], recBlock[:])
+							iTransform4x4(ws.uvRaster[:], ws.uvPred4[:], ws.uvRecBlock[:])
 							bPX := mbX*8 + bx*4
 							bPY := ry*8 + by*4
 							for y := 0; y < 4; y++ {
 								for x := 0; x < 4; x++ {
-									reconPlane[(bPY+y)*yuv.uvStride+(bPX+x)] = uint8(recBlock[y*4+x])
+									reconPlane[(bPY+y)*yuv.uvStride+(bPX+x)] = uint8(ws.uvRecBlock[y*4+x])
 								}
 							}
 						}
@@ -621,8 +633,8 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 					for by := 0; by < 4; by++ {
 						for bx := 0; bx < 4; bx++ {
 							n := by*4 + bx
-							cd.i4AC[n] = i4AcLevels[n]
-							last := findLast(i4AcLevels[n][:], 0)
+							cd.i4AC[n] = ws.localI4AcLevels[n]
+							last := findLast(ws.localI4AcLevels[n][:], 0)
 							nz := 0
 							if last >= 0 {
 								nz = 1
@@ -633,10 +645,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 					}
 					colTopNzDC = 0
 					leftNzY[4] = 0
-					_ = i4DcLevels
 				} else {
-					cd.i16DC = mbI16DcQuantLevels
-					lastDC := findLast(mbI16DcQuantLevels[:], 0)
+					cd.i16DC = ws.mbI16DcQuantLevels
+					lastDC := findLast(ws.mbI16DcQuantLevels[:], 0)
 					dcNZ := 0
 					if lastDC >= 0 {
 						dcNZ = 1
@@ -647,8 +658,8 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 					for by := 0; by < 4; by++ {
 						for bx := 0; bx < 4; bx++ {
 							n := by*4 + bx
-							cd.i16AC[n] = mbI16AcLevels[n]
-							last := findLast(mbI16AcLevels[n][:], 1)
+							cd.i16AC[n] = ws.mbI16AcLevels[n]
+							last := findLast(ws.mbI16AcLevels[n][:], 1)
 							nz := 0
 							if last >= 1 {
 								nz = 1
@@ -663,8 +674,8 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				for by := 0; by < 2; by++ {
 					for bx := 0; bx < 2; bx++ {
 						n := by*2 + bx
-						cd.uv[n] = uvLevels[n]
-						last := findLast(uvLevels[n][:], 0)
+						cd.uv[n] = ws.uvLevels[n]
+						last := findLast(ws.uvLevels[n][:], 0)
 						nz := 0
 						if last >= 0 {
 							nz = 1
@@ -676,8 +687,8 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 				for by := 0; by < 2; by++ {
 					for bx := 0; bx < 2; bx++ {
 						n := by*2 + bx
-						cd.uv[4+n] = uvLevels[4+n]
-						last := findLast(uvLevels[4+n][:], 0)
+						cd.uv[4+n] = ws.uvLevels[4+n]
+						last := findLast(ws.uvLevels[4+n][:], 0)
 						nz := 0
 						if last >= 0 {
 							nz = 1

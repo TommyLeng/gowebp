@@ -150,6 +150,9 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 	topNzV := make([]int, mbW*2+1)
 	topNzDC := make([]int, mbW+1)
 
+	// Allocate workspace once for the whole frame; reused across all MBs.
+	ws := new(mbWorkspace)
+
 	for mbY := 0; mbY < mbH; mbY++ {
 		leftNzY := [5]int{}
 		leftNzU := [3]int{}
@@ -177,8 +180,8 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 			trellisI16Costs := &seg.trellisI16Costs
 			trellisUVCosts := &seg.trellisUVCosts
 
-			// Extract full 16x16 source block
-			var src16 [256]int16
+			// Extract full 16x16 source block into workspace.
+			src16 := &ws.src16
 			for y := 0; y < 16; y++ {
 				for x := 0; x < 16; x++ {
 					sx := px + x
@@ -198,24 +201,19 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 			// -------------------------------------------------------
 			bestI16Mode := I16_DC_PRED
 			bestI16Score := int64(1<<62 - 1)
-			var pred16Best [256]int16
 
 			for mode := 0; mode < numI16Modes; mode++ {
-				var pred16 [256]int16
-				intra16Predict(mode, yuv, mbX, mbY, pred16[:])
-				distortion := ssd16x16(src16[:], pred16[:])
-				// bits cost for i16 mode: approximate with fixed costs
-				// VP8FixedCostsI16: DC=0,TM=1,VE=2,HE=3 -> bit costs in millibits
-				// Use rough estimate: all modes cost ~2-4 bits
+				intra16Predict(mode, yuv, mbX, mbY, ws.pred16[:])
+				distortion := ssd16x16(src16[:], ws.pred16[:])
 				modeBits := i16ModeBitCost(mode)
 				score := distortion + int64(mbLambdaI16)*modeBits
 				if score < bestI16Score {
 					bestI16Score = score
 					bestI16Mode = mode
-					copy(pred16Best[:], pred16[:])
+					copy(ws.pred16Best[:], ws.pred16[:])
 				}
 			}
-			_ = pred16Best
+			_ = ws.pred16Best
 
 			// -------------------------------------------------------
 			// Try intra4: for each of 16 4x4 blocks pick best mode
@@ -224,12 +222,6 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 			// actual reconstructed pixels (pred + dequantized residual)
 			// so subsequent blocks get correct intra4 prediction contexts.
 			var bestI4Score int64
-			var i4AcLevels [16][16]int16
-			var i4DcLevels [16]int16
-			var localI4Modes [16]int
-			// mbReconI4 holds reconstructed pixels built during i4 mode selection.
-			// It is also the mbRecon that is copied to the global recon buffer if i4 wins.
-			var mbReconI4 [16 * 16]uint8
 
 			{
 				// Track per-block top/left mode context
@@ -240,22 +232,16 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 				leftBlkMode := [4]int{leftI4Mode[0], leftI4Mode[1], leftI4Mode[2], leftI4Mode[3]}
 
 				// NZ context tracking for trellis: mirrors it->top_nz / it->left_nz in libwebp.
-				// topNzI4[bx] = 1 if the last block in column bx had a non-zero coeff.
-				// leftNzI4[by] = 1 if the last block in row by had a non-zero coeff.
-				// Seeded from the global topNzY which tracks across MBs.
 				var topNzI4 [4]int
 				var leftNzI4 [4]int
 				for bx := 0; bx < 4; bx++ {
 					topNzI4[bx] = topNzY[mbX*4+bx]
 				}
-				// leftNzY[by] from previous MB (already tracks left edge)
 				for by := 0; by < 4; by++ {
 					leftNzI4[by] = leftNzY[by]
 				}
 
 				var i4TotalScore int64
-				var localI4AcLevels [16][16]int16
-				var localI4DcLevels [16]int16
 
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx++ {
@@ -265,10 +251,10 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 
 						// Build prediction context (uses global recon for already-encoded MBs,
 						// and mbReconI4 for within this MB — containing true reconstructed pixels).
-						ctx := buildPred4ContextWithMBRecon(yuv, recon, reconStride, mbReconI4[:], px, py, bpx, bpy)
+						ctx := buildPred4ContextWithMBRecon(yuv, recon, reconStride, ws.mbReconI4[:], px, py, bpx, bpy)
 
 						// Extract 4x4 source
-						var src4 [16]int16
+						src4 := &ws.src4
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
 								sx := bpx + x
@@ -287,7 +273,7 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 						topPred := topBlkMode[bx]
 						leftPred := 0
 						if bx > 0 {
-							leftPred = localI4Modes[blkIdx-1]
+							leftPred = ws.localI4Modes[blkIdx-1]
 						} else {
 							leftPred = leftBlkMode[by]
 						}
@@ -296,63 +282,51 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 						// all 10 modes, then only run the full DCT+quantize path on the
 						// top sadTopN candidates. Gives ~2.5× speedup for the i4 path.
 						const sadTopN = 4
-						var sadScores [numI4Modes]int64
 						for i := 0; i < numI4Modes; i++ {
-							var p [16]int16
-							intra4Predict(i, ctx, p[:])
-							sadScores[i] = sad4x4(src4[:], p[:])
+							intra4Predict(i, ctx, ws.sadPred[:])
+							ws.sadScores[i] = sad4x4(src4[:], ws.sadPred[:])
 						}
 						// Find sadTopN-th lowest SAD via partial selection sort on a copy.
-						var sadTmp [numI4Modes]int64
-						copy(sadTmp[:], sadScores[:])
+						copy(ws.sadTmp[:], ws.sadScores[:])
 						for k := 0; k < sadTopN; k++ {
 							minIdx := k
 							for j := k + 1; j < numI4Modes; j++ {
-								if sadTmp[j] < sadTmp[minIdx] {
+								if ws.sadTmp[j] < ws.sadTmp[minIdx] {
 									minIdx = j
 								}
 							}
-							sadTmp[k], sadTmp[minIdx] = sadTmp[minIdx], sadTmp[k]
+							ws.sadTmp[k], ws.sadTmp[minIdx] = ws.sadTmp[minIdx], ws.sadTmp[k]
 						}
-						sadCutoff := sadTmp[sadTopN-1]
+						sadCutoff := ws.sadTmp[sadTopN-1]
 
 						// Try all 10 I4 modes; track the best.
 						bestBlkMode := B_DC_PRED
 						bestBlkScore := int64(1<<62 - 1)
-						var bestBlkRecon [16]uint8 // actual reconstructed pixels for best mode
-						var bestBlkAcLevels [16]int16
 
 						for mode := 0; mode < numI4Modes; mode++ {
-							if sadScores[mode] > sadCutoff {
+							if ws.sadScores[mode] > sadCutoff {
 								continue
 							}
-							var pred4 [16]int16
-							intra4Predict(mode, ctx, pred4[:])
+							intra4Predict(mode, ctx, ws.pred4[:])
 
 							// Forward DCT of (src - pred)
-							var dctOut [16]int16
-							fTransform(src4[:], pred4[:], dctOut[:])
+							fTransform(src4[:], ws.pred4[:], ws.dctOut[:])
 
 							// Trellis-quantize all 16 coefficients (i4: no WHT, first=0).
-							// ctx0 = topNzI4[bx] + leftNzI4[by] mirrors libwebp's NZ context.
-							// trellisQuantize writes dequantized values back into dctOut.
 							trellisCtx0 := topNzI4[bx] + leftNzI4[by]
 							if trellisCtx0 > 2 {
 								trellisCtx0 = 2
 							}
-							var acQ [16]int16
-							trellisQuantize(dctOut[:], acQ[:], &qm.y1, 0, mbLambdaTrellisI4, trellisI4Costs,
+							trellisQuantize(ws.dctOut[:], ws.acQ[:], &qm.y1, 0, mbLambdaTrellisI4, trellisI4Costs,
 								(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]), trellisCtx0)
 
 							// Inverse DCT → reconstructed block.
-							// dctOut now holds dequantized raster-order coefficients.
-							var recBlock [16]int16
-							iTransform4x4(dctOut[:], pred4[:], recBlock[:])
+							iTransform4x4(ws.dctOut[:], ws.pred4[:], ws.recBlock[:])
 
 							// Distortion = SSD of source vs actual reconstructed pixels
 							var distortion int64
 							for i := 0; i < 16; i++ {
-								d := int64(src4[i]) - int64(recBlock[i])
+								d := int64(src4[i]) - int64(ws.recBlock[i])
 								distortion += d * d
 							}
 
@@ -363,21 +337,21 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 							if score < bestBlkScore {
 								bestBlkScore = score
 								bestBlkMode = mode
-								copy(bestBlkAcLevels[:], acQ[:])
+								copy(ws.bestBlkAcLevels[:], ws.acQ[:])
 								for i := 0; i < 16; i++ {
-									bestBlkRecon[i] = uint8(recBlock[i])
+									ws.bestBlkRecon[i] = uint8(ws.recBlock[i])
 								}
 							}
 						}
 
-						localI4Modes[blkIdx] = bestBlkMode
-						localI4AcLevels[blkIdx] = bestBlkAcLevels
-						localI4DcLevels[blkIdx] = 0 // i4 has no WHT DC
+						ws.localI4Modes[blkIdx] = bestBlkMode
+						ws.localI4AcLevels[blkIdx] = ws.bestBlkAcLevels
+						ws.localI4DcLevels[blkIdx] = 0 // i4 has no WHT DC
 						i4TotalScore += bestBlkScore
 
 						// Update NZ context for subsequent blocks' trellis decisions.
 						bestNZ := 0
-						if findLast(bestBlkAcLevels[:], 0) >= 0 {
+						if findLast(ws.bestBlkAcLevels[:], 0) >= 0 {
 							bestNZ = 1
 						}
 						topNzI4[bx] = bestNZ
@@ -386,7 +360,7 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 						// Update mbReconI4 with actual reconstructed pixels.
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								mbReconI4[(by*4+y)*16+(bx*4+x)] = bestBlkRecon[y*4+x]
+								ws.mbReconI4[(by*4+y)*16+(bx*4+x)] = ws.bestBlkRecon[y*4+x]
 							}
 						}
 
@@ -394,112 +368,57 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 						topBlkMode[bx] = bestBlkMode
 					}
 					// After this row, update left mode context for next MB's bx=0 at this row
-					leftBlkMode[by] = localI4Modes[by*4+3]
+					leftBlkMode[by] = ws.localI4Modes[by*4+3]
 				}
 
 				bestI4Score = i4TotalScore
-				i4AcLevels = localI4AcLevels
-				i4DcLevels = localI4DcLevels
 			}
 
 			// -------------------------------------------------------
-			// RD decision: i16 vs i4
-			//
-			// We need a fair comparison. Both scores must use:
-			//   - post-quantization distortion (SSD of source vs actual reconstructed)
-			//   - same lambda scale for bit costs
-			//
-			// For i16: compute the full reconstruction (DCT → WHT → quantize → dequant
-			//   → iWHT → iDCT) and measure the post-quantization distortion.
-			//   Then score = distortion + lambdaMode * headerBits.
-			//
-			// For i4: bestI4Score = sum over 16 blocks of (post-quant SSD + lambdaI4 * modeBits).
-			//   The mode bit costs use lambdaI4 scale. The header cost (MB type bit) is separate.
-			//
-			// To compare at the same scale, we need to account for the fact that
-			// i4 bit costs used lambdaI4 while i16 uses lambdaMode.
-			// lambdaI4 = (3*qI4^2)>>7 and lambdaMode = (1*qI4^2)>>7, so lambdaI4 ≈ 3*lambdaMode.
-			//
-			// Strategy: compute i16 post-quant distortion, add lambdaMode * i16HdrBits.
-			// For i4: use post-quant distortion from bestI4Score decomposition.
-			//   Since bestI4Score = distortion_sum + lambdaI4 * mode_bits_sum, and
-			//   we want distortion_sum + lambdaMode * mode_bits_sum:
-			//   i4Score_normalized ≈ bestI4Score - lambdaI4*bits + lambdaMode*bits
-			//                      = bestI4Score - 2/3 * lambdaI4 * bits
-			// Approximation: use bestI4Score / 3 + i4HeaderPenalty (since lambdaI4≈3*lambdaMode).
-			// This avoids needing to separately track distortion vs bit costs.
-			//
-			// Simpler equivalent: compare i16 and i4 at the same lambda=lambdaMode:
-			//   i16Score = i16PostQuantDistortion + lambdaMode * i16ModeBits
-			//   i4Score  = i4PostQuantDistortion  + lambdaMode * i4ModeBits + i4HeaderCost
-			// where i4PostQuantDistortion = bestI4Score - lambdaI4 * i4ModeBits_sum.
-			// But we don't have i4ModeBits separately from the score.
-			//
-			// Practical approach: since distortion dominates at quality=90 and
-			// both scores share the same distortion unit, just scale the bit terms equally.
-			// Use bestI4Score as-is (overestimates bit cost penalty for i4 by ~3x) but
-			// also compute the i16 score with lambdaI4 scale to match.
-			//
-			// This biases toward i16 (penalizes i4 bit costs more), which is actually
-			// fine — it means we choose i4 only when it meaningfully beats i16 on distortion.
-			// -------------------------------------------------------
-
 			// Compute i16 post-quantization distortion.
-			var mbI16AcLevels [16][16]int16
-			var mbI16DcQuantLevels [16]int16
-			var mbI16Pred [256]int16
-
-			intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, mbY, yuv.mbW, yuv.mbH, mbI16Pred[:])
-			var yDcRaw16 [16]int16
+			// -------------------------------------------------------
+			intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, mbY, yuv.mbW, yuv.mbH, ws.mbI16Pred[:])
 			for by := 0; by < 4; by++ {
 				for bx := 0; bx < 4; bx++ {
 					n := by*4 + bx
-					var src4, pred4 [16]int16
 					for y := 0; y < 4; y++ {
 						for x := 0; x < 4; x++ {
-							src4[y*4+x] = src16[(by*4+y)*16+(bx*4+x)]
-							pred4[y*4+x] = mbI16Pred[(by*4+y)*16+(bx*4+x)]
+							ws.i16Src4[y*4+x] = src16[(by*4+y)*16+(bx*4+x)]
+							ws.i16Pred4[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
 						}
 					}
-					var dctOut [16]int16
-					fTransform(src4[:], pred4[:], dctOut[:])
-					yDcRaw16[n] = dctOut[0]
-					dctOut[0] = 0
-					trellisQuantize(dctOut[:], mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
+					fTransform(ws.i16Src4[:], ws.i16Pred4[:], ws.i16DctOut[:])
+					ws.yDcRaw16[n] = ws.i16DctOut[0]
+					ws.i16DctOut[0] = 0
+					trellisQuantize(ws.i16DctOut[:], ws.mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
 						(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0]), 0)
 				}
 			}
-			var whtOut16 [16]int16
-			fTransformWHT(yDcRaw16[:], whtOut16[:])
-			quantizeBlockWHT(whtOut16[:], mbI16DcQuantLevels[:], &qm.y2)
+			fTransformWHT(ws.yDcRaw16[:], ws.whtOut16[:])
+			quantizeBlockWHT(ws.whtOut16[:], ws.mbI16DcQuantLevels[:], &qm.y2)
 
 			// Dequantize WHT → iWHT → per-block DC coeffs
-			var whtRaster16 [16]int16
 			for n := 0; n < 16; n++ {
 				j := int(kZigzag[n])
-				whtRaster16[j] = int16(int32(mbI16DcQuantLevels[n]) * int32(qm.y2.q[j]))
+				ws.whtRaster16[j] = int16(int32(ws.mbI16DcQuantLevels[n]) * int32(qm.y2.q[j]))
 			}
-			var dcBlockCoeffs16 [16]int16
-			inverseWHT16(whtRaster16[:], dcBlockCoeffs16[:])
+			inverseWHT16(ws.whtRaster16[:], ws.dcBlockCoeffs16[:])
 
 			// Reconstruct i16 and measure post-quantization distortion
 			var i16PostQuantDistortion int64
 			for by := 0; by < 4; by++ {
 				for bx := 0; bx < 4; bx++ {
 					n := by*4 + bx
-					var pred4 [16]int16
 					for y := 0; y < 4; y++ {
 						for x := 0; x < 4; x++ {
-							pred4[y*4+x] = mbI16Pred[(by*4+y)*16+(bx*4+x)]
+							ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
 						}
 					}
-					var rasterCoeffs [16]int16
-					dequantizeBlock(mbI16AcLevels[n][:], rasterCoeffs[:], &qm.y1, dcBlockCoeffs16[n])
-					var recBlock [16]int16
-					iTransform4x4(rasterCoeffs[:], pred4[:], recBlock[:])
+					dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
+					iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
 					for y := 0; y < 4; y++ {
 						for x := 0; x < 4; x++ {
-							d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(recBlock[y*4+x])
+							d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(ws.i16RecBlock[y*4+x])
 							i16PostQuantDistortion += d * d
 						}
 					}
@@ -518,7 +437,7 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 			info := &mbInfos[mbIdx]
 			if i4Score < i16Score {
 				info.isI4 = true
-				copy(info.i4Modes[:], localI4Modes[:])
+				copy(info.i4Modes[:], ws.localI4Modes[:])
 			} else {
 				info.isI4 = false
 				info.i16Mode = bestI16Mode
@@ -547,8 +466,7 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 						rPlane = reconV
 						sPlane = yuv.v
 					}
-					var pred8 [64]int16
-					predictUV(uvMode, rPlane, yuv.uvStride, mbX, mbY, yuv.width, yuv.height, pred8[:])
+					predictUV(uvMode, rPlane, yuv.uvStride, mbX, mbY, yuv.width, yuv.height, ws.predU8[:])
 					uvW := (yuv.width + 1) / 2
 					uvH := (yuv.height + 1) / 2
 					for j := 0; j < 8; j++ {
@@ -562,7 +480,7 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 								bpy = uvH - 1
 							}
 							src := int64(sPlane[bpy*yuv.uvStride+bpx])
-							d := src - int64(pred8[j*8+i])
+							d := src - int64(ws.predU8[j*8+i])
 							if ch == 0 {
 								scoreU += d * d
 							} else {
@@ -589,29 +507,25 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 				// Copy to global recon buffer for adjacent MBs' prediction context.
 				for y := 0; y < 16; y++ {
 					for x := 0; x < 16; x++ {
-						recon[(py+y)*reconStride+(px+x)] = mbReconI4[y*16+x]
+						recon[(py+y)*reconStride+(px+x)] = ws.mbReconI4[y*16+x]
 					}
 				}
 			} else {
 				// i16: all the quantization and reconstruction was already computed
-				// in the RD decision section above (mbI16AcLevels, mbI16DcQuantLevels,
-				// mbI16Pred, dcBlockCoeffs16). Just write the reconstructed pixels to recon.
+				// in the RD decision section above. Just write the reconstructed pixels to recon.
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
-						var pred4 [16]int16
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								pred4[y*4+x] = mbI16Pred[(by*4+y)*16+(bx*4+x)]
+								ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
 							}
 						}
-						var rasterCoeffs [16]int16
-						dequantizeBlock(mbI16AcLevels[n][:], rasterCoeffs[:], &qm.y1, dcBlockCoeffs16[n])
-						var recBlock [16]int16
-						iTransform4x4(rasterCoeffs[:], pred4[:], recBlock[:])
+						dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
+						iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								recon[(py+by*4+y)*reconStride+(px+bx*4+x)] = uint8(recBlock[y*4+x])
+								recon[(py+by*4+y)*reconStride+(px+bx*4+x)] = uint8(ws.i16RecBlock[y*4+x])
 							}
 						}
 					}
@@ -632,8 +546,6 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 				// i16 MB: set i4 context to the i16 mode.
 				// The VP8 spec says: for i16 MBs, the top/left prediction mode
 				// contexts for adjacent i4 blocks are set to the i16 mode.
-				// The decoder's parsePredModeY16 sets d.upMB[mbx].pred[i] = i16Mode
-				// and d.leftMB.pred[j] = i16Mode for all i,j.
 				// Our i4 mode constants match the i16 constants:
 				//   B_DC_PRED=0=I16_DC_PRED, B_TM_PRED=1=I16_TM_PRED,
 				//   B_VE_PRED=2=I16_VE_PRED, B_HE_PRED=3=I16_HE_PRED.
@@ -646,12 +558,7 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 			}
 
 			// -------------------------------------------------------
-			// Encode coefficients
-			// -------------------------------------------------------
-			// -------------------------------------------------------
-			// Store coefficient levels in mbCoeffs for the two-pass
-			// probability adaptation (stats → adapted probs → entropy coding).
-			// Also update NZ context arrays so subsequent MBs use the correct ctx.
+			// Store coefficient levels and update NZ context
 			// -------------------------------------------------------
 			cd := &mbCoeffs[mbIdx]
 			cd.isI4 = info.isI4
@@ -661,8 +568,8 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
-						cd.i4AC[n] = i4AcLevels[n]
-						last := findLast(i4AcLevels[n][:], 0)
+						cd.i4AC[n] = ws.localI4AcLevels[n]
+						last := findLast(ws.localI4AcLevels[n][:], 0)
 						nz := 0
 						if last >= 0 {
 							nz = 1
@@ -673,12 +580,11 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 				}
 				topNzDC[mbX] = 0
 				leftNzY[4] = 0
-				_ = i4DcLevels
 
 			} else {
 				// i16: store DC and AC levels, update NZ ctx.
-				cd.i16DC = mbI16DcQuantLevels
-				lastDC := findLast(mbI16DcQuantLevels[:], 0)
+				cd.i16DC = ws.mbI16DcQuantLevels
+				lastDC := findLast(ws.mbI16DcQuantLevels[:], 0)
 				dcNZ := 0
 				if lastDC >= 0 {
 					dcNZ = 1
@@ -689,8 +595,8 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
-						cd.i16AC[n] = mbI16AcLevels[n]
-						last := findLast(mbI16AcLevels[n][:], 1)
+						cd.i16AC[n] = ws.mbI16AcLevels[n]
+						last := findLast(ws.mbI16AcLevels[n][:], 1)
 						nz := 0
 						if last >= 1 {
 							nz = 1
@@ -702,72 +608,60 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 			}
 
 			// UV quantization using RD-selected prediction mode.
-			// Compute 8×8 prediction for U and V using the chosen uvMode.
-			var predU8 [64]int16
-			var predV8 [64]int16
-			predictUV(info.uvMode, reconU, yuv.uvStride, mbX, mbY, yuv.width, yuv.height, predU8[:])
-			predictUV(info.uvMode, reconV, yuv.uvStride, mbX, mbY, yuv.width, yuv.height, predV8[:])
+			predictUV(info.uvMode, reconU, yuv.uvStride, mbX, mbY, yuv.width, yuv.height, ws.predU8[:])
+			predictUV(info.uvMode, reconV, yuv.uvStride, mbX, mbY, yuv.width, yuv.height, ws.predV8[:])
 
-			var uvLevels [8][16]int16
 			for ch := 0; ch < 2; ch++ {
 				plane := yuv.u
-				pred8 := predU8
+				predSlice := ws.predU8
 				if ch == 1 {
 					plane = yuv.v
-					pred8 = predV8
+					predSlice = ws.predV8
 				}
 				for by := 0; by < 2; by++ {
 					for bx := 0; bx < 2; bx++ {
 						bn := ch*4 + by*2 + bx
-						var src4 [16]int16
-						var pred4 [16]int16
-						extractBlock4x4UV(plane, yuv.uvStride, mbX*8+bx*4, mbY*8+by*4, yuv.width, yuv.height, src4[:])
+						extractBlock4x4UV(plane, yuv.uvStride, mbX*8+bx*4, mbY*8+by*4, yuv.width, yuv.height, ws.uvSrc4[:])
 						// Extract 4×4 sub-block from the 8×8 prediction.
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								pred4[y*4+x] = pred8[(by*4+y)*8+(bx*4+x)]
+								ws.uvPred4[y*4+x] = predSlice[(by*4+y)*8+(bx*4+x)]
 							}
 						}
-						var dctOut [16]int16
-						fTransform(src4[:], pred4[:], dctOut[:])
-						var quant [16]int16
-						trellisQuantize(dctOut[:], quant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
+						fTransform(ws.uvSrc4[:], ws.uvPred4[:], ws.uvDctOut[:])
+						trellisQuantize(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
 							(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2]), 0)
-						uvLevels[bn] = quant
+						ws.uvLevels[bn] = ws.uvQuant
 					}
 				}
 			}
 
 			// Reconstruct chroma and update reconU/reconV for subsequent MBs.
-			// Re-dequantize from levels (since we need a fresh raster for iDCT).
 			for ch := 0; ch < 2; ch++ {
 				reconPlane := reconU
-				pred8 := predU8
+				predSlice := ws.predU8
 				if ch == 1 {
 					reconPlane = reconV
-					pred8 = predV8
+					predSlice = ws.predV8
 				}
 				for by := 0; by < 2; by++ {
 					for bx := 0; bx < 2; bx++ {
 						bn := ch*4 + by*2 + bx
-						var pred4 [16]int16
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								pred4[y*4+x] = pred8[(by*4+y)*8+(bx*4+x)]
+								ws.uvPred4[y*4+x] = predSlice[(by*4+y)*8+(bx*4+x)]
 							}
 						}
-						var raster [16]int16
 						for n := 0; n < 16; n++ {
 							j := int(kZigzag[n])
-							raster[j] = int16(int32(uvLevels[bn][n]) * int32(qm.uv.q[j]))
+							ws.uvRaster[j] = int16(int32(ws.uvLevels[bn][n]) * int32(qm.uv.q[j]))
 						}
-						var recBlock [16]int16
-						iTransform4x4(raster[:], pred4[:], recBlock[:])
+						iTransform4x4(ws.uvRaster[:], ws.uvPred4[:], ws.uvRecBlock[:])
 						bPX := mbX*8 + bx*4
 						bPY := mbY*8 + by*4
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								reconPlane[(bPY+y)*yuv.uvStride+(bPX+x)] = uint8(recBlock[y*4+x])
+								reconPlane[(bPY+y)*yuv.uvStride+(bPX+x)] = uint8(ws.uvRecBlock[y*4+x])
 							}
 						}
 					}
@@ -778,8 +672,8 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 			for by := 0; by < 2; by++ {
 				for bx := 0; bx < 2; bx++ {
 					n := by*2 + bx
-					cd.uv[n] = uvLevels[n]
-					last := findLast(uvLevels[n][:], 0)
+					cd.uv[n] = ws.uvLevels[n]
+					last := findLast(ws.uvLevels[n][:], 0)
 					nz := 0
 					if last >= 0 {
 						nz = 1
@@ -791,8 +685,8 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 			for by := 0; by < 2; by++ {
 				for bx := 0; bx < 2; bx++ {
 					n := by*2 + bx
-					cd.uv[4+n] = uvLevels[4+n]
-					last := findLast(uvLevels[4+n][:], 0)
+					cd.uv[4+n] = ws.uvLevels[4+n]
+					last := findLast(ws.uvLevels[4+n][:], 0)
 					nz := 0
 					if last >= 0 {
 						nz = 1
