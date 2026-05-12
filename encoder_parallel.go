@@ -361,7 +361,24 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 								}
 
 								modeBits := i4ModeBitCost(mode, topPred, leftPred)
-								score := distortion + int64(mbLambdaI4)*modeBits
+
+								// Flatness penalty: mirrors PickBestIntra4 in libwebp.
+								// If block is flat (≤3 non-zero AC coeffs) and mode != B_DC_PRED,
+								// add FLATNESS_PENALTY * lambda to discourage complex modes.
+								var flatPenalty int64
+								if mode > 0 {
+									nzAC := 0
+									for _, v := range ws.acQ[1:16] {
+										if v != 0 {
+											nzAC++
+										}
+									}
+									if nzAC <= flatnessLimitI4 {
+										flatPenalty = flatnessPenalty * int64(mbLambdaI4)
+									}
+								}
+
+								score := distortion + int64(mbLambdaI4)*modeBits + flatPenalty
 								if score < bestBlkScore {
 									bestBlkScore = score
 									bestBlkMode = mode
