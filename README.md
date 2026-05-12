@@ -49,35 +49,26 @@ Test environment: Apple M1 Max, Go 1.25, cwebp 1.4.0 (quality=90)
 | 圖片尺寸 / Image Size | cwebp | gowebp | 加速 / Speedup |
 |---|---|---|---|
 | 300×300 | ~21 ms | **~6 ms** | **3.4×** |
+| 768×512 (Kodak) | ~50 ms | **~30 ms** | **1.7×** |
 | 1536×2048 | ~250 ms | **~102 ms** | **2.5×** |
 
 gowebp 更快的原因：直接作為 library 調用（無 subprocess fork 開銷），並採用 wave-front goroutine 並行編碼。
 
 gowebp is faster because it runs in-process (no subprocess fork overhead) and uses wave-front goroutine parallel encoding across rows.
 
-### 檔案大小 / File Size
+### 檔案大小摘要 / File Size Summary
 
-人像照片（約 300×300），quality=90：
-
-Portrait photos (~300×300), quality=90:
-
-| | cwebp | gowebp | 差異 / Delta |
+| 圖片類型 / Image type | cwebp | gowebp | Δ size |
 |---|---|---|---|
-| 檔案大小 / File size | ~11.8 kb | ~11.6 kb | −1.7% |
-| 色度 PSNR / Luma PSNR | ~47.4 dB | ~46.3 dB | −1.1 dB |
+| 人像 300×300 / Portrait 300×300 | 11.8 kb | 11.6 kb | −1.7% |
+| 複雜大圖 1536×2048 / Complex large | 304 kb | 246 kb | **−19%** |
+| Kodak 標準測試集平均 / Kodak avg | baseline | +15% | 複雜自然場景 |
 
-高解析度複雜圖片（1080p 以上），gowebp 的 SNS 算法通常產生 **更小** 的輸出：
+詳細測試數據、對比圖片及說明見：
 
-For high-resolution complex images (1080p+), gowebp's SNS algorithm often produces **smaller** output:
+For detailed benchmark data, comparison images and analysis, see:
 
-| 圖片 / Image | cwebp | gowebp | 差異 / Delta |
-|---|---|---|---|
-| 1096×1600 photo | 312 kb | 232 kb | **−26%** |
-| 1536×2048 photo | 304 kb | 246 kb | **−19%** |
-
-詳細 benchmark 及對比圖片見 [gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata)。
-
-Detailed benchmarks and comparison images: [gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata).
+👉 **[gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata)**
 
 ---
 
