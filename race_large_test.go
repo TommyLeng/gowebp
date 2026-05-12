@@ -15,7 +15,7 @@ import (
 )
 
 // TestEncodeLargeParallelCorrectness encodes jablehk_snexxxxxxx_0055.jpg
-// (1536×2048, 12288 MBs >> parallelThreshold) using the wave-front parallel
+// (1536×2048) using the wave-front parallel
 // path and verifies the output decodes correctly.
 func TestEncodeLargeParallelCorrectness(t *testing.T) {
 	f, err := os.Open("test_data/original/jablehk_snexxxxxxx_0055.jpg")

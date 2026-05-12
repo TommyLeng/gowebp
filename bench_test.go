@@ -16,7 +16,7 @@ import (
 )
 
 // BenchmarkEncode300x300 encodes a 300x300 JPEG resized image at quality 90.
-// Uses the serial encoding path (300×300 = 361 MBs < parallelThreshold=500).
+// Uses the wave-front parallel encoding path (parallelThreshold=0, all sizes parallelised).
 func BenchmarkEncode300x300(b *testing.B) {
 	f, err := os.Open("test_data/original/hidden/CD15 - Gallarde,Nica_fix.jpg")
 	if err != nil {
@@ -44,7 +44,7 @@ func BenchmarkEncode300x300(b *testing.B) {
 }
 
 // BenchmarkEncodeLarge encodes a 1536×2048 JPEG at quality 90.
-// Uses the parallel wave-front encoding path (12288 MBs >> parallelThreshold=500).
+// Uses the wave-front parallel encoding path (parallelThreshold=0, all sizes parallelised).
 func BenchmarkEncodeLarge(b *testing.B) {
 	f, err := os.Open("test_data/original/jablehk_snexxxxxxx_0055.jpg")
 	if err != nil {

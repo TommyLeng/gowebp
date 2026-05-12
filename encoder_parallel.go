@@ -8,8 +8,8 @@ import "sync"
 
 // parallelThreshold is the minimum total MB count (mbW*mbH) above which
 // encodeFrameParallel is used instead of the serial encodeFrame.
-// Below ~360×360px the serial path is faster due to goroutine overhead.
-const parallelThreshold = 500
+// Set to 0 so ALL images use the wave-front parallel encoder regardless of size.
+const parallelThreshold = 0
 
 // rowBottomNz stores the NZ context state that the last MB in a row leaves
 // behind for the next row to consume. It is written by row ry after it

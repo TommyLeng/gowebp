@@ -4,6 +4,7 @@
 
 package gowebp
 
+import "sync"
 
 // Spatial Noise Shaping (SNS) — faithful port of libwebp's analysis_enc.c + quant_enc.c.
 //
@@ -419,12 +420,19 @@ func computeSNS(yuv *yuvImage, mbW, mbH, baseQ int) snsResult {
 	mbCount := mbW * mbH
 
 	// Step 1: compute per-MB alpha using libwebp's DCT-based metric.
+	// Each row is independent (read-only yuv, disjoint write indices) — safe to parallelise.
 	mbAlphaSlice := make([]int, mbCount)
+	var snsWG sync.WaitGroup
 	for mbY := 0; mbY < mbH; mbY++ {
-		for mbX := 0; mbX < mbW; mbX++ {
-			mbAlphaSlice[mbY*mbW+mbX] = computeMBAlphaLibwebp(yuv, mbX, mbY)
-		}
+		snsWG.Add(1)
+		go func(ry int) {
+			defer snsWG.Done()
+			for mbX := 0; mbX < mbW; mbX++ {
+				mbAlphaSlice[ry*mbW+mbX] = computeMBAlphaLibwebp(yuv, mbX, ry)
+			}
+		}(mbY)
 	}
+	snsWG.Wait()
 
 	// Step 2: build alpha histogram.
 	var alphaHist [maxAlpha + 1]int

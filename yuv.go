@@ -4,7 +4,10 @@
 
 package gowebp
 
-import "image"
+import (
+	"image"
+	"sync"
+)
 
 // yuvImage holds YUV 4:2:0 planar data.
 // The Y plane is padded to the next multiple of 16 in both dimensions by
@@ -68,34 +71,41 @@ func rgbaToYUV420(img image.Image) *yuvImage {
 	oy := bounds.Min.Y
 
 	// Fill luma plane for the true image region.
+	// Each row writes to non-overlapping indices — safe to parallelise.
+	var yuvWG sync.WaitGroup
 	for py := 0; py < h; py++ {
-		for px := 0; px < w; px++ {
-			r32, g32, b32, _ := img.At(ox+px, oy+py).RGBA()
-			// RGBA() returns 16-bit values; convert to 8-bit
-			r := int(r32 >> 8)
-			g := int(g32 >> 8)
-			b := int(b32 >> 8)
+		yuvWG.Add(1)
+		go func(row int) {
+			defer yuvWG.Done()
+			for px := 0; px < w; px++ {
+				r32, g32, b32, _ := img.At(ox+px, oy+row).RGBA()
+				// RGBA() returns 16-bit values; convert to 8-bit
+				r := int(r32 >> 8)
+				g := int(g32 >> 8)
+				b := int(b32 >> 8)
 
-			// Y (full resolution)
-			luma := 16839*r + 33059*g + 6420*b
-			y := (luma + yuvHalf + (16 << yuvFix)) >> yuvFix
-			if y > 235 {
-				y = 235
+				// Y (full resolution)
+				luma := 16839*r + 33059*g + 6420*b
+				y := (luma + yuvHalf + (16 << yuvFix)) >> yuvFix
+				if y > 235 {
+					y = 235
+				}
+				if y < 16 {
+					y = 16
+				}
+				yuv.y[row*mbW+px] = uint8(y)
 			}
-			if y < 16 {
-				y = 16
-			}
-			yuv.y[py*mbW+px] = uint8(y)
-		}
 
-		// Pad right edge: replicate last valid column for px = w..mbW-1.
-		if w < mbW {
-			edge := yuv.y[py*mbW+(w-1)]
-			for px := w; px < mbW; px++ {
-				yuv.y[py*mbW+px] = edge
+			// Pad right edge: replicate last valid column for px = w..mbW-1.
+			if w < mbW {
+				edge := yuv.y[row*mbW+(w-1)]
+				for px := w; px < mbW; px++ {
+					yuv.y[row*mbW+px] = edge
+				}
 			}
-		}
+		}(py)
 	}
+	yuvWG.Wait()
 
 	// Pad bottom rows: replicate last valid row for py = h..mbH-1.
 	if h < mbH {
@@ -118,60 +128,66 @@ func rgbaToYUV420(img image.Image) *yuvImage {
 	uvWTrue := (w + 1) / 2
 	uvHTrue := (h + 1) / 2
 
+	// Each UV row writes to non-overlapping indices — safe to parallelise.
 	for bpy := 0; bpy < uvHTrue; bpy++ {
-		for bpx := 0; bpx < uvWTrue; bpx++ {
-			// Gather 4 pixel block (clamp to image boundary)
-			var rSum, gSum, bSum int
-			for dy := 0; dy < 2; dy++ {
-				for dx := 0; dx < 2; dx++ {
-					px := bpx*2 + dx
-					py := bpy*2 + dy
-					if px >= w {
-						px = w - 1
+		yuvWG.Add(1)
+		go func(row int) {
+			defer yuvWG.Done()
+			for bpx := 0; bpx < uvWTrue; bpx++ {
+				// Gather 4 pixel block (clamp to image boundary)
+				var rSum, gSum, bSum int
+				for dy := 0; dy < 2; dy++ {
+					for dx := 0; dx < 2; dx++ {
+						px := bpx*2 + dx
+						py := row*2 + dy
+						if px >= w {
+							px = w - 1
+						}
+						if py >= h {
+							py = h - 1
+						}
+						r32, g32, b32, _ := img.At(ox+px, oy+py).RGBA()
+						rSum += int(r32 >> 8)
+						gSum += int(g32 >> 8)
+						bSum += int(b32 >> 8)
 					}
-					if py >= h {
-						py = h - 1
-					}
-					r32, g32, b32, _ := img.At(ox+px, oy+py).RGBA()
-					rSum += int(r32 >> 8)
-					gSum += int(g32 >> 8)
-					bSum += int(b32 >> 8)
+				}
+				// Compute U/V on the 4-pixel sum.
+				// Mirrors libwebp WebPConvertRGBA32ToUV_C → VP8RGBToU/V(r,g,b, YUV_HALF<<2)
+				// where r,g,b are the 4-pixel accumulated sums.
+				// VP8ClipUV(u, rounding) = (u + rounding + (128 << 18)) >> 18
+				// rounding = YUV_HALF << 2 = (1<<15) << 2 = 1 << 17
+				uRaw := -9719*rSum - 19081*gSum + 28800*bSum
+				vRaw := 28800*rSum - 24116*gSum - 4684*bSum
+				rounding := 1 << 17 // = YUV_HALF << 2
+				u := (uRaw + rounding + (128 << 18)) >> 18
+				v := (vRaw + rounding + (128 << 18)) >> 18
+				if u < 0 {
+					u = 0
+				} else if u > 255 {
+					u = 255
+				}
+				if v < 0 {
+					v = 0
+				} else if v > 255 {
+					v = 255
+				}
+				yuv.u[row*uvW+bpx] = uint8(u)
+				yuv.v[row*uvW+bpx] = uint8(v)
+			}
+
+			// Pad right edge of this UV row: replicate last valid column.
+			if uvWTrue < uvW {
+				uEdge := yuv.u[row*uvW+(uvWTrue-1)]
+				vEdge := yuv.v[row*uvW+(uvWTrue-1)]
+				for bpx := uvWTrue; bpx < uvW; bpx++ {
+					yuv.u[row*uvW+bpx] = uEdge
+					yuv.v[row*uvW+bpx] = vEdge
 				}
 			}
-			// Compute U/V on the 4-pixel sum.
-			// Mirrors libwebp WebPConvertRGBA32ToUV_C → VP8RGBToU/V(r,g,b, YUV_HALF<<2)
-			// where r,g,b are the 4-pixel accumulated sums.
-			// VP8ClipUV(u, rounding) = (u + rounding + (128 << 18)) >> 18
-			// rounding = YUV_HALF << 2 = (1<<15) << 2 = 1 << 17
-			uRaw := -9719*rSum - 19081*gSum + 28800*bSum
-			vRaw := 28800*rSum - 24116*gSum - 4684*bSum
-			rounding := 1 << 17 // = YUV_HALF << 2
-			u := (uRaw + rounding + (128 << 18)) >> 18
-			v := (vRaw + rounding + (128 << 18)) >> 18
-			if u < 0 {
-				u = 0
-			} else if u > 255 {
-				u = 255
-			}
-			if v < 0 {
-				v = 0
-			} else if v > 255 {
-				v = 255
-			}
-			yuv.u[bpy*uvW+bpx] = uint8(u)
-			yuv.v[bpy*uvW+bpx] = uint8(v)
-		}
-
-		// Pad right edge of this UV row: replicate last valid column.
-		if uvWTrue < uvW {
-			uEdge := yuv.u[bpy*uvW+(uvWTrue-1)]
-			vEdge := yuv.v[bpy*uvW+(uvWTrue-1)]
-			for bpx := uvWTrue; bpx < uvW; bpx++ {
-				yuv.u[bpy*uvW+bpx] = uEdge
-				yuv.v[bpy*uvW+bpx] = vEdge
-			}
-		}
+		}(bpy)
 	}
+	yuvWG.Wait()
 
 	// Pad UV bottom rows: replicate last valid row.
 	if uvHTrue < uvH {
