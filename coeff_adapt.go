@@ -650,12 +650,27 @@ func putSegmentID(bw *boolEncoder, s int, prob [3]uint8) {
 // coefficient probability updates) using the adapted probability table.
 // Mirrors VP8WriteProbas() from libwebp/src/enc/tree_enc.c for the prob section.
 //
-// segQ0, segQ1: quantizer indices for SNS segments 0 (smooth) and 1 (textured).
-// When segQ0 == segQ1, single-segment mode is used (no segment header overhead).
-func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH, segQ0, segQ1 int, infos []mbInfo,
+// segQs[0..3]: absolute quantizer indices for up to 4 SNS segments.
+// numSegs: number of active segments (1, 2, or 4). When numSegs==1 or all segQs equal,
+// single-segment mode is used (no segment map overhead).
+func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH int, segQs [4]int, numSegs int, infos []mbInfo,
 	probs *adaptedCoeffProbs, updated *[numTypes][numBands][numCtx][numProbas]bool) {
 
-	useSegments := segQ0 != segQ1
+	// Determine whether per-MB segment signaling is needed.
+	useSegments := numSegs > 1
+	if useSegments {
+		// Also check if all active segments have the same quantizer — if so, skip map.
+		allSame := true
+		for i := 1; i < numSegs; i++ {
+			if segQs[i] != segQs[0] {
+				allSame = false
+				break
+			}
+		}
+		if allSame {
+			useSegments = false
+		}
+	}
 
 	// colorspace = 0, clamp_type = 0
 	bw.putBitUniform(0)
@@ -676,12 +691,15 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH, segQ0, segQ1 int, info
 		// segment_feature_mode (1 bit): 1 = absolute values (not relative deltas).
 		bw.putBitUniform(1)
 
-		// Quantizer absolute values for 4 segments (7-bit signed each).
-		// Unused segments (2, 3) replicate segment 1's value.
-		bw.putSignedBits(segQ0, 7)
-		bw.putSignedBits(segQ1, 7)
-		bw.putSignedBits(segQ1, 7) // segment 2 — unused, same as 1
-		bw.putSignedBits(segQ1, 7) // segment 3 — unused, same as 1
+		// Quantizer absolute values for all 4 segment slots (7-bit signed each).
+		// Unused slots (numSegs..3) replicate the last active segment's value.
+		for s := 0; s < 4; s++ {
+			idx := s
+			if idx >= numSegs {
+				idx = numSegs - 1
+			}
+			bw.putSignedBits(segQs[idx], 7)
+		}
 
 		// Filter strength absolute values for 4 segments (6-bit signed).
 		// All 0: loop filtering is disabled.
@@ -711,9 +729,9 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH, segQ0, segQ1 int, info
 	// Quantizer indices.
 	// base_q is the nominal quantizer (used for MBs without explicit segment override).
 	// With update_map=1, every MB gets an explicit segment ID, so base_q is not
-	// directly used for reconstruction. We set it to segQ1 (textured segment)
-	// to match libwebp's enc->base_quant convention.
-	baseQ := segQ1
+	// directly used for reconstruction. We set it to segQs[0] (matches libwebp's
+	// enc->base_quant = enc->dqm[0].quant).
+	baseQ := segQs[0]
 	bw.putBits(uint32(baseQ), 7)
 	bw.putSignedBits(0, 4) // y1_dc_delta = 0
 	bw.putSignedBits(0, 4) // y2_dc_delta = 0

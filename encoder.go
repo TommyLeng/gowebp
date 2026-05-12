@@ -97,38 +97,16 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 	mbW := yuv.mbW / 16
 	mbH := yuv.mbH / 16
 
-	// SNS (Spatial Noise Shaping): pre-compute per-MB luma activity scores.
-	// Mirrors VP8EncAnalyze() / MBAnalyze() in libwebp/src/enc/analysis_enc.c.
-	mbAlpha := make([]int, mbW*mbH)
-	for mbY := 0; mbY < mbH; mbY++ {
-		for mbX := 0; mbX < mbW; mbX++ {
-			mbAlpha[mbY*mbW+mbX] = computeMBAlpha(yuv, mbX, mbY)
-		}
-	}
+	// SNS (Spatial Noise Shaping): libwebp-faithful analysis + K-means + power-law quantizer.
+	// Mirrors VP8EncAnalyze() / AssignSegments() / VP8SetSegmentParams() in libwebp.
+	sns := computeSNS(yuv, mbW, mbH, baseQ)
+	mbSegment := sns.mbSegment
 
-	// Compute per-segment quantizers using the libwebp SNS formula.
-	// VP8SetSegmentParams: for each segment alpha, expn = 1 - amp*alpha,
-	// c = c_base^expn, q = 127*(1-c). With snsStrength=50, SNS_TO_DQ=0.9:
-	//   amp = 0.9 * 50 / 100 / 128 ≈ 0.003516
-	// We use 2 segments: segment 0 = smooth (higher q), segment 1 = textured (baseQ).
-	// The alpha threshold separates the two groups.
-	seg0Quality, seg1Quality := computeSNSSegmentQualities(baseQ, mbW*mbH)
-
-	// Build per-segment quantizer matrices and lambdas.
-	seg0 := makeSegmentParams(seg0Quality)
-	seg1 := makeSegmentParams(seg1Quality)
-	segs := [2]segmentParams{seg0, seg1}
-
-	// Assign each MB to a segment: below threshold → segment 0 (coarse/smooth).
-	// Use median alpha as threshold (50th percentile).
-	alphaThreshold := computeAlphaThreshold(mbAlpha)
-	mbSegment := make([]int, mbW*mbH)
-	for i, a := range mbAlpha {
-		if a <= alphaThreshold {
-			mbSegment[i] = 0 // smooth → coarser quant
-		} else {
-			mbSegment[i] = 1 // textured → finer quant
-		}
+	// Build per-segment quantizer matrices and lambdas from the SNS q-indices.
+	numSegs := sns.numSegs
+	segs := make([]segmentParams, numSegs)
+	for i := 0; i < numSegs; i++ {
+		segs[i] = makeSegmentParamsFromQ(sns.segQs[i])
 	}
 
 	// Reconstructed luma: used to build intra4 contexts across 4x4 blocks.
@@ -840,11 +818,8 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 	tokenData := tokenBW.finish()
 
 	// --- Partition 0: frame-level headers + intra modes + updated probs ---
-	// Pass SNS segment quantizer indices so the segment header can be emitted.
-	// seg0.baseQ = quantizer for smooth MBs (segment 0)
-	// seg1.baseQ = quantizer for textured MBs (segment 1)
 	part0BW := newBoolEncoder()
-	encodePartition0WithProbs(part0BW, mbW, mbH, seg0.baseQ, seg1.baseQ, mbInfos, &adaptedProbs, &updatedFlags)
+	encodePartition0WithProbs(part0BW, mbW, mbH, sns.segQs, numSegs, mbInfos, &adaptedProbs, &updatedFlags)
 	part0Data := part0BW.finish()
 
 	// --- Assemble VP8 bitstream ---

@@ -40,26 +40,12 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 	mbH := yuv.mbH / 16
 
 	// --- SNS pre-analysis (serial, already independent) ---
-	mbAlpha := make([]int, mbW*mbH)
-	for mbY := 0; mbY < mbH; mbY++ {
-		for mbX := 0; mbX < mbW; mbX++ {
-			mbAlpha[mbY*mbW+mbX] = computeMBAlpha(yuv, mbX, mbY)
-		}
-	}
-
-	seg0Quality, seg1Quality := computeSNSSegmentQualities(baseQ, mbW*mbH)
-	seg0 := makeSegmentParams(seg0Quality)
-	seg1 := makeSegmentParams(seg1Quality)
-	segs := [2]segmentParams{seg0, seg1}
-
-	alphaThreshold := computeAlphaThreshold(mbAlpha)
-	mbSegment := make([]int, mbW*mbH)
-	for i, a := range mbAlpha {
-		if a <= alphaThreshold {
-			mbSegment[i] = 0
-		} else {
-			mbSegment[i] = 1
-		}
+	sns := computeSNS(yuv, mbW, mbH, baseQ)
+	mbSegment := sns.mbSegment
+	numSegs := sns.numSegs
+	segs := make([]segmentParams, numSegs)
+	for i := 0; i < numSegs; i++ {
+		segs[i] = makeSegmentParamsFromQ(sns.segQs[i])
 	}
 
 	// --- Shared reconstruction buffers ---
@@ -736,7 +722,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 	tokenData := tokenBW.finish()
 
 	part0BW := newBoolEncoder()
-	encodePartition0WithProbs(part0BW, mbW, mbH, seg0.baseQ, seg1.baseQ, mbInfos, &adaptedProbs, &updatedFlags)
+	encodePartition0WithProbs(part0BW, mbW, mbH, sns.segQs, numSegs, mbInfos, &adaptedProbs, &updatedFlags)
 	part0Data := part0BW.finish()
 
 	frameHdr := buildVP8FrameHeader(w, h, len(part0Data))
