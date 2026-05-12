@@ -239,6 +239,35 @@ func quantizeBlockWHT(in []int16, out []int16, m *quantMatrix) bool {
 	return quantizeBlock(in, out, m, 0)
 }
 
+// FLATNESS_LIMIT_I4 / FLATNESS_PENALTY: constants from libwebp/src/enc/quant_enc.c.
+// A 4×4 block is considered "flat" if it has at most flatnessLimitI4 non-zero
+// AC coefficients (DC is excluded). PickBestIntra4 adds a rate-penalty equal to
+// `flatnessPenalty * kNumBlocks` (kNumBlocks=1 for I4) to all non-DC predictions
+// whose quantized output is flat, biasing the choice toward DC_PRED in flat
+// regions.  Penalty is added to the rate term R; final score contribution is
+// `lambda * flatnessPenalty * kNumBlocks` (cf. SetRDScore in quant_enc.c).
+const (
+	flatnessLimitI4 = 3
+	flatnessPenalty = 140
+)
+
+// isFlatI4Levels returns true iff `levels[1..15]` (AC coefficients in zigzag
+// order, DC at index 0 is ignored) contains at most flatnessLimitI4 non-zero
+// entries.  Faithful port of IsFlat() from libwebp/src/dsp/quant.h with
+// num_blocks=1.
+func isFlatI4Levels(levels []int16) bool {
+	score := 0
+	for i := 1; i < 16; i++ {
+		if levels[i] != 0 {
+			score++
+			if score > flatnessLimitI4 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // dequantizeBlock converts quantized zigzag-order levels back to raster-order
 // DCT coefficients by multiplying each level by its quantization step size.
 // The DC slot (zigzag[0]=raster[0]) is set to dcVal (already in raster space).

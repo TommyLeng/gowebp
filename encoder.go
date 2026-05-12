@@ -333,7 +333,25 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 							// Mode bit cost
 							modeBits := i4ModeBitCost(mode, topPred, leftPred)
 
-							score := distortion + int64(mbLambdaI4)*modeBits
+							// Flatness penalty: if a non-DC mode produced a block with
+							// ≤ flatnessLimitI4 non-zero AC coefficients (so the residual
+							// is essentially flat), bias against it so DC_PRED wins.
+							// Mirrors PickBestIntra4 in libwebp quant_enc.c:1097-1103.
+							//
+							// Scaling rationale:  libwebp's SetRDScore computes
+							//     score = lambda*(R+H) + RD_DISTO_MULT*(D+SD)   with RD_DISTO_MULT=256.
+							// Our score is `distortion + lambda*modeBits`, i.e. distortion is
+							// weighted 1× instead of 256×.  To make the *trade-off magnitude*
+							// of the flatness penalty equivalent to libwebp's (where 140 bits
+							// worth of penalty competes against 256× distortion), scale by 1/256.
+							//   ours_penalty = lambda * FLATNESS_PENALTY * kNumBlocks / 256
+							// (kNumBlocks=1 for I4, division via >>8).
+							flatPenalty := int64(0)
+							if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
+								flatPenalty = (int64(mbLambdaI4) * flatnessPenalty) >> 8
+							}
+
+							score := distortion + int64(mbLambdaI4)*modeBits + flatPenalty
 							if score < bestBlkScore {
 								bestBlkScore = score
 								bestBlkMode = mode

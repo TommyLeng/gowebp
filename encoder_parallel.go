@@ -361,7 +361,15 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 								}
 
 								modeBits := i4ModeBitCost(mode, topPred, leftPred)
-								score := distortion + int64(mbLambdaI4)*modeBits
+
+								// Flatness penalty: see encoder.go for rationale (scaled by 1/256
+								// to compensate for our score system's missing RD_DISTO_MULT).
+								flatPenalty := int64(0)
+								if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
+									flatPenalty = (int64(mbLambdaI4) * flatnessPenalty) >> 8
+								}
+
+								score := distortion + int64(mbLambdaI4)*modeBits + flatPenalty
 								if score < bestBlkScore {
 									bestBlkScore = score
 									bestBlkMode = mode
