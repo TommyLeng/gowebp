@@ -936,82 +936,18 @@ func buildPred4ContextWithMBRecon(yuv *yuvImage, recon []uint8, reconStride int,
 	return ctx
 }
 
-// i16ModeBitCost returns a rough bit cost for an intra16 mode.
-// Based on the entropy coding tree in partition 0.
-// DC=2 bits, VE=2, HE=2, TM=2 (approximate; actual depends on prob).
+// i16ModeBitCost returns the exact entropy bit cost (in millibits × 1024)
+// for encoding an intra-16 mode in partition 0.
+// Ported from VP8FixedCostsI16 in libwebp/src/enc/cost_enc.c.
 func i16ModeBitCost(mode int) int64 {
-	// kVP8FixedCostsI16 from libwebp (in bits * 256):
-	// These are rough bit costs for each mode.
-	// DC_PRED (0): ~256, TM_PRED (1): ~512, V_PRED (2): ~384, H_PRED (3): ~512
-	switch mode {
-	case I16_DC_PRED:
-		return 1
-	case I16_VE_PRED:
-		return 2
-	case I16_HE_PRED:
-		return 2
-	case I16_TM_PRED:
-		return 2
-	}
-	return 2
+	return int64(vp8FixedCostsI16[mode])
 }
 
-// i4ModeBitCost returns an approximate bit cost for an intra4 mode
-// given the neighboring top and left modes.
-// Based on kBModesProba probabilities.
+// i4ModeBitCost returns the exact entropy bit cost (in millibits × 1024)
+// for encoding an intra-4x4 mode given the neighboring top and left modes.
+// Ported from VP8FixedCostsI4 in libwebp/src/enc/cost_enc.c.
 func i4ModeBitCost(mode, topPred, leftPred int) int64 {
-	// Approximate: count bits in the probability tree.
-	// This is a simplified entropy estimate.
-	prob := &kBModesProba[topPred][leftPred]
-
-	bits := int64(0)
-	// Bit 0: mode != B_DC_PRED
-	if mode != B_DC_PRED {
-		bits += probToBits(255 - int(prob[0]))
-		// Bit 1: mode != B_TM_PRED
-		if mode != B_TM_PRED {
-			bits += probToBits(255 - int(prob[1]))
-			// Bit 2: mode != B_VE_PRED
-			if mode != B_VE_PRED {
-				bits += probToBits(255 - int(prob[2]))
-				if mode >= B_LD_PRED {
-					bits += probToBits(int(prob[3]))
-					if mode != B_LD_PRED {
-						bits += probToBits(255 - int(prob[6]))
-						if mode != B_VL_PRED {
-							bits += probToBits(255 - int(prob[7]))
-							// HD or HU
-							bits += 1
-						}
-					}
-				} else {
-					bits += probToBits(255 - int(prob[3]))
-					if mode != B_HE_PRED {
-						bits += probToBits(255 - int(prob[4]))
-						// RD or VR
-						bits += 1
-					}
-				}
-			}
-		}
-	} else {
-		bits += probToBits(int(prob[0]))
-	}
-	return bits
-}
-
-// probToBits converts a VP8 probability (0..255) to a rough bit cost (0 or 1).
-// Full entropy is -log2(p/256) but we use a table approximation.
-func probToBits(prob int) int64 {
-	// Rough: if prob > 128, costs 0 bits effectively; else costs 1 bit.
-	// Better: use actual entropy ~-log2(prob/256).
-	if prob >= 200 {
-		return 0
-	}
-	if prob >= 128 {
-		return 1
-	}
-	return 2
+	return int64(vp8FixedCostsI4[topPred][leftPred][mode])
 }
 
 // computeDCY computes the DC prediction value for a 16x16 luma macroblock.
