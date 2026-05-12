@@ -399,20 +399,22 @@ func clipI(v, lo, hi int) int {
 type snsResult struct {
 	mbSegment []int  // per-MB segment ID [0..numSegs-1]
 	segQs     [4]int // quantizer index per segment (absolute)
-	numSegs   int    // number of active segments (1 or 2)
+	numSegs   int    // number of active segments (1, 2, or 4)
 }
 
 // computeSNS runs the SNS pipeline:
 //   - Per-MB alpha: libwebp's DCT-based metric (0=textured, 255=smooth).
-//   - K-means with 2 clusters for segment assignment (natural boundary).
-//   - Segment quantizers: smooth cluster → coarser (baseQ+delta), textured → baseQ.
+//   - K-means with 4 clusters for segment assignment (adaptive boundaries).
+//   - Segment quantizers: delta distributed proportionally across clusters
+//     based on their smoothness relative to the alpha range.
 //
 // The DCT-based alpha (ported from libwebp's CollectHistogram/GetAlpha/FinalAlphaValue)
 // more accurately distinguishes smooth from textured regions than the old MAD metric.
-// K-means finds the natural cluster boundary rather than using a fixed threshold.
+// K-means finds the natural cluster boundaries rather than using fixed thresholds.
 //
-// Segment 0 = smooth/flat: gets coarser quant (baseQ+delta) — saves bits.
-// Segment 1 = textured:    gets base quant (baseQ)           — preserves quality.
+// K-means cluster ordering: 0=most textured (lowest alpha), 3=most smooth (highest alpha).
+// Encoder segment ordering: 0=coarsest (smooth, highest Q), 3=finest (textured, base Q).
+// Mapping: encoder_seg = 3 - kmCluster  (reversal).
 func computeSNS(yuv *yuvImage, mbW, mbH, baseQ int) snsResult {
 	mbCount := mbW * mbH
 
@@ -430,41 +432,57 @@ func computeSNS(yuv *yuvImage, mbW, mbH, baseQ int) snsResult {
 		alphaHist[a]++
 	}
 
-	// Step 3: K-means with 2 clusters for natural smooth/textured boundary.
-	// centers[0] = textured cluster (lower alpha), centers[1] = smooth cluster (higher alpha).
-	// segMap[a] = 0 (textured) or 1 (smooth).
-	_, segMap, _ := assignSegments(alphaHist, 2)
+	// Step 3: K-means with 4 clusters for adaptive smooth/textured boundaries.
+	// centers[0] = most textured cluster (lowest alpha).
+	// centers[3] = most smooth cluster (highest alpha).
+	// segMap[a] = cluster ID in [0..3].
+	centers, segMap, _ := assignSegments(alphaHist, 4)
 
 	// Step 4: determine quantizer delta based on image size.
-	// Small images (portraits): delta=8 compensates for DCT alpha being slightly
-	// more sensitive to texture than MAD, ensuring smooth MBs remain compressed.
-	// Large images: delta=12 (unchanged from v0.4.0).
+	// Small images (portraits): delta=8.
+	// Large images: delta=12.
 	delta := 8
 	if mbCount > snsSmallImageThreshold {
 		delta = 12
 	}
 
-	// Compute 2-segment q-indices:
-	//   seg0 (smooth): q0 = baseQ + delta (coarser → saves bits on flat areas)
-	//   seg1 (textured): q1 = baseQ (baseline quality)
-	q0 := clipI(baseQ+delta, 0, 127)
-	q1 := baseQ
+	// Step 5: distribute delta proportionally across 4 clusters.
+	// Most textured cluster (centers[0]) → delta = 0 (base quality).
+	// Most smooth cluster   (centers[3]) → delta = full delta.
+	// Intermediate clusters → proportional to their smoothness relative to range.
+	minAlphaC := centers[0] // most textured (lowest alpha)
+	maxAlphaC := centers[3] // most smooth (highest alpha)
+	alphaRange := maxAlphaC - minAlphaC
+	if alphaRange == 0 {
+		alphaRange = 1
+	}
 
-	// Step 5: assign each MB.
-	// K-means segMap: 1=smooth (higher center), 0=textured (lower center).
+	// segQIdx[i] = quantizer for K-means cluster i (0=textured, 3=smooth).
+	var segQIdx [4]int
+	for i := 0; i < 4; i++ {
+		smoothness := centers[i] - minAlphaC // 0..alphaRange
+		segDelta := delta * smoothness / alphaRange
+		segQIdx[i] = clipI(baseQ+segDelta, 0, 127)
+	}
+
+	// Reverse cluster→segment mapping:
+	// encoder seg0 = smoothest (coarsest quant), encoder seg3 = most textured (finest quant).
+	// K-means cluster 0 = most textured → encoder seg3.
+	// K-means cluster 3 = most smooth   → encoder seg0.
+	segQs := [4]int{segQIdx[3], segQIdx[2], segQIdx[1], segQIdx[0]}
+
+	// Step 6: assign each MB to its encoder segment.
 	mbSegment := make([]int, mbCount)
 	for i, a := range mbAlphaSlice {
-		if segMap[a] == 1 {
-			mbSegment[i] = 0 // smooth → encoder seg0 (coarser)
-		} else {
-			mbSegment[i] = 1 // textured → encoder seg1 (finer)
-		}
+		kmCluster := segMap[a] // 0=most textured, 3=most smooth
+		// Reverse: encoder seg = 3 - kmCluster
+		mbSegment[i] = 3 - kmCluster
 	}
 
 	return snsResult{
 		mbSegment: mbSegment,
-		segQs:     [4]int{q0, q1, q1, q1},
-		numSegs:   2,
+		segQs:     segQs,
+		numSegs:   4,
 	}
 }
 
