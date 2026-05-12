@@ -60,7 +60,7 @@ gowebp is faster because it runs in-process (no subprocess fork overhead) and us
 
 | 圖片類型 / Image type | cwebp | gowebp | Δ size |
 |---|---|---|---|
-| 人像 300×300 / Portrait 300×300 | 11.8 kb | 11.6 kb | −1.7% |
+| 人像 300×300 / Portrait 300×300 | ~16 kb | ~17 kb | +4% avg |
 | 複雜大圖 1536×2048 / Complex large | 304 kb | 246 kb | **−19%** |
 | Kodak 標準測試集平均 / Kodak avg | baseline | +15% | 複雜自然場景 |
 
