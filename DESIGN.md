@@ -191,6 +191,15 @@ go test -v -run TestCompareWithCwebp -timeout 300s
 
 # Benchmark
 go test -bench=BenchmarkEncode300x300 -benchtime=5s
+
+# 1 CPU Benchmark
+GOMAXPROCS=1 go test -bench=BenchmarkEncode300x300 -benchtime=10s -cpuprofile=cpu_gomaxprocs1.prof -run='^$' .
+
+# Gomaxprocs test
+go test -v -run TestCompareGOMAXPROCS -timeout 600s
+
+# 
+
 ```
 
 Reference outputs in `test_data/`:
