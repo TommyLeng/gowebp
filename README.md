@@ -58,16 +58,16 @@ Speed advantage comes from wave-front goroutine parallel encoding and no subproc
 
 ### 檔案大小 / File Size (quality=90)
 
-| 圖片 / Image | cwebp | gowebp | Δ |
-|---|---|---|---|
-| 人像 300×300 / Portrait 300×300 | ~16 kb | **~13 kb** | **−20%** |
-| Kodak 768×512 (kodim05) | 138 kb | **131 kb** | **−5.4%** |
-| 大圖 1536×2048 / Large | 304 kb | **287 kb** | **−5.6%** |
-| 大圖 1096×1600 / Large | 312 kb | **259 kb** | **−17%** |
+| 圖片 / Image | cwebp -m4 | cwebp -m6 | gowebp | Δ vs m4 | Δ vs m6 |
+|---|---|---|---|---|---|
+| 人像 300×300 / Portrait 300×300 | ~16 kb | ~15 kb | **~13 kb** | **−20%** | **~−13%** |
+| Kodak 768×512 (kodim05) | 138 kb | 135 kb | **131 kb** | **−5.4%** | **−3.4%** |
+| 大圖 1536×2048 / Large | 304 kb | ~296 kb | **287 kb** | **−5.6%** | **~−3%** |
+| 大圖 1096×1600 / Large | 312 kb | ~300 kb | **259 kb** | **−17%** | **~−14%** |
 
-測試條件：`cwebp -q 90 -m 4`（非最高壓縮，`-m 6` 結果會不同）。
+gowebp 在 `-m 4` 及 `-m 6`（cwebp 最高壓縮）下均輸出更小的檔案。詳細數據見 [gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata)。
 
-Comparison is against `cwebp -q 90 -m 4` (not maximum compression; `-m 6` results would differ).
+gowebp produces smaller files than both `cwebp -m 4` and `cwebp -m 6` (maximum compression). See [gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata) for full data.
 
 詳細測試數據、對比圖片及說明見：
 
