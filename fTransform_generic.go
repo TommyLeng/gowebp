@@ -2,6 +2,8 @@
 // Copyright 2011 Google Inc. All Rights Reserved.
 // BSD 3-Clause License — see /Users/bayshark/-projects/self/libwebp/COPYING
 
+//go:build !amd64 && !arm64
+
 package gowebp
 
 // fTransform computes the 4x4 forward DCT of (src - ref), storing into out[16].
