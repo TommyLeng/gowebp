@@ -16,7 +16,7 @@ Target: quality=90, method=4 — matching cwebp's default parameters
 
 | Metric | cwebp | gowebp | Notes |
 |---|---|---|---|
-| CD15 300×300 size | 11.8 kb | **9.5 kb** | −19%, beats cwebp |
+| CD15 300×300 size | 11.8 kb | **9.5 kb** | −19% vs cwebp -m 4 |
 | portrait_1 300×300 size | 16.2 kb | **13.0 kb** | −20% |
 | kodim05 768×512 size | 138 kb | **131 kb** | −5.4% |
 | jablehk 1536×2048 size | 304 kb | **287 kb** | −5.6% |
@@ -24,7 +24,8 @@ Target: quality=90, method=4 — matching cwebp's default parameters
 | Bitstream validity | ✅ | ✅ | golang.org/x/image/webp decodes |
 | Color correctness | ✅ | ✅ | UV recon buffers fix chroma DC drift |
 
-All Kodak test images beat cwebp at quality=90 -m 4.
+All Kodak test images are slightly smaller than `cwebp -q 90 -m 4` (avg −9.2%).
+Note: `-m 4` is not maximum compression; results vs `-m 6` are untested.
 
 ### Implemented Components
 

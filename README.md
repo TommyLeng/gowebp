@@ -65,9 +65,9 @@ gowebp is faster because it runs in-process (no subprocess fork overhead) and us
 | 大圖 1536×2048 / Large | 304 kb | **287 kb** | **−5.6%** |
 | 大圖 1096×1600 / Large | 312 kb | **259 kb** | **−17%** |
 
-gowebp 在全部測試 Kodak 圖片上均優於 cwebp。
+測試條件：`cwebp -q 90 -m 4`（非最高壓縮，`-m 6` 結果會不同）。
 
-gowebp beats cwebp on all tested Kodak images.
+Comparison is against `cwebp -q 90 -m 4` (not maximum compression; `-m 6` results would differ).
 
 詳細測試數據、對比圖片及說明見：
 

@@ -79,9 +79,10 @@ Encode()
 ## Known hacks & tech debt
 
 ### Size comparison vs cwebp (`encoder.go`)
-gowebp **beats** cwebp at quality=90 on most images:
+At `cwebp -q 90 -m 4` (default method), gowebp produces slightly smaller files on most images.
+Note: `-m 4` is not cwebp's maximum compression; `-m 6` would likely close or reverse the gap.
 
-| Image | cwebp | gowebp | Δ |
+| Image | cwebp -m 4 | gowebp | Δ |
 |---|---|---|---|
 | CD15 300×300 | 11.8 kb | 9.5 kb | −19% |
 | portrait_1 300×300 | 16.2 kb | 13.0 kb | −20% |
@@ -89,7 +90,7 @@ gowebp **beats** cwebp at quality=90 on most images:
 | jablehk 1536×2048 | 304 kb | 287 kb | −5.6% |
 | i30 1096×1600 | 312 kb | 259 kb | −17% |
 
-All Kodak test set images beat cwebp as of the RD_DISTO_MULT=256 fix.
+Kodak suite average: −9.2% vs cwebp -m 4.
 
 **Implemented optimisations:**
 1. ✅ **Coefficient probability adaptation** — two-pass encoding adapts `default_coeff_probs`
@@ -148,7 +149,7 @@ no longer needed. The ones worth keeping:
 3. ~~**Clean up debug test files**~~ ✅ done: 16 one-off debug test files removed
 4. ~~**Speed optimisation** — SAD pre-screening~~ ✅ done: top-4 SAD candidates per i4 block, ~2.5× i4 speedup
 5. ~~**Fix quality remapping**~~ ✅ done: quality-4 hack removed; quality=90 now honest
-6. ~~**Reduce size gap vs libwebp** — trellis quantization, entropy cost, RD scoring~~ ✅ done: gowebp now beats cwebp on most images (−5% to −20%)
+6. ~~**Reduce size gap vs libwebp** — trellis quantization, entropy cost, RD scoring~~ ✅ done: gowebp is slightly smaller than `cwebp -m 4` on most images (−5% to −20%)
 7. **EncodeAll / animation** — lossless subpackage has it; lossy does not
 8. **Decode support** — currently only encode; could wrap `golang.org/x/image/webp`
 
