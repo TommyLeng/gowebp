@@ -95,7 +95,7 @@ func TestCompareGOMAXPROCS(t *testing.T) {
 		}
 
 		if hasCwebp == nil {
-			out := filepath.Join(t.TempDir(), name+".webp")
+			out := filepath.Join(t.TempDir(), filepath.Base(name)+".webp")
 			cmd := exec.Command("cwebp", "-q", "90", "-m", "4", srcPath, "-o", out)
 			cmd.Stderr = nil
 			t0 := time.Now()
@@ -116,60 +116,63 @@ func TestCompareGOMAXPROCS(t *testing.T) {
 	origProcs := runtime.GOMAXPROCS(0)
 	defer runtime.GOMAXPROCS(origProcs)
 
-	for _, procs := range []int{1, 2, 4, 10} {
-		procs := procs
+	procsList := []int{1, 2, 4, 10}
+
+	type row struct {
+		name    string
+		srcKB   float64
+		cwebpKB string
+		cwebpMs string
+		goKB    float64
+		goPSNR  string
+		goMs    [4]float64 // indexed by position in procsList
+	}
+	rows := make([]row, len(imgs))
+	for i, d := range imgs {
+		rows[i] = row{
+			name:    d.name,
+			srcKB:   d.srcKB,
+			cwebpKB: d.cwebpKB,
+			cwebpMs: d.cwebpMs,
+		}
+	}
+
+	for pi, procs := range procsList {
+		pi := pi
 		t.Run(fmt.Sprintf("GOMAXPROCS=%d", procs), func(t *testing.T) {
 			runtime.GOMAXPROCS(procs)
 
-			type row struct {
-				name    string
-				srcKB   float64
-				cwebpKB string
-				cwebpMs string
-				goKB    float64
-				goMs    float64
-				goPSNR  string
-			}
-			var rows []row
-
-			for _, d := range imgs {
+			for i, d := range imgs {
 				var buf bytes.Buffer
 				t0 := time.Now()
 				if err := Encode(&buf, d.src, &Options{Quality: 90}); err != nil {
 					t.Errorf("encode %s: %v", d.name, err)
 					continue
 				}
-				goMs := float64(time.Since(t0).Milliseconds())
-				goKB := float64(buf.Len()) / 1024
+				rows[i].goMs[pi] = float64(time.Since(t0).Milliseconds())
 
-				psnr := "-"
-				if decoded, err := webp.Decode(bytes.NewReader(buf.Bytes())); err == nil {
-					v := psnrRGBA(d.src, decoded)
-					psnr = fmt.Sprintf("%.1f dB", v)
+				// Only compute size and PSNR on first pass (deterministic).
+				if pi == 0 {
+					rows[i].goKB = float64(buf.Len()) / 1024
+					if decoded, err := webp.Decode(bytes.NewReader(buf.Bytes())); err == nil {
+						rows[i].goPSNR = fmt.Sprintf("%.1f dB", psnrRGBA(d.src, decoded))
+					} else {
+						rows[i].goPSNR = "-"
+					}
 				}
-
-				rows = append(rows, row{
-					name:    d.name,
-					srcKB:   d.srcKB,
-					cwebpKB: d.cwebpKB,
-					cwebpMs: d.cwebpMs,
-					goKB:    goKB,
-					goMs:    goMs,
-					goPSNR:  psnr,
-				})
 			}
 
-			// Console output
+			// Per-GOMAXPROCS console output.
 			fmt.Printf("\n=== GOMAXPROCS=%d ===\n", procs)
 			fmt.Printf("%-40s %8s | %11s %7s | %9s %7s %10s\n",
 				"File", "Original", "cwebp lossy", "time", "go lossy", "time", "PSNR")
 			fmt.Println(strings.Repeat("-", 100))
 			for _, r := range rows {
 				fmt.Printf("%-40s %7.1fkb | %11s %7s | %8.1fkb %6.0fms %10s\n",
-					r.name, r.srcKB, r.cwebpKB, r.cwebpMs, r.goKB, r.goMs, r.goPSNR)
+					r.name, r.srcKB, r.cwebpKB, r.cwebpMs, r.goKB, r.goMs[pi], r.goPSNR)
 			}
 
-			// Markdown
+			// Per-GOMAXPROCS markdown.
 			var md strings.Builder
 			md.WriteString(fmt.Sprintf("# gowebp vs cwebp — GOMAXPROCS=%d\n\n", procs))
 			md.WriteString(fmt.Sprintf("quality=90, cwebp -m 4, Apple M1 Max, Go 1.25, GOMAXPROCS=%d\n\n", procs))
@@ -177,12 +180,26 @@ func TestCompareGOMAXPROCS(t *testing.T) {
 			md.WriteString("|---|---|---|---|---|---|---|\n")
 			for _, r := range rows {
 				md.WriteString(fmt.Sprintf("| %s | %.1f kb | %s | %s | %.1f kb | %.0f ms | %s |\n",
-					r.name, r.srcKB, r.cwebpKB, r.cwebpMs, r.goKB, r.goMs, r.goPSNR))
+					r.name, r.srcKB, r.cwebpKB, r.cwebpMs, r.goKB, r.goMs[pi], r.goPSNR))
 			}
-
 			mdPath := filepath.Join(resultsDir, fmt.Sprintf("gomaxprocs_%d.md", procs))
 			os.WriteFile(mdPath, []byte(md.String()), 0644)
 			t.Logf("GOMAXPROCS=%d results saved to %s", procs, mdPath)
 		})
 	}
+
+	// Combined markdown — one row per image, timing columns for each GOMAXPROCS.
+	var md strings.Builder
+	md.WriteString("# gowebp vs cwebp — GOMAXPROCS comparison\n\n")
+	md.WriteString("quality=90, cwebp -m 4, Apple M1 Max, Go 1.25\n\n")
+	md.WriteString("| File | Original | cwebp | cwebp time | go size | PSNR | P=1 ms | P=2 ms | P=4 ms | P=10 ms |\n")
+	md.WriteString("|---|---|---|---|---|---|---|---|---|---|\n")
+	for _, r := range rows {
+		md.WriteString(fmt.Sprintf("| %s | %.1f kb | %s | %s | %.1f kb | %s | %.0f | %.0f | %.0f | %.0f |\n",
+			r.name, r.srcKB, r.cwebpKB, r.cwebpMs, r.goKB, r.goPSNR,
+			r.goMs[0], r.goMs[1], r.goMs[2], r.goMs[3]))
+	}
+	combinedPath := filepath.Join(resultsDir, "gomaxprocs_combined.md")
+	os.WriteFile(combinedPath, []byte(md.String()), 0644)
+	t.Logf("Combined results saved to %s", combinedPath)
 }

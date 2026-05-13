@@ -4,7 +4,12 @@
 
 package gowebp
 
-import "sync"
+import (
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+)
 
 // mbWorkspace holds all temporary buffers for one MB's encoding work.
 // Pre-allocated once per goroutine (parallel path) or once per frame (serial path)
@@ -124,26 +129,19 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 	mbCoeffs := make([]mbCoeffData, mbW*mbH)
 
 	// --- Wave-front synchronisation ---
-	// done[ry][mbX] is closed when MB (mbX, ry) has finished writing its recon buffer.
-	// This allows row ry+1 to safely read the top-neighbor recon data.
-	//
-	// We allocate mbW+1 channels per row: done[ry][mbX] for mbX in [0, mbW].
-	// The sentinel done[ry][mbW] is closed when the whole row is done (not needed
-	// here but makes the index math simpler).
-	done := make([][]chan struct{}, mbH)
-	for y := range done {
-		done[y] = make([]chan struct{}, mbW)
-		for x := range done[y] {
-			done[y][x] = make(chan struct{})
-		}
+	// rowProgress[ry] stores the mbX index of the last completed MB in row ry.
+	// -1 means the row has not started. The spin-wait loop below reads this
+	// atomically so no goroutine scheduler involvement is needed for typical
+	// cases, eliminating the pthread_cond overhead seen in the channel version.
+	rowProgress := make([]atomic.Int32, mbH)
+	for i := range rowProgress {
+		rowProgress[i].Store(-1)
 	}
 
-	// Row -1 sentinels: pre-closed so row 0 MBs can start immediately.
-	topRowDone := make([]chan struct{}, mbW)
-	for x := range topRowDone {
-		topRowDone[x] = make(chan struct{})
-		close(topRowDone[x])
-	}
+	// sentinelRow represents row -1: all MBs are already "done" so row 0
+	// can start immediately without waiting.
+	var sentinelRow atomic.Int32
+	sentinelRow.Store(int32(mbW - 1))
 
 	// --- Per-column NZ context shared between rows ---
 	// Row ry writes these after finishing MB (mbX, ry); row ry+1 reads them
@@ -163,12 +161,14 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 
 		// Capture loop variables.
 		ry := rowY
-		prevDone := topRowDone
-		if ry > 0 {
-			prevDone = done[ry-1]
+		var prev *atomic.Int32
+		if ry == 0 {
+			prev = &sentinelRow
+		} else {
+			prev = &rowProgress[ry-1]
 		}
 
-		go func(ry int, prevDone []chan struct{}) {
+		go func(ry int, prev *atomic.Int32) {
 			defer wg.Done()
 
 			// Allocate workspace once per goroutine; reused for every MB in this row.
@@ -183,17 +183,20 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 			var leftI4Mode [4]int
 
 			for mbX := 0; mbX < mbW; mbX++ {
-				// Wait for MB (mbX, ry-1) above to finish before we read
-				// its recon buffer and NZ state.
-				<-prevDone[mbX]
-
-				// Also wait for MB (mbX+1, ry-1) if it exists.
-				// buildPred4ContextWithMBRecon reads recon[topY*stride + x] for
-				// x >= px+16 (the 4 right-of-top pixels used by diagonal i4 modes
-				// in the rightmost 4x4 block column). Those pixels belong to MB
-				// (mbX+1, ry-1), so we must wait for that MB to complete too.
-				if mbX+1 < mbW {
-					<-prevDone[mbX+1]
+				// Wait for the previous row to complete MB (mbX+1, ry-1) if it
+				// exists, otherwise just MB (mbX, ry-1).
+				// buildPred4ContextWithMBRecon reads recon pixels that belong to
+				// MB (mbX+1, ry-1) for diagonal i4 modes, so we need that too.
+				needed := int32(mbX + 1)
+				if mbX == mbW-1 {
+					needed = int32(mbX)
+				}
+				for i := 0; prev.Load() < needed; i++ {
+					if i < 16 {
+						runtime.Gosched()
+					} else {
+						time.Sleep(1 * time.Microsecond)
+					}
 				}
 
 				// Now safe to read top-neighbor recon and NZ state for column mbX.
@@ -734,9 +737,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 
 				// Signal: MB (mbX, ry) is complete. Row ry+1 may now read
 				// this column's recon data and NZ state.
-				close(done[ry][mbX])
+				rowProgress[ry].Store(int32(mbX))
 			}
-		}(ry, prevDone)
+		}(ry, prev)
 	}
 
 	wg.Wait()
