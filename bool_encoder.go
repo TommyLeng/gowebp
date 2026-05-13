@@ -52,6 +52,16 @@ func newBoolEncoder() *boolEncoder {
 	}
 }
 
+func newBoolEncoderSized(cap int) *boolEncoder {
+	return &boolEncoder{
+		range_: 255 - 1,
+		value:  0,
+		run:    0,
+		nbBits: -8,
+		buf:    make([]byte, 0, cap),
+	}
+}
+
 // flush writes any pending full byte to buf, with carry propagation.
 // Mirrors Flush() in bit_writer_utils.c.
 func (e *boolEncoder) flush() {

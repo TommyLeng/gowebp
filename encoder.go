@@ -621,6 +621,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						n := by*4 + bx
 						cd.i4AC[n] = ws.localI4AcLevels[n]
 						last := findLast(ws.localI4AcLevels[n][:], 0)
+						cd.i4ACLast[n] = int8(last)
 						nz := 0
 						if last >= 0 {
 							nz = 1
@@ -636,6 +637,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				// i16: store DC and AC levels, update NZ ctx.
 				cd.i16DC = ws.mbI16DcQuantLevels
 				lastDC := findLast(ws.mbI16DcQuantLevels[:], 0)
+				cd.i16DCLast = int8(lastDC)
 				dcNZ := 0
 				if lastDC >= 0 {
 					dcNZ = 1
@@ -648,6 +650,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						n := by*4 + bx
 						cd.i16AC[n] = ws.mbI16AcLevels[n]
 						last := findLast(ws.mbI16AcLevels[n][:], 1)
+						cd.i16ACLast[n] = int8(last)
 						nz := 0
 						if last >= 1 {
 							nz = 1
@@ -725,6 +728,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					n := by*2 + bx
 					cd.uv[n] = ws.uvLevels[n]
 					last := findLast(ws.uvLevels[n][:], 0)
+					cd.uvLast[n] = int8(last)
 					nz := 0
 					if last >= 0 {
 						nz = 1
@@ -738,6 +742,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					n := by*2 + bx
 					cd.uv[4+n] = ws.uvLevels[4+n]
 					last := findLast(ws.uvLevels[4+n][:], 0)
+					cd.uvLast[4+n] = int8(last)
 					nz := 0
 					if last >= 0 {
 						nz = 1
@@ -758,12 +763,15 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 	adaptedProbs, updatedFlags := finalizeTokenProbas(&stats)
 
 	// Pass 2: entropy-encode all coefficients using the adapted probabilities.
-	tokenBW := newBoolEncoder()
+	// Pre-size the token partition buffer: w*h/3 is a rough estimate of WebP
+	// output size at quality 90, avoiding repeated reallocation for large images.
+	tokenBW := newBoolEncoderSized(w * h / 3)
 	encodeTokenPartition(tokenBW, mbCoeffs, mbW, mbH, &adaptedProbs)
 	tokenData := tokenBW.finish()
 
 	// --- Partition 0: frame-level headers + intra modes + updated probs ---
-	part0BW := newBoolEncoder()
+	// Partition 0 is small (MB modes + prob updates << 10KB); default cap is fine.
+	part0BW := newBoolEncoderSized(mbW*mbH*8 + 4096)
 	encodePartition0WithProbs(part0BW, mbW, mbH, sns.segQs, numSegs, mbInfos, &adaptedProbs, &updatedFlags)
 	part0Data := part0BW.finish()
 

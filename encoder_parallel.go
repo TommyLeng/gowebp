@@ -677,6 +677,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							n := by*4 + bx
 							cd.i4AC[n] = ws.localI4AcLevels[n]
 							last := findLast(ws.localI4AcLevels[n][:], 0)
+							cd.i4ACLast[n] = int8(last)
 							nz := 0
 							if last >= 0 {
 								nz = 1
@@ -690,6 +691,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				} else {
 					cd.i16DC = ws.mbI16DcQuantLevels
 					lastDC := findLast(ws.mbI16DcQuantLevels[:], 0)
+					cd.i16DCLast = int8(lastDC)
 					dcNZ := 0
 					if lastDC >= 0 {
 						dcNZ = 1
@@ -702,6 +704,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							n := by*4 + bx
 							cd.i16AC[n] = ws.mbI16AcLevels[n]
 							last := findLast(ws.mbI16AcLevels[n][:], 1)
+							cd.i16ACLast[n] = int8(last)
 							nz := 0
 							if last >= 1 {
 								nz = 1
@@ -718,6 +721,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						n := by*2 + bx
 						cd.uv[n] = ws.uvLevels[n]
 						last := findLast(ws.uvLevels[n][:], 0)
+						cd.uvLast[n] = int8(last)
 						nz := 0
 						if last >= 0 {
 							nz = 1
@@ -731,6 +735,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						n := by*2 + bx
 						cd.uv[4+n] = ws.uvLevels[4+n]
 						last := findLast(ws.uvLevels[4+n][:], 0)
+						cd.uvLast[4+n] = int8(last)
 						nz := 0
 						if last >= 0 {
 							nz = 1

@@ -8,7 +8,11 @@ package gowebp
 // after the RD selection pass. These are used for the two-pass coefficient
 // probability adaptation: first pass collects stats, second pass emits bits.
 type mbCoeffData struct {
-	isI4 bool
+	isI4      bool
+	i16DCLast int8        // findLast(i16DC[:], 0); packed with isI4 to avoid padding
+	i4ACLast  [16]int8   // findLast(i4AC[n][:], 0) for each i4 block
+	i16ACLast [16]int8   // findLast(i16AC[n][:], 1) for each i16 AC block
+	uvLast    [8]int8    // findLast(uv[n][:], 0) for all 8 UV blocks
 
 	// i4 path: 16 blocks × 16 coefficients each
 	i4AC [16][16]int16
@@ -510,7 +514,7 @@ func collectCoeffStats(mbCoeffs []mbCoeffData, mbW, mbH int, stats *coeffStats) 
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
 						ctx := topNzY[mbX*4+bx] + leftNzY[by]
-						last := findLast(cd.i4AC[n][:], 0)
+						last := int(cd.i4ACLast[n])
 						recordCoeffs(stats, ctx, cd.i4AC[n][:], 3, 0, last)
 						nz := 0
 						if last >= 0 {
@@ -524,7 +528,7 @@ func collectCoeffStats(mbCoeffs []mbCoeffData, mbW, mbH int, stats *coeffStats) 
 				leftNzY[4] = 0
 			} else {
 				dcCtx := topNzDC[mbX] + leftNzY[4]
-				lastDC := findLast(cd.i16DC[:], 0)
+				lastDC := int(cd.i16DCLast)
 				recordCoeffs(stats, dcCtx, cd.i16DC[:], 1, 0, lastDC)
 				dcNZ := 0
 				if lastDC >= 0 {
@@ -537,7 +541,7 @@ func collectCoeffStats(mbCoeffs []mbCoeffData, mbW, mbH int, stats *coeffStats) 
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
 						ctx := topNzY[mbX*4+bx] + leftNzY[by]
-						last := findLast(cd.i16AC[n][:], 1)
+						last := int(cd.i16ACLast[n])
 						recordCoeffs(stats, ctx, cd.i16AC[n][:], 0, 1, last)
 						nz := 0
 						if last >= 1 {
@@ -554,7 +558,7 @@ func collectCoeffStats(mbCoeffs []mbCoeffData, mbW, mbH int, stats *coeffStats) 
 				for bx := 0; bx < 2; bx++ {
 					n := by*2 + bx
 					ctx := topNzU[mbX*2+bx] + leftNzU[by]
-					last := findLast(cd.uv[n][:], 0)
+					last := int(cd.uvLast[n])
 					recordCoeffs(stats, ctx, cd.uv[n][:], 2, 0, last)
 					nz := 0
 					if last >= 0 {
@@ -569,7 +573,7 @@ func collectCoeffStats(mbCoeffs []mbCoeffData, mbW, mbH int, stats *coeffStats) 
 				for bx := 0; bx < 2; bx++ {
 					n := by*2 + bx
 					ctx := topNzV[mbX*2+bx] + leftNzV[by]
-					last := findLast(cd.uv[4+n][:], 0)
+					last := int(cd.uvLast[4+n])
 					recordCoeffs(stats, ctx, cd.uv[4+n][:], 2, 0, last)
 					nz := 0
 					if last >= 0 {
@@ -604,7 +608,7 @@ func encodeTokenPartition(bw *boolEncoder, mbCoeffs []mbCoeffData, mbW, mbH int,
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
 						ctx := topNzY[mbX*4+bx] + leftNzY[by]
-						last := findLast(cd.i4AC[n][:], 0)
+						last := int(cd.i4ACLast[n])
 						putCoeffsWithProbs(bw, ctx, cd.i4AC[n][:], 3, 0, last, probs)
 						nz := 0
 						if last >= 0 {
@@ -618,7 +622,7 @@ func encodeTokenPartition(bw *boolEncoder, mbCoeffs []mbCoeffData, mbW, mbH int,
 				leftNzY[4] = 0
 			} else {
 				dcCtx := topNzDC[mbX] + leftNzY[4]
-				lastDC := findLast(cd.i16DC[:], 0)
+				lastDC := int(cd.i16DCLast)
 				putCoeffsWithProbs(bw, dcCtx, cd.i16DC[:], 1, 0, lastDC, probs)
 				dcNZ := 0
 				if lastDC >= 0 {
@@ -631,7 +635,7 @@ func encodeTokenPartition(bw *boolEncoder, mbCoeffs []mbCoeffData, mbW, mbH int,
 					for bx := 0; bx < 4; bx++ {
 						n := by*4 + bx
 						ctx := topNzY[mbX*4+bx] + leftNzY[by]
-						last := findLast(cd.i16AC[n][:], 1)
+						last := int(cd.i16ACLast[n])
 						putCoeffsWithProbs(bw, ctx, cd.i16AC[n][:], 0, 1, last, probs)
 						nz := 0
 						if last >= 1 {
@@ -648,7 +652,7 @@ func encodeTokenPartition(bw *boolEncoder, mbCoeffs []mbCoeffData, mbW, mbH int,
 				for bx := 0; bx < 2; bx++ {
 					n := by*2 + bx
 					ctx := topNzU[mbX*2+bx] + leftNzU[by]
-					last := findLast(cd.uv[n][:], 0)
+					last := int(cd.uvLast[n])
 					putCoeffsWithProbs(bw, ctx, cd.uv[n][:], 2, 0, last, probs)
 					nz := 0
 					if last >= 0 {
@@ -663,7 +667,7 @@ func encodeTokenPartition(bw *boolEncoder, mbCoeffs []mbCoeffData, mbW, mbH int,
 				for bx := 0; bx < 2; bx++ {
 					n := by*2 + bx
 					ctx := topNzV[mbX*2+bx] + leftNzV[by]
-					last := findLast(cd.uv[4+n][:], 0)
+					last := int(cd.uvLast[4+n])
 					putCoeffsWithProbs(bw, ctx, cd.uv[4+n][:], 2, 0, last, probs)
 					nz := 0
 					if last >= 0 {
