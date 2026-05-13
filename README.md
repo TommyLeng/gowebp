@@ -52,9 +52,9 @@ Test environment: Apple M1 Max, Go 1.25, cwebp 1.4.0 (quality=90)
 | 768×512 (Kodak) | ~55 ms | **~35 ms** | **1.6×** |
 | 1536×2048 | ~250 ms | **~102 ms** | **2.5×** |
 
-速度優勢來自 wave-front goroutine 並行編碼（每行 MB 一條 goroutine）及無 subprocess fork 開銷。單核（GOMAXPROCS=1）下 gowebp 因每個 MB 做更多優化（trellis、SNS）而比 cwebp 慢約 2×。
+速度優勢來自 wave-front goroutine 並行編碼（每行 MB 一條 goroutine）及無 subprocess fork 開銷。單核（GOMAXPROCS=1）下 gowebp 因做更多優化（trellis、SNS）比 cwebp 略慢，但近期 i4 flat block early exit 優化後差距已大幅縮小（300×300 實測 11ms vs cwebp ~21ms 含 fork）。
 
-Speed advantage comes from wave-front goroutine parallel encoding and no subprocess fork overhead. At GOMAXPROCS=1, gowebp is ~2× slower than cwebp due to heavier per-MB work (trellis, SNS). See [gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata) for full GOMAXPROCS breakdown.
+Speed advantage comes from wave-front goroutine parallel encoding and no subprocess fork overhead. At GOMAXPROCS=1, gowebp is slightly slower than cwebp due to heavier per-MB work (trellis, SNS), though recent optimizations (i4 flat block early exit, intra4 prediction caching) have significantly narrowed the gap — measured at 11ms vs cwebp's ~21ms (including fork) for a 300×300 photo. See [gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata) for full GOMAXPROCS breakdown.
 
 ### 檔案大小 / File Size (quality=90)
 

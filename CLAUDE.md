@@ -112,6 +112,13 @@ Kodak suite average: −9.2% vs cwebp -m 4.
    from `libwebp/src/enc/quant_enc.c`.
 7. ✅ **SNS (Spatial Noise Shaping)** — DCT-histogram alpha + 4-segment K-means, exact port
    of `VP8SetSegmentParams`. Runs in parallel with YUV conversion.
+8. ✅ **i4 flat block early exit** — skip all 9 non-DC modes when 4×4 block pixel variance
+   < 16² (integer check, no division). DC is near-optimal for flat regions. Port of libwebp's
+   flat detection in `PickBestIntra4`. −27% P=1 on 300×300, −33% P=1 on 1536×2048.
+9. ✅ **intra4Predict cache** — prediction output from SAD phase stored and reused in RD phase,
+   eliminating 4 redundant `intra4Predict` calls per block (29% fewer prediction calls).
+10. ✅ **Trellis precompute** — `level0`/`threshLevel` separated from Viterbi DP loop into a
+    precompute pass, allowing the compiler to optimise both phases independently.
 
 **Remaining known gaps:**
 - `tlambda_` per-MB lambda scaling (local texture complexity): not implemented; libwebp
@@ -150,10 +157,13 @@ no longer needed. The ones worth keeping:
 4. ~~**Speed optimisation** — SAD pre-screening~~ ✅ done: top-4 SAD candidates per i4 block, ~2.5× i4 speedup
 5. ~~**Fix quality remapping**~~ ✅ done: quality-4 hack removed; quality=90 now honest
 6. ~~**Reduce size gap vs libwebp** — trellis quantization, entropy cost, RD scoring~~ ✅ done: gowebp is slightly smaller than `cwebp -m 4` on most images (−5% to −20%)
-7. **EncodeAll / animation** — lossless subpackage has it; lossy does not
-8. **Decode support** — currently only encode; could wrap `golang.org/x/image/webp`
+7. ~~**Speed optimisation** — i4 flat block early exit, intra4Predict cache, trellis precompute~~ ✅ done: −27% P=1 serial on 300×300 (15ms→11ms), −33% P=1 on 1536×2048 (604ms→407ms)
+8. **EncodeAll / animation** — lossless subpackage has it; lossy does not
+9. **Decode support** — currently only encode; could wrap `golang.org/x/image/webp`
 
 ## Performance (Apple M1 Max)
+
+GOMAXPROCS=10 (wave-front parallel):
 
 | Image | cwebp | gowebp | Notes |
 |---|---|---|---|
@@ -161,4 +171,9 @@ no longer needed. The ones worth keeping:
 | 768×512 (Kodak) | ~138kb / ~50ms | **~131kb / ~30ms** | wave-front parallel encoding |
 | 1536×2048 | ~304kb / ~250ms | **~287kb / ~102ms** | 2.5× faster than cwebp |
 
-Bottleneck (remaining): i4 early exit for flat regions.
+GOMAXPROCS=1 (serial, benchmarked 2026-05-14):
+
+| Image | Before optimisations | After (current) | Speedup |
+|---|---|---|---|
+| 300×300 photo | 15.2 ms | **11.1 ms** | −27% |
+| 1536×2048 | 604 ms | **407 ms** | −33% |

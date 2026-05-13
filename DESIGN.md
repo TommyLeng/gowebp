@@ -173,10 +173,11 @@ Goroutine pipeline across MB rows (`encoder_parallel.go`).
 Each row depends only on the row above; rows are pipelined with channel sync.
 ~2.5× speedup on multi-core for large images.
 
-### 4. i4 Early Exit
-Skip i4 search entirely if i16 score is already below a threshold.
-Flat regions (low variance) rarely benefit from i4.
-Estimated speedup: 20–30% for photos. Not yet implemented.
+### 4. i4 Flat Block Early Exit ✅ implemented
+Skip all 9 non-DC modes when 4×4 block variance < 16² per pixel (integer check, no division).
+DC mode is near-optimal for flat/uniform regions; the other modes add DCT + trellis cost for no gain.
+Also: intra4Predict output cached from SAD phase → eliminates 4 redundant calls per block in RD phase.
+Measured speedup: −27% P=1 serial on 300×300 real photo (15ms→11ms), −33% on 1536×2048 (604ms→407ms).
 
 ---
 
