@@ -59,24 +59,23 @@ func (e *boolEncoder) flush() {
 	bits := e.value >> s
 	e.value -= bits << s
 	e.nbBits -= 8
-	if (bits & 0xff) != 0xff {
-		pos := len(e.buf)
-		// grow buf by run+1 slots
-		for i := 0; i <= e.run; i++ {
-			e.buf = append(e.buf, 0)
+	if bits&0xff != 0xff {
+		// Fast path: ~99.6% of calls — no carry, no pending 0xFF run.
+		if e.run == 0 && bits&0x100 == 0 {
+			e.buf = append(e.buf, byte(bits))
+			return
 		}
-		if bits&0x100 != 0 { // carry overflow: increment previous byte
+		// Slow path: carry propagation or pending 0xFF bytes.
+		pos := len(e.buf)
+		e.buf = append(e.buf, make([]byte, e.run+1)...) // bulk extend, zero-filled
+		if bits&0x100 != 0 {                            // carry: propagate into previous byte
 			if pos > 0 {
 				e.buf[pos-1]++
 			}
-		}
-		if e.run > 0 {
-			fillVal := byte(0xff)
-			if bits&0x100 != 0 {
-				fillVal = 0x00
-			}
+			// pending run bytes become 0x00 — already zero from make, skip fill
+		} else if e.run > 0 {
 			for i := 0; i < e.run; i++ {
-				e.buf[pos+i] = fillVal
+				e.buf[pos+i] = 0xff
 			}
 		}
 		e.buf[pos+e.run] = byte(bits & 0xff)
