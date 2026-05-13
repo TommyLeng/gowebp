@@ -90,7 +90,9 @@ func makeSegmentParams(quality int) segmentParams {
 // SNS: uses 2 segments — segment 0 (smooth MBs, coarser quant) and
 // segment 1 (textured MBs, finer quant = baseQ). Segment quantizers are
 // signaled in partition 0 using the VP8 segment header.
-func encodeFrame(yuv *yuvImage, baseQ int) []byte {
+//
+// arena supplies reusable backing slices to avoid per-call allocation churn.
+func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 	w := yuv.width
 	h := yuv.height
 	// mbW/mbH come from the padded yuvImage so they match the YUV plane dimensions.
@@ -113,15 +115,19 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 	// We maintain a reconstructed frame buffer so intra4 predictions use
 	// previously decoded pixels within and across MBs.
 	reconStride := mbW * 16
-	recon := make([]uint8, reconStride*mbH*16)
+	arena.recon = growSliceU8(arena.recon, reconStride*mbH*16)
+	recon := arena.recon
+	clear(recon)
 
 	// Reconstructed chroma: UV DC prediction must use the same values the
 	// decoder will reconstruct, not the original YUV samples. Without this,
 	// the encoder's DC prediction diverges from the decoder's, causing a
 	// systematic Cr offset (red bias) that accumulates across MBs.
 	uvPlaneH := yuv.mbH / 2
-	reconU := make([]uint8, yuv.uvStride*uvPlaneH)
-	reconV := make([]uint8, yuv.uvStride*uvPlaneH)
+	arena.reconU = growSliceU8(arena.reconU, yuv.uvStride*uvPlaneH)
+	arena.reconV = growSliceU8(arena.reconV, yuv.uvStride*uvPlaneH)
+	reconU := arena.reconU
+	reconV := arena.reconV
 	for i := range reconU {
 		reconU[i] = 128
 	}
@@ -129,26 +135,40 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 		reconV[i] = 128
 	}
 
-	mbInfos := make([]mbInfo, mbW*mbH)
+	arena.mbInfos = growSliceMBInfo(arena.mbInfos, mbW*mbH)
+	mbInfos := arena.mbInfos
+	clear(mbInfos)
 
 	// mbCoeffs stores quantized coefficient levels for every MB.
 	// Used for the two-pass coefficient probability adaptation:
 	// pass 1 collects statistics, pass 2 emits entropy-coded bits.
-	mbCoeffs := make([]mbCoeffData, mbW*mbH)
+	arena.mbCoeffs = growSliceMBCoeff(arena.mbCoeffs, mbW*mbH)
+	mbCoeffs := arena.mbCoeffs
+	clear(mbCoeffs)
 
 	// per-MB top/left i4 mode arrays for entropy context
 	// topI4Modes[mbX*4 + bx]: top neighbor mode for 4x4 block column bx in mbX
-	topI4Modes := make([]int, mbW*4)
+	arena.topI4Modes = growSliceInt(arena.topI4Modes, mbW*4)
+	topI4Modes := arena.topI4Modes
+	clear(topI4Modes)
 
 	// NZ context arrays — still tracked during the MB loop so that we know
 	// which ctx value to pass to recordCoeffs/putCoeffsWithProbs in the
 	// second pass.  We re-derive them from mbCoeffs in encodeTokenPartition.
 	// They are kept here only to compute the correct nz flags that we store
 	// alongside the coefficient levels (ctx is implicit; we store it too).
-	topNzY := make([]int, mbW*4+1)
-	topNzU := make([]int, mbW*2+1)
-	topNzV := make([]int, mbW*2+1)
-	topNzDC := make([]int, mbW+1)
+	arena.topNzY = growSliceInt(arena.topNzY, mbW*4+1)
+	topNzY := arena.topNzY
+	clear(topNzY)
+	arena.topNzU = growSliceInt(arena.topNzU, mbW*2+1)
+	topNzU := arena.topNzU
+	clear(topNzU)
+	arena.topNzV = growSliceInt(arena.topNzV, mbW*2+1)
+	topNzV := arena.topNzV
+	clear(topNzV)
+	arena.topNzDC = growSliceInt(arena.topNzDC, mbW+1)
+	topNzDC := arena.topNzDC
+	clear(topNzDC)
 
 	// Allocate workspace once for the whole frame; reused across all MBs.
 	ws := new(mbWorkspace)

@@ -44,8 +44,12 @@ func encodeLossy(w io.Writer, img image.Image, quality int) error {
 
 	internalQuality := quality
 
+	// Acquire a reusable frame arena; return it when done.
+	arena := arenaPool.Get().(*frameArena)
+	defer arenaPool.Put(arena)
+
 	// Convert to YUV 4:2:0
-	yuv := rgbaToYUV420(img)
+	yuv := rgbaToYUV420(img, arena)
 
 	// Compute base quantizer index; per-MB quantizers are determined inside encodeFrame
 	// via the SNS two-segment scheme (computeSNSSegmentQualities).
@@ -55,9 +59,9 @@ func encodeLossy(w io.Writer, img image.Image, quality int) error {
 	mbCount := (yuv.mbW / 16) * (yuv.mbH / 16)
 	var vp8Data []byte
 	if mbCount > parallelThreshold && runtime.GOMAXPROCS(0) > 1 {
-		vp8Data = encodeFrameParallel(yuv, baseQ)
+		vp8Data = encodeFrameParallel(yuv, baseQ, arena)
 	} else {
-		vp8Data = encodeFrame(yuv, baseQ)
+		vp8Data = encodeFrame(yuv, baseQ, arena)
 	}
 
 	// Write WebP container

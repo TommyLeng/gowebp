@@ -39,7 +39,10 @@ type yuvImage struct {
 // The Y plane is allocated at mbW×mbH (next multiples of 16) and the region
 // beyond the true image is filled by edge-pixel replication, matching libwebp.
 // UV planes are padded to (mbW/2)×(mbH/2).
-func rgbaToYUV420(img image.Image) *yuvImage {
+//
+// arena is used to reuse backing slices across Encode() calls.
+// The YUV planes are fully overwritten here so they need no zeroing.
+func rgbaToYUV420(img image.Image, arena *frameArena) *yuvImage {
 	bounds := img.Bounds()
 	w := bounds.Max.X - bounds.Min.X
 	h := bounds.Max.Y - bounds.Min.Y
@@ -52,10 +55,14 @@ func rgbaToYUV420(img image.Image) *yuvImage {
 	uvW := mbW / 2
 	uvH := mbH / 2
 
+	arena.yPlane = growSliceU8(arena.yPlane, mbW*mbH)
+	arena.uPlane = growSliceU8(arena.uPlane, uvW*uvH)
+	arena.vPlane = growSliceU8(arena.vPlane, uvW*uvH)
+
 	yuv := &yuvImage{
-		y:        make([]uint8, mbW*mbH),
-		u:        make([]uint8, uvW*uvH),
-		v:        make([]uint8, uvW*uvH),
+		y:        arena.yPlane,
+		u:        arena.uPlane,
+		v:        arena.vPlane,
 		yStride:  mbW,
 		uvStride: uvW,
 		width:    w,

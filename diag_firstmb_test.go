@@ -23,7 +23,7 @@ func TestFirstMBRecon(t *testing.T) {
 		}
 	}
 
-	yuv := rgbaToYUV420(img)
+	yuv := rgbaToYUV420(img, &frameArena{})
 	fmt.Printf("Y[0,0]=%d (MB0), Y[16,0]=%d (MB1)\n", yuv.y[0], yuv.y[16])
 
 	qm := buildQuantMatrices(90)

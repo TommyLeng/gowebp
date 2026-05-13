@@ -95,7 +95,9 @@ type rowBottomNz struct {
 //
 // The second pass (coefficient probability adaptation + entropy coding) remains
 // sequential, as the output must be a single ordered bitstream.
-func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
+//
+// arena supplies reusable backing slices to avoid per-call allocation churn.
+func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 	w := yuv.width
 	h := yuv.height
 	mbW := yuv.mbW / 16
@@ -113,11 +115,15 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 	// --- Shared reconstruction buffers ---
 	// These are written by row ry and read by row ry+1 (after channel sync).
 	reconStride := mbW * 16
-	recon := make([]uint8, reconStride*mbH*16)
+	arena.recon = growSliceU8(arena.recon, reconStride*mbH*16)
+	recon := arena.recon
+	clear(recon)
 
 	uvPlaneH := yuv.mbH / 2
-	reconU := make([]uint8, yuv.uvStride*uvPlaneH)
-	reconV := make([]uint8, yuv.uvStride*uvPlaneH)
+	arena.reconU = growSliceU8(arena.reconU, yuv.uvStride*uvPlaneH)
+	arena.reconV = growSliceU8(arena.reconV, yuv.uvStride*uvPlaneH)
+	reconU := arena.reconU
+	reconV := arena.reconV
 	for i := range reconU {
 		reconU[i] = 128
 	}
@@ -125,8 +131,12 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 		reconV[i] = 128
 	}
 
-	mbInfos := make([]mbInfo, mbW*mbH)
-	mbCoeffs := make([]mbCoeffData, mbW*mbH)
+	arena.mbInfos = growSliceMBInfo(arena.mbInfos, mbW*mbH)
+	mbInfos := arena.mbInfos
+	clear(mbInfos)
+	arena.mbCoeffs = growSliceMBCoeff(arena.mbCoeffs, mbW*mbH)
+	mbCoeffs := arena.mbCoeffs
+	clear(mbCoeffs)
 
 	// --- Wave-front synchronisation ---
 	// rowProgress[ry] stores the mbX index of the last completed MB in row ry.
@@ -148,11 +158,21 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 	// before starting MB (mbX, ry+1). Safe because of the done-channel sync.
 	//
 	// Indexed as [mbX] for DC/i4modes, [mbX*4+bx] for Y, [mbX*2+bx] for UV.
-	topNzYShared := make([]int, mbW*4)
-	topNzUShared := make([]int, mbW*2)
-	topNzVShared := make([]int, mbW*2)
-	topNzDCShared := make([]int, mbW)
-	topI4ModesShared := make([]int, mbW*4)
+	arena.topNzYShared = growSliceInt(arena.topNzYShared, mbW*4)
+	topNzYShared := arena.topNzYShared
+	clear(topNzYShared)
+	arena.topNzUShared = growSliceInt(arena.topNzUShared, mbW*2)
+	topNzUShared := arena.topNzUShared
+	clear(topNzUShared)
+	arena.topNzVShared = growSliceInt(arena.topNzVShared, mbW*2)
+	topNzVShared := arena.topNzVShared
+	clear(topNzVShared)
+	arena.topNzDCShared = growSliceInt(arena.topNzDCShared, mbW)
+	topNzDCShared := arena.topNzDCShared
+	clear(topNzDCShared)
+	arena.topI4ModesShared = growSliceInt(arena.topI4ModesShared, mbW*4)
+	topI4ModesShared := arena.topI4ModesShared
+	clear(topI4ModesShared)
 
 	var wg sync.WaitGroup
 

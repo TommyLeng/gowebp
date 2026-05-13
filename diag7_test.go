@@ -21,7 +21,7 @@ func TestLumaQuality(t *testing.T) {
 	dst := image.NewNRGBA(image.Rect(0, 0, 300, 300))
 	xdraw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Src, nil)
 	
-	yuv := rgbaToYUV420(dst)
+	yuv := rgbaToYUV420(dst, &frameArena{})
 	
 	// Encode
 	var buf bytes.Buffer
