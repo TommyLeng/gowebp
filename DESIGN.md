@@ -10,18 +10,21 @@ Target: quality=90, method=4 — matching cwebp's default parameters
 
 ---
 
-## Current Status (as of 2026-05-11)
+## Current Status (as of 2026-05-13)
 
 ### Achieved
 
 | Metric | cwebp | gowebp | Notes |
 |---|---|---|---|
-| 300×300 photo size | 12kb | **13.5kb** | +12.5%, honest quality=90 |
-| 300×300 luma PSNR | 47.42 dB | **47.59 dB** | +0.17 dB |
-| 300×300 speed | ~1ms | **~13ms** | includes fork overhead for cwebp |
+| CD15 300×300 size | 11.8 kb | **9.5 kb** | −19%, beats cwebp |
+| portrait_1 300×300 size | 16.2 kb | **13.0 kb** | −20% |
+| kodim05 768×512 size | 138 kb | **131 kb** | −5.4% |
+| jablehk 1536×2048 size | 304 kb | **287 kb** | −5.6% |
+| 300×300 speed | ~21ms | **~6ms** | in-process, wave-front parallel |
 | Bitstream validity | ✅ | ✅ | golang.org/x/image/webp decodes |
 | Color correctness | ✅ | ✅ | UV recon buffers fix chroma DC drift |
-| Edge handling | ✅ | ✅ | YUV padded to 16px multiples |
+
+All Kodak test images beat cwebp at quality=90 -m 4.
 
 ### Implemented Components
 
@@ -32,10 +35,17 @@ Target: quality=90, method=4 — matching cwebp's default parameters
 - **Quantization** — kDcTable/kAcTable from libwebp, quality→level mapping
 - **Intra16 prediction** — all 4 modes: DC, V, H, TM
 - **Intra4 prediction** — all 10 modes: DC, V, H, TM, LD, RD, VR, VL, HD, HU
-- **RD mode selection** — SSD + lambda×bits per MB, chooses i16 vs i4
-- **Coefficient tokenization** — default_coeff_probs from VP8 spec
-- **VP8 bitstream** — frame header, partition 0, coefficient partitions
+- **RD mode selection** — `score = 256*D + λ*(H+R+flatPenalty)`, matches libwebp `SetRDScore`
+- **Trellis quantization** — `TrellisQuantizeBlock()` port from `quant_enc.c`
+- **Coefficient probability adaptation** — two-pass, updated probs in partition 0
+- **Exact VP8EntropyCost table** — ported from `libwebp/src/dsp/cost.c`
+- **Coefficient bit cost R** — `coeffBitCost()` mirrors `GetResidualCost_C`
+- **Flatness penalty** — `FLATNESS_PENALTY=140` for flat i4 blocks (≤3 non-zero AC)
+- **SNS (Spatial Noise Shaping)** — DCT-histogram alpha + 4-segment K-means, `VP8SetSegmentParams`
+- **UV chroma RD prediction** — DC/VE/HE/TM four-mode RD selection
+- **Wave-front parallel encoding** — goroutine pipeline across MB rows
 - **RIFF/WEBP container** — correct chunk layout
+- **VP8L lossless** — full lossless encoder with animation `EncodeAll`
 
 ### Known Bugs Fixed During Development
 
@@ -70,8 +80,11 @@ gowebp/
 ### Public API
 
 ```go
-func Encode(w io.Writer, img image.Image, quality int) error
-// quality: 0–100, matches cwebp -q flag
+type Options struct {
+    Lossless bool  // true = VP8L lossless, false = VP8 lossy (default)
+    Quality  int   // 0–100, lossy only (default 90)
+}
+func Encode(w io.Writer, img image.Image, o *Options) error
 ```
 
 ### Encoding Pipeline
@@ -124,11 +137,16 @@ Critical: each i4 sub-block predicts from reconstructed (not source) neighbors.
 After encoding each sub-block: dequantize → iDCT → store in recon buffer.
 
 ### RD Mode Selection (`encoder.go`)
-libwebp ref: `src/enc/quant_enc.c` — `VP8Decimate`
+libwebp ref: `src/enc/quant_enc.c` — `VP8Decimate`, `SetRDScore`
 
-For each MB: score = SSD(source, reconstructed) + λ × mode_bits  
-λ = quantizer_step² / 2  
-Try all i16 modes; try all i4 modes per sub-block; pick overall winner.
+For each MB: `score = 256*D + λ*(H + R + flatPenalty)`
+- D = SSD distortion (post-quant reconstruction vs source)
+- H = mode header bits (VP8FixedCostsI4/I16)
+- R = coefficient bit cost (`coeffBitCost`, mirrors `GetResidualCost_C`)
+- flatPenalty = `FLATNESS_PENALTY=140` if block has ≤3 non-zero AC and mode != DC
+- λ = `lambdaI4` or `lambdaI16` from `SetupMatrices()`
+
+Try all i16 modes; try all i4 modes per sub-block with SAD top-4 pre-screening; pick overall winner.
 
 ### Coefficient Encoding (`bitstream.go`, `probs.go`)
 libwebp ref: `src/enc/token_enc.c`, `src/enc/tree_enc.c`
@@ -138,31 +156,26 @@ Lookup context: plane (Y-DC/Y-AC/U/V) × band × neighbor non-zero count.
 
 ---
 
-## Optimization Opportunities (Next Steps)
-
-Current bottleneck: ~0.05ms per macroblock.  
-For 300×300: 361 MBs → 16ms ✅  
-For 1080×1350: 5,780 MBs → 290ms ⚠️
-
-Per-MB work: up to 224 DCT operations (64 for i16 + 160 for i4).
+## Optimization Status
 
 ### 1. SAD Pre-screening ✅ implemented
 Top-4 SAD candidates per i4 sub-block (`encoder.go` — `sad4x4`, `sadTopN=4`).
-Measured ~2.5× speedup for i4 path; 300×300 dropped from ~16ms to ~13ms.
+~2.5× speedup for i4 path.
 libwebp ref: `src/enc/quant_enc.c` — uses `VP8SSE4x4` / `VP8SAD4x4`
 
-### 2. i4 Early Exit
+### 2. Buffer Reuse ✅ implemented
+Per-goroutine `mbWorkspace` struct (`encoder_parallel.go`) reused across all MBs.
+Eliminates per-MB allocation GC pressure.
+
+### 3. Wave-front Parallel Encoding ✅ implemented
+Goroutine pipeline across MB rows (`encoder_parallel.go`).
+Each row depends only on the row above; rows are pipelined with channel sync.
+~2.5× speedup on multi-core for large images.
+
+### 4. i4 Early Exit
 Skip i4 search entirely if i16 score is already below a threshold.
 Flat regions (low variance) rarely benefit from i4.
-Estimated speedup: 20-30% for photos.
-
-### 3. Buffer Reuse
-Currently allocates per-MB buffers. Pre-allocate a single workspace struct
-and reuse across all MBs to reduce GC pressure.
-
-### 4. Parallel MB Encoding (advanced)
-VP8 allows encoding multiple rows in parallel with care for recon buffer dependencies.
-Each row depends only on the row above — rows can be pipelined.
+Estimated speedup: 20–30% for photos. Not yet implemented.
 
 ---
 

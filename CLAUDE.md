@@ -78,28 +78,44 @@ Encode()
 
 ## Known hacks & tech debt
 
-### Remaining size gap vs libwebp (`encoder.go`)
-gowebp produces ~12.7kb vs cwebp ~12kb (+5.8%) at quality=90 on 300×300 photo.
+### Size comparison vs cwebp (`encoder.go`)
+gowebp **beats** cwebp at quality=90 on most images:
 
-Lambda values are correct — `lambdaI4`, `lambdaI16`, `lambdaMode` all match
-libwebp's `SetupMatrices()` exactly. The i16/i4 comparison intentionally biases
-toward i4 (because lambdaI16 inflates i16Score), which improves compression for
-natural images (verified: changing to lambdaMode scale makes files larger, not smaller).
+| Image | cwebp | gowebp | Δ |
+|---|---|---|---|
+| CD15 300×300 | 11.8 kb | 9.5 kb | −19% |
+| portrait_1 300×300 | 16.2 kb | 13.0 kb | −20% |
+| kodim05 768×512 | 138 kb | 131 kb | −5.4% |
+| jablehk 1536×2048 | 304 kb | 287 kb | −5.6% |
+| i30 1096×1600 | 312 kb | 259 kb | −17% |
+
+All Kodak test set images beat cwebp as of the RD_DISTO_MULT=256 fix.
 
 **Implemented optimisations:**
 1. ✅ **Coefficient probability adaptation** — two-pass encoding adapts `default_coeff_probs`
    to actual statistics; updated probs are signalled in partition 0.
 2. ✅ **Trellis quantization** — `trellis.go` implements `TrellisQuantizeBlock()` ported from
    libwebp. Applied to i4-AC (lambda=(7*qI4^2)>>3), i16-AC (lambda=(qI16^2)>>2), and
-   UV ((lambda=qUV^2<<1). NZ context tracked per block. Frequency sharpening included.
-   Saves ~216 bytes (1.6%) vs standard quantization.
+   UV (lambda=qUV^2<<1). NZ context tracked per block. Frequency sharpening included.
+3. ✅ **Exact VP8EntropyCost table** — ported directly from `libwebp/src/dsp/cost.c`.
+   Previous table had off-by-one indexing and zeroed-out entries from index ~60 onward,
+   causing 13–20% file-size regression on Kodak suite.
+4. ✅ **Coefficient bit cost R in i4 scoring** — `coeffBitCost()` mirrors `GetResidualCost_C`
+   from libwebp; added `(lambdaI4 * rCost) >> 8` to i4 block RD score so mode selection
+   accounts for actual bitstream cost of quantized levels.
+5. ✅ **RD scoring fix (RD_DISTO_MULT=256)** — `score = 256*D + λ*(H + R + flatPenalty)`.
+   Previous formula had distortion at 1× scale, making rate dominate (92% weight) and
+   causing excess non-zero coefficients. Now matches libwebp's `SetRDScore` exactly.
+6. ✅ **Flatness penalty for i4** — `FLATNESS_PENALTY=140` added to RD score when a 4×4
+   block has ≤3 non-zero AC coefficients and mode != DC. Port of `PickBestIntra4`/`IsFlat`
+   from `libwebp/src/enc/quant_enc.c`.
+7. ✅ **SNS (Spatial Noise Shaping)** — DCT-histogram alpha + 4-segment K-means, exact port
+   of `VP8SetSegmentParams`. Runs in parallel with YUV conversion.
 
-**Residual gap causes:**
-- Our `vp8EntropyCost` table differs slightly from libwebp's for low probabilities
-  (p=1..3 range), causing slightly suboptimal trellis and adaptation decisions.
-- No SNS (Spatial Noise Shaping): libwebp adjusts quantizer per MB based on local
-  complexity; we use a single quality level for the whole frame.
-- Single segment: libwebp uses up to 4 quantizer segments; we always use 1.
+**Remaining known gaps:**
+- `tlambda_` per-MB lambda scaling (local texture complexity): not implemented; libwebp
+  uses this to reduce distortion weight in flat regions.
+- Token partitions: fixed 1 partition; libwebp supports up to 8.
 
 ### Debug test files (safe to delete)
 21 test files exist. Most were created to diagnose bugs during development and are
@@ -132,7 +148,7 @@ no longer needed. The ones worth keeping:
 3. ~~**Clean up debug test files**~~ ✅ done: 16 one-off debug test files removed
 4. ~~**Speed optimisation** — SAD pre-screening~~ ✅ done: top-4 SAD candidates per i4 block, ~2.5× i4 speedup
 5. ~~**Fix quality remapping**~~ ✅ done: quality-4 hack removed; quality=90 now honest
-6. ~~**Reduce size gap vs libwebp** — trellis quantization~~ ✅ done: `trellis.go` saves ~216 bytes (1.6%), gap now ~5.8% vs cwebp
+6. ~~**Reduce size gap vs libwebp** — trellis quantization, entropy cost, RD scoring~~ ✅ done: gowebp now beats cwebp on most images (−5% to −20%)
 7. **EncodeAll / animation** — lossless subpackage has it; lossy does not
 8. **Decode support** — currently only encode; could wrap `golang.org/x/image/webp`
 
@@ -140,7 +156,8 @@ no longer needed. The ones worth keeping:
 
 | Image | cwebp | gowebp | Notes |
 |---|---|---|---|
-| 300×300 photo | ~12kb / ~20ms | ~12.7kb / ~15ms | includes fork overhead for cwebp; trellis adds ~2ms |
-| 1080×1350 photo | — / ~160ms | — / ~120ms est. | ~0.02ms per macroblock with SAD pre-screening |
+| 300×300 photo | ~12kb / ~21ms | **~9.5kb / ~6ms** | includes fork overhead for cwebp |
+| 768×512 (Kodak) | ~138kb / ~50ms | **~131kb / ~30ms** | wave-front parallel encoding |
+| 1536×2048 | ~304kb / ~250ms | **~287kb / ~102ms** | 2.5× faster than cwebp |
 
-Bottleneck (remaining): i4 early exit for flat regions (see DESIGN.md §2).
+Bottleneck (remaining): i4 early exit for flat regions.
