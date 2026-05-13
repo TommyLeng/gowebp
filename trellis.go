@@ -223,15 +223,41 @@ func trellisQuantize(
 	// bestPath[0]=best end pos, [1]=best node idx, [2]=best prev idx
 	bestPath := [3]int{-1, -1, -1}
 
+	// Precompute quantized level bounds for each coefficient position.
+	// Separating this from the Viterbi DP lets the compiler optimize both phases
+	// independently and avoids redundant field loads inside the inner loop.
+	const neutralBias = uint32(0)
+	biasHalf := uint32(0x80) << (qfix - 8) // BIAS(0x80)
+	var lvl0 [16]int    // floor level (no rounding bias)
+	var lvlMax [16]int  // threshold level (0.5 bias; candidates pruned above this)
+	for n := first; n <= last; n++ {
+		j := int(kZigzag[n])
+		iQ := uint32(m.iq[j])
+		raw := int32(in[j])
+		if raw < 0 {
+			raw = -raw
+		}
+		coeff0 := raw + int32(m.sharpen[j])
+		if coeff0 < 0 {
+			coeff0 = 0
+		}
+		l0 := int((uint32(coeff0)*iQ + neutralBias) >> qfix)
+		if l0 > maxLevel {
+			l0 = maxLevel
+		}
+		lMax := int((uint32(coeff0)*iQ + biasHalf) >> qfix)
+		if lMax > maxLevel {
+			lMax = maxLevel
+		}
+		lvl0[n] = l0
+		lvlMax[n] = lMax
+	}
+
 	for n := first; n <= last; n++ {
 		j := int(kZigzag[n])
 		Q := int32(m.q[j])
-		iQ := uint32(m.iq[j])
 
-		// Neutral bias = BIAS(0x00) = 0.
-		const neutralBias = uint32(0)
-
-		// Apply sharpening bias to increase high-frequency coefficient magnitude.
+		// Apply sharpening bias to get coeff0 for distortion computation.
 		// Mirrors libwebp: coeff0 = (sign ? -in[j] : in[j]) + mtx->sharpen[j].
 		raw := int32(in[j])
 		sign := int8(0)
@@ -244,17 +270,8 @@ func trellisQuantize(
 			coeff0 = 0
 		}
 
-		// level0: floor of coeff/q (no rounding bias).
-		level0 := int((uint32(coeff0)*iQ + neutralBias) >> qfix)
-		if level0 > maxLevel {
-			level0 = maxLevel
-		}
-		// threshLevel: round with standard 0.5 bias; anything above is too costly.
-		biasHalf := uint32(0x80) << (qfix - 8) // BIAS(0x80)
-		threshLevel := int((uint32(coeff0)*iQ + biasHalf) >> qfix)
-		if threshLevel > maxLevel {
-			threshLevel = maxLevel
-		}
+		level0 := lvl0[n]
+		threshLevel := lvlMax[n]
 
 		// Swap cur ↔ prev.
 		curIdx, prevIdx = prevIdx, curIdx

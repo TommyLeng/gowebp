@@ -302,28 +302,20 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							leftPred = leftBlkMode[by]
 						}
 
-						// SAD pre-screening: compute cheap Sum of Absolute Differences for
-						// all 10 modes, then only run the full DCT+quantize path on the
-						// top sadTopN candidates. Gives ~2.5× speedup for the i4 path.
-						const sadTopN = 4
-						for i := 0; i < numI4Modes; i++ {
-							intra4Predict(i, ctx, ws.sadPred[:])
-							ws.sadScores[i] = sad4x4(src4[:], ws.sadPred[:])
+						// Flat-block early exit: if block variance is very low, only try
+						// B_DC_PRED (mode 0). DC is provably optimal for constant blocks
+						// and near-optimal for very flat ones, so the other 9 modes can
+						// be skipped safely with minimal quality impact.
+						const flatThreshold16 = 16 * 16 * 16 // variance per pixel < 16²
+						var varSum, varSumSq int
+						for _, v := range src4 {
+							iv := int(v)
+							varSum += iv
+							varSumSq += iv * iv
 						}
-						// Find sadTopN-th lowest SAD via partial selection sort on a copy.
-						copy(ws.sadTmp[:], ws.sadScores[:])
-						for k := 0; k < sadTopN; k++ {
-							minIdx := k
-							for j := k + 1; j < numI4Modes; j++ {
-								if ws.sadTmp[j] < ws.sadTmp[minIdx] {
-									minIdx = j
-								}
-							}
-							ws.sadTmp[k], ws.sadTmp[minIdx] = ws.sadTmp[minIdx], ws.sadTmp[k]
-						}
-						sadCutoff := ws.sadTmp[sadTopN-1]
+						variance16 := varSumSq*16 - varSum*varSum
 
-						// Try all 10 I4 modes; track the best.
+						// Try all relevant I4 modes; track the best.
 						bestBlkMode := B_DC_PRED
 						bestBlkScore := int64(1<<62 - 1)
 						// `bestBlkOldScore` tracks the winner using the original
@@ -332,12 +324,9 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						// note below the i4 block) sees the same magnitude as before.
 						bestBlkOldScore := int64(1<<62 - 1)
 
-						for mode := 0; mode < numI4Modes; mode++ {
-							if ws.sadScores[mode] > sadCutoff {
-								continue
-							}
-							intra4Predict(mode, ctx, ws.pred4[:])
-
+						// runRD evaluates mode's full RD cost using the prediction
+						// already in ws.pred4. It updates best{Blk*} if this mode wins.
+						runRD := func(mode int) {
 							// Forward DCT of (src - pred)
 							fTransform(src4[:], ws.pred4[:], ws.dctOut[:])
 
@@ -392,6 +381,43 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 								for i := 0; i < 16; i++ {
 									ws.bestBlkRecon[i] = uint8(ws.recBlock[i])
 								}
+							}
+						}
+
+						if variance16 < flatThreshold16 {
+							// Very flat block: only DC mode is worth trying.
+							intra4Predict(B_DC_PRED, ctx, ws.pred4[:])
+							runRD(B_DC_PRED)
+						} else {
+							// SAD pre-screening: compute cheap Sum of Absolute Differences for
+							// all 10 modes, then only run the full DCT+quantize path on the
+							// top sadTopN candidates. Gives ~2.5× speedup for the i4 path.
+							const sadTopN = 4
+							// Cache all 10 SAD-phase predictions to avoid repeating them in the RD phase.
+							var sadPreds [numI4Modes][16]int16
+							for i := 0; i < numI4Modes; i++ {
+								intra4Predict(i, ctx, sadPreds[i][:])
+								ws.sadScores[i] = sad4x4(src4[:], sadPreds[i][:])
+							}
+							// Find sadTopN-th lowest SAD via partial selection sort on a copy.
+							copy(ws.sadTmp[:], ws.sadScores[:])
+							for k := 0; k < sadTopN; k++ {
+								minIdx := k
+								for j := k + 1; j < numI4Modes; j++ {
+									if ws.sadTmp[j] < ws.sadTmp[minIdx] {
+										minIdx = j
+									}
+								}
+								ws.sadTmp[k], ws.sadTmp[minIdx] = ws.sadTmp[minIdx], ws.sadTmp[k]
+							}
+							sadCutoff := ws.sadTmp[sadTopN-1]
+
+							for mode := 0; mode < numI4Modes; mode++ {
+								if ws.sadScores[mode] > sadCutoff {
+									continue
+								}
+								copy(ws.pred4[:], sadPreds[mode][:])
+								runRD(mode)
 							}
 						}
 
