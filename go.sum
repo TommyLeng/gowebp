@@ -1,2 +1,4 @@
+github.com/eringen/gowebper v0.1.2 h1:9rvIvlTK+CiMuc+cTC3Ozzsz6e3e1rOo7z3kSfWnPT4=
+github.com/eringen/gowebper v0.1.2/go.mod h1:B12vKXoit3pdxVagJNqmnQ/SDciA+UjYRnhn4dAIxNk=
 golang.org/x/image v0.24.0 h1:AN7zRgVsbvmTfNyqIbbOraYL8mSwcKncEj8ofjgzcMQ=
 golang.org/x/image v0.24.0/go.mod h1:4b/ITuLfqYq1hqZcjofwctIhi7sZh2WaCjvsBNjjya8=
