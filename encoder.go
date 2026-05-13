@@ -333,11 +333,7 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 							iTransform4x4(ws.dctOut[:], ws.pred4[:], ws.recBlock[:])
 
 							// Distortion = SSD of source vs actual reconstructed pixels
-							var distortion int64
-							for i := 0; i < 16; i++ {
-								d := int64(src4[i]) - int64(ws.recBlock[i])
-								distortion += d * d
-							}
+							distortion := ssd4x4(src4[:], ws.recBlock[:])
 
 							// Mode bit cost H (header).
 							modeBits := i4ModeBitCost(mode, topPred, leftPred)

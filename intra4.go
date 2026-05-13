@@ -569,27 +569,8 @@ func intra16Predict(mode int, yuv *yuvImage, mbX, mbY int, pred []int16) {
 	}
 }
 
-// ssd4x4 computes Sum of Squared Differences between src[16] and pred[16].
-func ssd4x4(src, pred []int16) int64 {
-	var sum int64
-	for i := 0; i < 16; i++ {
-		d := int64(src[i]) - int64(pred[i])
-		sum += d * d
-	}
-	return sum
-}
-
-// ssd16x16 computes SSD between src and pred for a 16x16 MB.
-// src is a flat 16x16 array extracted from the image.
-// pred is also flat 16x16.
-func ssd16x16(src, pred []int16) int64 {
-	var sum int64
-	for i := 0; i < 256; i++ {
-		d := int64(src[i]) - int64(pred[i])
-		sum += d * d
-	}
-	return sum
-}
+// ssd4x4 and ssd16x16 are declared per-architecture in ssd_arm64.go /
+// ssd_amd64.go (SIMD) or ssd_generic.go (scalar fallback).
 
 // kBModesProba is the 10x10x9 probability table for encoding I4 modes.
 // From libwebp/src/enc/tree_enc.c — kBModesProba[NUM_BMODES][NUM_BMODES][NUM_BMODES-1].
