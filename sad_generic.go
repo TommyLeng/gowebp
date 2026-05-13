@@ -2,8 +2,6 @@
 // Copyright 2011 Google Inc. All Rights Reserved.
 // BSD 3-Clause License — see /Users/bayshark/-projects/self/libwebp/COPYING
 
-//go:build !amd64 && !arm64
-
 package gowebp
 
 // sad4x4 computes the Sum of Absolute Differences between a 4×4 source
