@@ -77,6 +77,33 @@ func rgbaToYUV420(img image.Image, arena *frameArena) *yuvImage {
 	ox := bounds.Min.X
 	oy := bounds.Min.Y
 
+	// getPixel returns the 8-bit R, G, B components for pixel (ox+x, oy+y).
+	// For concrete *image.NRGBA and *image.RGBA types we read Pix[] directly,
+	// avoiding two levels of interface dispatch (image.At + color.RGBA) and the
+	// convTnoptr allocation that appears in CPU profiles (~15% combined).
+	// For all other image types we fall back to the generic At()+RGBA() path.
+	var getPixel func(x, y int) (r, g, b int)
+	switch m := img.(type) {
+	case *image.NRGBA:
+		// Pix layout: [R, G, B, A, R, G, B, A, ...], values already 8-bit (non-premultiplied).
+		getPixel = func(x, y int) (r, g, b int) {
+			i := (oy+y-m.Rect.Min.Y)*m.Stride + (ox+x-m.Rect.Min.X)*4
+			return int(m.Pix[i]), int(m.Pix[i+1]), int(m.Pix[i+2])
+		}
+	case *image.RGBA:
+		// Pix layout same as NRGBA; alpha is pre-multiplied but we ignore it for YUV.
+		getPixel = func(x, y int) (r, g, b int) {
+			i := (oy+y-m.Rect.Min.Y)*m.Stride + (ox+x-m.Rect.Min.X)*4
+			return int(m.Pix[i]), int(m.Pix[i+1]), int(m.Pix[i+2])
+		}
+	default:
+		// Generic path: RGBA() returns 16-bit values; shift right to 8-bit.
+		getPixel = func(x, y int) (r, g, b int) {
+			r32, g32, b32, _ := img.At(ox+x, oy+y).RGBA()
+			return int(r32 >> 8), int(g32 >> 8), int(b32 >> 8)
+		}
+	}
+
 	// Fill luma plane for the true image region.
 	// Each row writes to non-overlapping indices — safe to parallelise.
 	var yuvWG sync.WaitGroup
@@ -85,11 +112,7 @@ func rgbaToYUV420(img image.Image, arena *frameArena) *yuvImage {
 		go func(row int) {
 			defer yuvWG.Done()
 			for px := 0; px < w; px++ {
-				r32, g32, b32, _ := img.At(ox+px, oy+row).RGBA()
-				// RGBA() returns 16-bit values; convert to 8-bit
-				r := int(r32 >> 8)
-				g := int(g32 >> 8)
-				b := int(b32 >> 8)
+				r, g, b := getPixel(px, row)
 
 				// Y (full resolution)
 				luma := 16839*r + 33059*g + 6420*b
@@ -153,10 +176,10 @@ func rgbaToYUV420(img image.Image, arena *frameArena) *yuvImage {
 						if py >= h {
 							py = h - 1
 						}
-						r32, g32, b32, _ := img.At(ox+px, oy+py).RGBA()
-						rSum += int(r32 >> 8)
-						gSum += int(g32 >> 8)
-						bSum += int(b32 >> 8)
+						r, g, b := getPixel(px, py)
+						rSum += r
+						gSum += g
+						bSum += b
 					}
 				}
 				// Compute U/V on the 4-pixel sum.
