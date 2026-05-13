@@ -9,6 +9,7 @@ package gowebp
 import (
 	"image"
 	"io"
+	"runtime"
 
 	"github.com/TommyLeng/gowebp/lossless"
 )
@@ -53,7 +54,7 @@ func encodeLossy(w io.Writer, img image.Image, quality int) error {
 	// Encode the VP8 frame — use wave-front parallel encoding for large images.
 	mbCount := (yuv.mbW / 16) * (yuv.mbH / 16)
 	var vp8Data []byte
-	if mbCount > parallelThreshold {
+	if mbCount > parallelThreshold && runtime.GOMAXPROCS(0) > 1 {
 		vp8Data = encodeFrameParallel(yuv, baseQ)
 	} else {
 		vp8Data = encodeFrame(yuv, baseQ)
