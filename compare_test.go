@@ -22,6 +22,7 @@ import (
 func TestCompareWithCwebp(t *testing.T) {
 	originalDir := "test_data/original"
 	libwebpLossyDir := "test_data/libwebp/lossy"
+	libwebpLossyM6Dir := "test_data/libwebp/lossy_m6"
 	libwebpLosslessDir := "test_data/libwebp/lossless"
 	gowebpLossyDir := "test_data/gowebp/lossy"
 	gowebpLosslessDir := "test_data/gowebp/lossless"
@@ -79,6 +80,8 @@ func TestCompareWithCwebp(t *testing.T) {
 		srcKB             float64
 		libLossyKB        string
 		libLossyMs        string
+		libM6LossyKB      string
+		libM6LossyMs      string
 		libLosslessKB     string
 		libLosslessMs     string
 		goLossyKB         float64
@@ -95,11 +98,12 @@ func TestCompareWithCwebp(t *testing.T) {
 		stem := strings.TrimSuffix(rel, filepath.Ext(rel))
 
 		// ensure output dirs exist
-		for _, d := range []string{libwebpLossyDir, libwebpLosslessDir, gowebpLossyDir, gowebpLosslessDir} {
+		for _, d := range []string{libwebpLossyDir, libwebpLossyM6Dir, libwebpLosslessDir, gowebpLossyDir, gowebpLosslessDir} {
 			os.MkdirAll(filepath.Join(d, filepath.Dir(stem)), 0755)
 		}
 
 		libLossyPath := filepath.Join(libwebpLossyDir, stem+".webp")
+		libM6LossyPath := filepath.Join(libwebpLossyM6Dir, stem+".webp")
 		libLosslessPath := filepath.Join(libwebpLosslessDir, stem+".webp")
 		goLossyPath := filepath.Join(gowebpLossyDir, stem+".webp")
 		goLosslessPath := filepath.Join(gowebpLosslessDir, stem+".webp")
@@ -145,6 +149,26 @@ func TestCompareWithCwebp(t *testing.T) {
 				if fi, fiErr := os.Stat(libLossyPath); fiErr == nil {
 					libLossyKBStr = fmt.Sprintf("%.1f kb", float64(fi.Size())/1024)
 					libLossyMsStr = fmt.Sprintf("%.0f ms", float64(elapsed.Milliseconds()))
+				}
+			}
+		}
+
+		// --- cwebp lossy -m 6 ---
+		libM6LossyKBStr, libM6LossyMsStr := "N/A", "N/A"
+		if hasCwebp {
+			args := []string{"-q", "90", "-m", "6"}
+			if isHidden {
+				args = append(args, "-resize", "300", "300")
+			}
+			args = append(args, srcPath, "-o", libM6LossyPath)
+			cmd := exec.Command("cwebp", args...)
+			cmd.Stderr = nil
+			t0 := time.Now()
+			if cmd.Run() == nil {
+				elapsed := time.Since(t0)
+				if fi, fiErr := os.Stat(libM6LossyPath); fiErr == nil {
+					libM6LossyKBStr = fmt.Sprintf("%.1f kb", float64(fi.Size())/1024)
+					libM6LossyMsStr = fmt.Sprintf("%.0f ms", float64(elapsed.Milliseconds()))
 				}
 			}
 		}
@@ -199,6 +223,7 @@ func TestCompareWithCwebp(t *testing.T) {
 		rows = append(rows, row{
 			rel, srcKB,
 			libLossyKBStr, libLossyMsStr,
+			libM6LossyKBStr, libM6LossyMsStr,
 			libLosslessKBStr, libLosslessMsStr,
 			goLossyKB, goLossyMs, goLossyPSNR,
 			goLosslessKB, goLosslessMs,
@@ -206,17 +231,19 @@ func TestCompareWithCwebp(t *testing.T) {
 	}
 
 	// print to console
-	fmt.Printf("\n%-40s %9s | %11s %7s | %12s %7s | %9s %7s %10s | %11s %7s\n",
+	fmt.Printf("\n%-40s %9s | %11s %7s | %11s %7s | %12s %7s | %9s %7s %10s | %11s %7s\n",
 		"File", "Original",
-		"lib lossy", "time",
+		"lib -m4", "time",
+		"lib -m6", "time",
 		"lib lossless", "time",
 		"go lossy", "time", "PSNR",
 		"go lossless", "time")
-	fmt.Println(strings.Repeat("-", 135))
+	fmt.Println(strings.Repeat("-", 155))
 	for _, r := range rows {
-		fmt.Printf("%-40s %8.1fkb | %11s %7s | %12s %7s | %8.1fkb %7.0fms %10s | %10.1fkb %7.0fms\n",
+		fmt.Printf("%-40s %8.1fkb | %11s %7s | %11s %7s | %12s %7s | %8.1fkb %7.0fms %10s | %10.1fkb %7.0fms\n",
 			r.name, r.srcKB,
 			r.libLossyKB, r.libLossyMs,
+			r.libM6LossyKB, r.libM6LossyMs,
 			r.libLosslessKB, r.libLosslessMs,
 			r.goLossyKB, r.goLossyMs, r.goLossyPSNR,
 			r.goLosslessKB, r.goLosslessMs)
@@ -226,13 +253,14 @@ func TestCompareWithCwebp(t *testing.T) {
 	// write markdown
 	var md strings.Builder
 	md.WriteString("# WebP Conversion Comparison\n\n")
-	md.WriteString("Parameters: quality=90, method=4. `hidden/` images resized to 300×300.\n\n")
-	md.WriteString("| File | Original | lib lossy | lib lossy time | lib lossless | lib lossless time | go lossy | go lossy time | PSNR (go) | go lossless | go lossless time |\n")
-	md.WriteString("|---|---|---|---|---|---|---|---|---|---|---|\n")
+	md.WriteString("Parameters: quality=90. `hidden/` images resized to 300×300.\n\n")
+	md.WriteString("| File | Original | cwebp -m4 | time | cwebp -m6 | time | lib lossless | lib lossless time | go lossy | go lossy time | PSNR (go) | go lossless | go lossless time |\n")
+	md.WriteString("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, r := range rows {
-		md.WriteString(fmt.Sprintf("| %s | %.1f kb | %s | %s | %s | %s | %.1f kb | %.0f ms | %s | %.1f kb | %.0f ms |\n",
+		md.WriteString(fmt.Sprintf("| %s | %.1f kb | %s | %s | %s | %s | %s | %s | %.1f kb | %.0f ms | %s | %.1f kb | %.0f ms |\n",
 			r.name, r.srcKB,
 			r.libLossyKB, r.libLossyMs,
+			r.libM6LossyKB, r.libM6LossyMs,
 			r.libLosslessKB, r.libLosslessMs,
 			r.goLossyKB, r.goLossyMs, r.goLossyPSNR,
 			r.goLosslessKB, r.goLosslessMs))
