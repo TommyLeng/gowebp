@@ -255,7 +255,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 					intra16Predict(mode, yuv, mbX, ry, ws.pred16[:])
 					distortion := ssd16x16(src16[:], ws.pred16[:])
 					modeBits := i16ModeBitCost(mode)
-					score := distortion + int64(mbLambdaI16)*modeBits
+					// Match libwebp's SetRDScore: score = lambda*(R+H) + 256*(D+SD).
+					// See encoder.go for full rationale.
+					score := int64(rdDistoMult)*distortion + int64(mbLambdaI16)*modeBits
 					if score < bestI16Score {
 						bestI16Score = score
 						bestI16Mode = mode
@@ -337,6 +339,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 
 							bestBlkMode := B_DC_PRED
 							bestBlkScore := int64(1<<62 - 1)
+							// Old-scale score for the MB-level i4-vs-i16 comparison.
+							// See encoder.go for rationale.
+							bestBlkOldScore := int64(1<<62 - 1)
 
 							for mode := 0; mode < numI4Modes; mode++ {
 								if ws.sadScores[mode] > sadCutoff {
@@ -362,21 +367,26 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 
 								modeBits := i4ModeBitCost(mode, topPred, leftPred)
 
-								// Flatness penalty: see encoder.go for rationale (scaled by 1/256
-								// to compensate for our score system's missing RD_DISTO_MULT).
-								flatPenalty := int64(0)
-								if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
-									flatPenalty = (int64(mbLambdaI4) * flatnessPenalty) >> 8
-								}
-
 								// Coefficient bit cost R: see encoder.go for rationale.
 								rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs,
 									(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]))
-								rPenalty := (int64(mbLambdaI4) * int64(rCost)) >> 8
 
-								score := distortion + int64(mbLambdaI4)*modeBits + flatPenalty + rPenalty
+								// Flatness penalty added to R (libwebp PickBestIntra4
+								// quant_enc.c:1097-1103). See encoder.go for rationale.
+								flatBitsR := int64(0)
+								if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
+									flatBitsR = flatnessPenalty
+								}
+
+								// Match libwebp's SetRDScore: score = lambda*(R+H) + 256*(D+SD).
+								// See encoder.go for full rationale.
+								score := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*(modeBits+int64(rCost)+flatBitsR)
 								if score < bestBlkScore {
 									bestBlkScore = score
+									// Keep distortion at 1× for the MB-level i4-vs-i16
+									// comparison so it still matches the unscaled
+									// i16PostQuantDistortion term in i16Score.
+									bestBlkOldScore = distortion + int64(mbLambdaI4)*modeBits
 									bestBlkMode = mode
 									copy(ws.bestBlkAcLevels[:], ws.acQ[:])
 									for i := 0; i < 16; i++ {
@@ -388,7 +398,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 							ws.localI4Modes[blkIdx] = bestBlkMode
 							ws.localI4AcLevels[blkIdx] = ws.bestBlkAcLevels
 							ws.localI4DcLevels[blkIdx] = 0
-							i4TotalScore += bestBlkScore
+							i4TotalScore += bestBlkOldScore
 
 							bestNZ := 0
 							if findLast(ws.bestBlkAcLevels[:], 0) >= 0 {

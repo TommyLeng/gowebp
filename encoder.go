@@ -206,7 +206,11 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 				intra16Predict(mode, yuv, mbX, mbY, ws.pred16[:])
 				distortion := ssd16x16(src16[:], ws.pred16[:])
 				modeBits := i16ModeBitCost(mode)
-				score := distortion + int64(mbLambdaI16)*modeBits
+				// Match libwebp's SetRDScore (quant_enc.c:558):
+				//   score = lambda*(R+H) + RD_DISTO_MULT*(D+SD)   with RD_DISTO_MULT=256.
+				// Scaling D by 256 so distortion dominates rate at the proper
+				// libwebp ratio (~86% D vs ~14% lambda*H).
+				score := int64(rdDistoMult)*distortion + int64(mbLambdaI16)*modeBits
 				if score < bestI16Score {
 					bestI16Score = score
 					bestI16Mode = mode
@@ -302,6 +306,11 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 						// Try all 10 I4 modes; track the best.
 						bestBlkMode := B_DC_PRED
 						bestBlkScore := int64(1<<62 - 1)
+						// `bestBlkOldScore` tracks the winner using the original
+						// 1×-distortion scale, so the MB-level i4-vs-i16 comparison
+						// (which is intentionally NOT scaled by RD_DISTO_MULT — see
+						// note below the i4 block) sees the same magnitude as before.
+						bestBlkOldScore := int64(1<<62 - 1)
 
 						for mode := 0; mode < numI4Modes; mode++ {
 							if ws.sadScores[mode] > sadCutoff {
@@ -330,40 +339,38 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 								distortion += d * d
 							}
 
-							// Mode bit cost
+							// Mode bit cost H (header).
 							modeBits := i4ModeBitCost(mode, topPred, leftPred)
-
-							// Flatness penalty: if a non-DC mode produced a block with
-							// ≤ flatnessLimitI4 non-zero AC coefficients (so the residual
-							// is essentially flat), bias against it so DC_PRED wins.
-							// Mirrors PickBestIntra4 in libwebp quant_enc.c:1097-1103.
-							//
-							// Scaling rationale:  libwebp's SetRDScore computes
-							//     score = lambda*(R+H) + RD_DISTO_MULT*(D+SD)   with RD_DISTO_MULT=256.
-							// Our score is `distortion + lambda*modeBits`, i.e. distortion is
-							// weighted 1× instead of 256×.  To make the *trade-off magnitude*
-							// of the flatness penalty equivalent to libwebp's (where 140 bits
-							// worth of penalty competes against 256× distortion), scale by 1/256.
-							//   ours_penalty = lambda * FLATNESS_PENALTY * kNumBlocks / 256
-							// (kNumBlocks=1 for I4, division via >>8).
-							flatPenalty := int64(0)
-							if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
-								flatPenalty = (int64(mbLambdaI4) * flatnessPenalty) >> 8
-							}
 
 							// Coefficient bit cost R: mirrors VP8GetCostLuma4 in libwebp's
 							// PickBestIntra4 (quant_enc.c:1110). Without this, directional
 							// modes that produce a more-compressible residual (but slightly
 							// higher mode-bit cost) are unfairly penalised, and the encoder
-							// over-selects DC/TM. Scaled by 1/256 to match the score system
-							// (see flatPenalty rationale above).
+							// over-selects DC/TM.
 							rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs,
 								(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]))
-							rPenalty := (int64(mbLambdaI4) * int64(rCost)) >> 8
 
-							score := distortion + int64(mbLambdaI4)*modeBits + flatPenalty + rPenalty
+							// Flatness penalty: if a non-DC mode produced a block with
+							// ≤ flatnessLimitI4 non-zero AC coefficients (so the residual
+							// is essentially flat), bias against it so DC_PRED wins.
+							// Mirrors PickBestIntra4 in libwebp quant_enc.c:1097-1103:
+							// `R += FLATNESS_PENALTY * kNumBlocks` (kNumBlocks=1 for I4).
+							flatBitsR := int64(0)
+							if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
+								flatBitsR = flatnessPenalty
+							}
+
+							// Match libwebp's SetRDScore (quant_enc.c:558):
+							//   score = lambda*(R+H) + RD_DISTO_MULT*(D+SD)   with RD_DISTO_MULT=256.
+							// All bit costs (modeBits=H, rCost=R, flatBitsR=R bias) live in
+							// the lambda-scaled term; distortion (D) is multiplied by 256.
+							score := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*(modeBits+int64(rCost)+flatBitsR)
 							if score < bestBlkScore {
 								bestBlkScore = score
+								// Old-scale score for the MB-level i4-vs-i16 decision:
+								// keep distortion at 1× so it compares against the
+								// unscaled i16PostQuantDistortion term unchanged.
+								bestBlkOldScore = distortion + int64(mbLambdaI4)*modeBits
 								bestBlkMode = mode
 								copy(ws.bestBlkAcLevels[:], ws.acQ[:])
 								for i := 0; i < 16; i++ {
@@ -375,7 +382,7 @@ func encodeFrame(yuv *yuvImage, baseQ int) []byte {
 						ws.localI4Modes[blkIdx] = bestBlkMode
 						ws.localI4AcLevels[blkIdx] = ws.bestBlkAcLevels
 						ws.localI4DcLevels[blkIdx] = 0 // i4 has no WHT DC
-						i4TotalScore += bestBlkScore
+						i4TotalScore += bestBlkOldScore
 
 						// Update NZ context for subsequent blocks' trellis decisions.
 						bestNZ := 0
