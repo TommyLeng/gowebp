@@ -1008,16 +1008,3 @@ func fillPred4x4(pred []int16, val uint8) {
 	}
 }
 
-// sad4x4 computes the Sum of Absolute Differences between a 4×4 source
-// and prediction block. Used for cheap mode pre-screening before DCT.
-func sad4x4(src, pred []int16) int64 {
-	var s int64
-	for i := 0; i < 16; i++ {
-		d := int64(src[i]) - int64(pred[i])
-		if d < 0 {
-			d = -d
-		}
-		s += d
-	}
-	return s
-}
