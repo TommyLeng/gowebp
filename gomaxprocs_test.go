@@ -138,54 +138,27 @@ func TestCompareGOMAXPROCS(t *testing.T) {
 	}
 
 	for pi, procs := range procsList {
-		pi := pi
-		t.Run(fmt.Sprintf("GOMAXPROCS=%d", procs), func(t *testing.T) {
-			runtime.GOMAXPROCS(procs)
+		runtime.GOMAXPROCS(procs)
+		fmt.Printf("\n=== GOMAXPROCS=%d ===\n", procs)
+		for i, d := range imgs {
+			var buf bytes.Buffer
+			t0 := time.Now()
+			if err := Encode(&buf, d.src, &Options{Quality: 90}); err != nil {
+				t.Errorf("encode %s: %v", d.name, err)
+				continue
+			}
+			rows[i].goMs[pi] = float64(time.Since(t0).Milliseconds())
 
-			for i, d := range imgs {
-				var buf bytes.Buffer
-				t0 := time.Now()
-				if err := Encode(&buf, d.src, &Options{Quality: 90}); err != nil {
-					t.Errorf("encode %s: %v", d.name, err)
-					continue
-				}
-				rows[i].goMs[pi] = float64(time.Since(t0).Milliseconds())
-
-				// Only compute size and PSNR on first pass (deterministic).
-				if pi == 0 {
-					rows[i].goKB = float64(buf.Len()) / 1024
-					if decoded, err := webp.Decode(bytes.NewReader(buf.Bytes())); err == nil {
-						rows[i].goPSNR = fmt.Sprintf("%.1f dB", psnrRGBA(d.src, decoded))
-					} else {
-						rows[i].goPSNR = "-"
-					}
+			// Only compute size and PSNR on first pass (deterministic).
+			if pi == 0 {
+				rows[i].goKB = float64(buf.Len()) / 1024
+				if decoded, err := webp.Decode(bytes.NewReader(buf.Bytes())); err == nil {
+					rows[i].goPSNR = fmt.Sprintf("%.1f dB", psnrRGBA(d.src, decoded))
+				} else {
+					rows[i].goPSNR = "-"
 				}
 			}
-
-			// Per-GOMAXPROCS console output.
-			fmt.Printf("\n=== GOMAXPROCS=%d ===\n", procs)
-			fmt.Printf("%-40s %8s | %11s %7s | %9s %7s %10s\n",
-				"File", "Original", "cwebp lossy", "time", "go lossy", "time", "PSNR")
-			fmt.Println(strings.Repeat("-", 100))
-			for _, r := range rows {
-				fmt.Printf("%-40s %7.1fkb | %11s %7s | %8.1fkb %6.0fms %10s\n",
-					r.name, r.srcKB, r.cwebpKB, r.cwebpMs, r.goKB, r.goMs[pi], r.goPSNR)
-			}
-
-			// Per-GOMAXPROCS markdown.
-			var md strings.Builder
-			md.WriteString(fmt.Sprintf("# gowebp vs cwebp — GOMAXPROCS=%d\n\n", procs))
-			md.WriteString(fmt.Sprintf("quality=90, cwebp -m 4, Apple M1 Max, Go 1.25, GOMAXPROCS=%d\n\n", procs))
-			md.WriteString("| File | Original | cwebp lossy | cwebp time | go lossy | go time | PSNR |\n")
-			md.WriteString("|---|---|---|---|---|---|---|\n")
-			for _, r := range rows {
-				md.WriteString(fmt.Sprintf("| %s | %.1f kb | %s | %s | %.1f kb | %.0f ms | %s |\n",
-					r.name, r.srcKB, r.cwebpKB, r.cwebpMs, r.goKB, r.goMs[pi], r.goPSNR))
-			}
-			mdPath := filepath.Join(resultsDir, fmt.Sprintf("gomaxprocs_%d.md", procs))
-			os.WriteFile(mdPath, []byte(md.String()), 0644)
-			t.Logf("GOMAXPROCS=%d results saved to %s", procs, mdPath)
-		})
+		}
 	}
 
 	// Combined markdown — one row per image, timing columns for each GOMAXPROCS.
