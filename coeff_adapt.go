@@ -182,6 +182,101 @@ func vp8BitCost(bit int, prob int) int {
 	return vp8EntropyCost[p]
 }
 
+// coeffBitCost estimates the entropy-coding bit cost for a block of 16 quantized
+// coefficient levels using a precomputed level-cost table. Mirrors libwebp's
+// GetResidualCost_C() in src/dsp/cost.c (lines 238-271) and is exactly the
+// quantity that PickBestIntra4 adds to rd_tmp.R via VP8GetCostLuma4.
+//
+// Parameters:
+//   - ctx0: NZ context (top_nz + left_nz, 0..2) of the first coefficient slot.
+//   - coeffs: 16 quantized levels (zigzag order).
+//   - first: 0 for i4/UV, 1 for i16-AC.
+//   - costs: pointer to the trellisCostTables for this coeffType (already
+//     built from the coefficient probability table; e.g. trellisI4Costs).
+//   - probs: pointer to the raw [numBands][numCtx][numProbas] probability slab
+//     for the same coeffType — needed for the trailing EOB-flag cost only.
+//
+// Returns cost in millibits×1024 (same units as vp8EntropyCost / VP8FixedCostsI4).
+func coeffBitCost(ctx0 int, coeffs []int16, first int,
+	costs *trellisCostTables,
+	probs *[numBands][numCtx][numProbas]uint8) int {
+	// Locate the last non-zero coefficient.
+	last := -1
+	for i := 15; i >= first; i-- {
+		if coeffs[i] != 0 {
+			last = i
+			break
+		}
+	}
+
+	firstBand := int(vp8EncBands[first])
+	// Probability of the EOB bit at the very first position.
+	p0 := int(probs[firstBand][ctx0][0])
+
+	if last < 0 {
+		// All-zero block: just the cost of emitting the "no non-zero" flag.
+		return vp8BitCost(0, p0)
+	}
+
+	// Initial cost includes the "non-zero exists" flag, but ONLY when
+	// ctx0 == 0. Mirrors the (ctx0==0) branch in GetResidualCost_C:
+	// for ctx0 > 0, the level-cost table already has VP8BitCost(1, p[0])
+	// baked into its non-zero levels via cost_base.
+	cost := 0
+	if ctx0 == 0 {
+		cost = vp8BitCost(1, p0)
+	}
+
+	// Current level-cost table for (band, ctx) of the current position.
+	t := costs[firstBand][ctx0][:]
+
+	// Walk through all non-zero positions strictly before the last one.
+	n := first
+	for ; n < last; n++ {
+		v := int(coeffs[n])
+		if v < 0 {
+			v = -v
+		}
+		cost += levelCostFromTable(t, v)
+		// Next context: 0 if v==0, 1 if v==1, 2 if v>=2.
+		nextCtx := 0
+		if v >= 2 {
+			nextCtx = 2
+		} else if v == 1 {
+			nextCtx = 1
+		}
+		nextBand := int(vp8EncBands[n+1])
+		t = costs[nextBand][nextCtx][:]
+		// Sign bit (uniform, cost = 1 bit = 256 in our units) only for non-zero
+		// coeffs.
+		if v != 0 {
+			cost += 256
+		}
+	}
+
+	// Last coefficient is guaranteed non-zero by our `last` search.
+	{
+		v := int(coeffs[n])
+		if v < 0 {
+			v = -v
+		}
+		cost += levelCostFromTable(t, v)
+		cost += 256 // sign bit
+		// If last < 15, the bitstream emits an EOB flag (more=0) at position
+		// n+1 using probability probs[VP8EncBands[n+1]][ctx][0] where ctx is
+		// the context produced by v: 1 if v==1, else 2.
+		if n < 15 {
+			ctxAfter := 2
+			if v == 1 {
+				ctxAfter = 1
+			}
+			eobP := int(probs[int(vp8EncBands[n+1])][ctxAfter][0])
+			cost += vp8BitCost(0, eobP)
+		}
+	}
+	return cost
+}
+
 // calcTokenProba computes the new probability from observation counts.
 // Mirrors CalcTokenProba() in libwebp/src/enc/frame_enc.c:
 //   255 - nb*255/total, where nb = count of 1-decisions.

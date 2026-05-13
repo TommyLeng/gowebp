@@ -369,7 +369,12 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int) []byte {
 									flatPenalty = (int64(mbLambdaI4) * flatnessPenalty) >> 8
 								}
 
-								score := distortion + int64(mbLambdaI4)*modeBits + flatPenalty
+								// Coefficient bit cost R: see encoder.go for rationale.
+								rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs,
+									(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]))
+								rPenalty := (int64(mbLambdaI4) * int64(rCost)) >> 8
+
+								score := distortion + int64(mbLambdaI4)*modeBits + flatPenalty + rPenalty
 								if score < bestBlkScore {
 									bestBlkScore = score
 									bestBlkMode = mode
