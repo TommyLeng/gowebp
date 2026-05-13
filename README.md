@@ -44,17 +44,17 @@ err := gowebp.Encode(w, img, nil)
 
 Test environment: Apple M1 Max, Go 1.25, cwebp 1.4.0 (quality=90)
 
-### 速度 / Speed
+### 速度 / Speed (GOMAXPROCS=10, Apple M1 Max)
 
 | 圖片尺寸 / Image Size | cwebp | gowebp | 加速 / Speedup |
 |---|---|---|---|
 | 300×300 | ~21 ms | **~6 ms** | **3.4×** |
-| 768×512 (Kodak) | ~50 ms | **~30 ms** | **1.7×** |
+| 768×512 (Kodak) | ~55 ms | **~35 ms** | **1.6×** |
 | 1536×2048 | ~250 ms | **~102 ms** | **2.5×** |
 
-gowebp 更快的原因：直接作為 library 調用（無 subprocess fork 開銷），並採用 wave-front goroutine 並行編碼。
+速度優勢來自 wave-front goroutine 並行編碼（每行 MB 一條 goroutine）及無 subprocess fork 開銷。單核（GOMAXPROCS=1）下 gowebp 因每個 MB 做更多優化（trellis、SNS）而比 cwebp 慢約 2×。
 
-gowebp is faster because it runs in-process (no subprocess fork overhead) and uses wave-front goroutine parallel encoding across rows.
+Speed advantage comes from wave-front goroutine parallel encoding and no subprocess fork overhead. At GOMAXPROCS=1, gowebp is ~2× slower than cwebp due to heavier per-MB work (trellis, SNS). See [gowebp-testdata](https://github.com/TommyLeng/gowebp-testdata) for full GOMAXPROCS breakdown.
 
 ### 檔案大小 / File Size (quality=90)
 
