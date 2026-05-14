@@ -43,6 +43,29 @@ func BenchmarkEncode300x300(b *testing.B) {
 	}
 }
 
+// BenchmarkEncodeKodak768x512 encodes kodim05.png (768×512) at quality 90.
+func BenchmarkEncodeKodak768x512(b *testing.B) {
+	f, err := os.Open("test_data/original/kodak/kodim05.png")
+	if err != nil {
+		b.Skip("kodak test image not found: test_data/original/kodak/kodim05.png")
+	}
+	defer f.Close()
+
+	src, _, err := image.Decode(f)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var buf bytes.Buffer
+		if err := Encode(&buf, src, &Options{Quality: 90}); err != nil {
+			b.Fatal(err)
+		}
+		b.SetBytes(int64(src.Bounds().Dx() * src.Bounds().Dy()))
+	}
+}
+
 // BenchmarkEncodeLarge encodes a 1536×2048 JPEG at quality 90.
 // Uses the wave-front parallel encoding path (parallelThreshold=0, all sizes parallelised).
 func BenchmarkEncodeLarge(b *testing.B) {
