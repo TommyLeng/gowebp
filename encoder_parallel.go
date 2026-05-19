@@ -256,15 +256,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				src16 := &ws.src16
 				for y := 0; y < 16; y++ {
 					for x := 0; x < 16; x++ {
-						sx := px + x
-						sy := py + y
-						if sx >= yuv.width {
-							sx = yuv.width - 1
-						}
-						if sy >= yuv.height {
-							sy = yuv.height - 1
-						}
-						src16[y*16+x] = int16(yuv.y[sy*yuv.yStride+sx])
+						src16[y*16+x] = int16(yuv.y[(py+y)*yuv.yStride+(px+x)])
 					}
 				}
 
@@ -295,7 +287,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				var bestI4Score int64
 
 				{
-					topBlkMode := make([]int, 4)
+					var topBlkMode [4]int
 					for bx := 0; bx < 4; bx++ {
 						topBlkMode[bx] = colTopI4Modes[bx]
 					}
@@ -323,15 +315,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							src4 := &ws.src4
 							for y := 0; y < 4; y++ {
 								for x := 0; x < 4; x++ {
-									sx := bpx + x
-									sy := bpy + y
-									if sx >= yuv.width {
-										sx = yuv.width - 1
-									}
-									if sy >= yuv.height {
-										sy = yuv.height - 1
-									}
-									src4[y*4+x] = int16(yuv.y[sy*yuv.yStride+sx])
+									src4[y*4+x] = int16(yuv.y[(bpy+y)*yuv.yStride+(bpx+x)])
 								}
 							}
 
@@ -551,18 +535,10 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							sPlane = yuv.v
 						}
 						predictUV(uvMode, rPlane, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.predU8[:])
-						uvW := (yuv.width + 1) / 2
-						uvH := (yuv.height + 1) / 2
 						for j := 0; j < 8; j++ {
 							for i := 0; i < 8; i++ {
 								bpx := mbX*8 + i
 								bpy := ry*8 + j
-								if bpx >= uvW {
-									bpx = uvW - 1
-								}
-								if bpy >= uvH {
-									bpy = uvH - 1
-								}
 								src := int64(sPlane[bpy*yuv.uvStride+bpx])
 								d := src - int64(ws.predU8[j*8+i])
 								if ch == 0 {

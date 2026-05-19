@@ -204,15 +204,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 			src16 := &ws.src16
 			for y := 0; y < 16; y++ {
 				for x := 0; x < 16; x++ {
-					sx := px + x
-					sy := py + y
-					if sx >= yuv.width {
-						sx = yuv.width - 1
-					}
-					if sy >= yuv.height {
-						sy = yuv.height - 1
-					}
-					src16[y*16+x] = int16(yuv.y[sy*yuv.yStride+sx])
+					src16[y*16+x] = int16(yuv.y[(py+y)*yuv.yStride+(px+x)])
 				}
 			}
 
@@ -249,7 +241,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 
 			{
 				// Track per-block top/left mode context
-				topBlkMode := make([]int, 4) // top block modes for bx=0..3
+				var topBlkMode [4]int // top block modes for bx=0..3
 				for bx := 0; bx < 4; bx++ {
 					topBlkMode[bx] = topI4Modes[mbX*4+bx]
 				}
@@ -281,15 +273,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						src4 := &ws.src4
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								sx := bpx + x
-								sy := bpy + y
-								if sx >= yuv.width {
-									sx = yuv.width - 1
-								}
-								if sy >= yuv.height {
-									sy = yuv.height - 1
-								}
-								src4[y*4+x] = int16(yuv.y[sy*yuv.yStride+sx])
+								src4[y*4+x] = int16(yuv.y[(bpy+y)*yuv.yStride+(bpx+x)])
 							}
 						}
 
@@ -544,18 +528,10 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						sPlane = yuv.v
 					}
 					predictUV(uvMode, rPlane, yuv.uvStride, mbX, mbY, yuv.width, yuv.height, ws.predU8[:])
-					uvW := (yuv.width + 1) / 2
-					uvH := (yuv.height + 1) / 2
 					for j := 0; j < 8; j++ {
 						for i := 0; i < 8; i++ {
 							bpx := mbX*8 + i
 							bpy := mbY*8 + j
-							if bpx >= uvW {
-								bpx = uvW - 1
-							}
-							if bpy >= uvH {
-								bpy = uvH - 1
-							}
 							src := int64(sPlane[bpy*yuv.uvStride+bpx])
 							d := src - int64(ws.predU8[j*8+i])
 							if ch == 0 {
@@ -1034,19 +1010,9 @@ func extractBlock4x4Y(yuv *yuvImage, px, py int, flat []int16) {
 
 // extractBlock4x4UV extracts a 4x4 chroma block.
 func extractBlock4x4UV(plane []uint8, stride, px, py, imgW, imgH int, flat []int16) {
-	uvW := (imgW + 1) / 2
-	uvH := (imgH + 1) / 2
 	for dy := 0; dy < 4; dy++ {
 		for dx := 0; dx < 4; dx++ {
-			x := px + dx
-			y := py + dy
-			if x >= uvW {
-				x = uvW - 1
-			}
-			if y >= uvH {
-				y = uvH - 1
-			}
-			flat[dy*4+dx] = int16(plane[y*stride+x])
+			flat[dy*4+dx] = int16(plane[(py+dy)*stride+(px+dx)])
 		}
 	}
 }
