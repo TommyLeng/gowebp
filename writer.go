@@ -42,6 +42,11 @@ func encodeLossy(w io.Writer, img image.Image, quality int) error {
 		quality = 100
 	}
 
+	// If image has a non-trivial alpha channel, use Extended format (VP8 RGB + VP8L alpha).
+	if imageHasAlpha(img) {
+		return encodeLossyWithAlpha(w, img, quality)
+	}
+
 	internalQuality := quality
 
 	// Acquire a reusable frame arena; return it when done.

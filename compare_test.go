@@ -89,6 +89,8 @@ func TestCompareWithCwebp(t *testing.T) {
 		goLossyPSNR       string
 		goLosslessKB      float64
 		goLosslessMs      float64
+		hasAlpha          bool
+		alphaTransPct     string // % of transparent pixels correctly preserved
 	}
 	var rows []row
 
@@ -204,9 +206,30 @@ func TestCompareWithCwebp(t *testing.T) {
 		os.WriteFile(goLossyPath, bufLossy.Bytes(), 0644)
 		goLossyKB := float64(bufLossy.Len()) / 1024
 
+		hasAlpha := imageHasAlpha(dst)
 		goLossyPSNR := "err"
+		alphaTransPct := "-"
 		if decoded, decErr := webp.Decode(bytes.NewReader(bufLossy.Bytes())); decErr == nil {
 			goLossyPSNR = fmt.Sprintf("%.1f dB", psnrRGBA(dst, decoded))
+			if hasAlpha {
+				b := dst.Bounds()
+				total, ok := 0, 0
+				for y := b.Min.Y; y < b.Max.Y; y++ {
+					for x := b.Min.X; x < b.Max.X; x++ {
+						_, _, _, srcA := dst.At(x, y).RGBA()
+						if srcA == 0 {
+							total++
+							_, _, _, gotA := decoded.At(x, y).RGBA()
+							if gotA == 0 {
+								ok++
+							}
+						}
+					}
+				}
+				if total > 0 {
+					alphaTransPct = fmt.Sprintf("%.1f%%", float64(ok)/float64(total)*100)
+				}
+			}
 		}
 
 		// --- gowebp lossless ---
@@ -221,32 +244,35 @@ func TestCompareWithCwebp(t *testing.T) {
 		goLosslessKB := float64(bufLossless.Len()) / 1024
 
 		rows = append(rows, row{
-			rel, srcKB,
-			libLossyKBStr, libLossyMsStr,
-			libM6LossyKBStr, libM6LossyMsStr,
-			libLosslessKBStr, libLosslessMsStr,
-			goLossyKB, goLossyMs, goLossyPSNR,
-			goLosslessKB, goLosslessMs,
+			name:          rel,
+			srcKB:         srcKB,
+			libLossyKB:    libLossyKBStr, libLossyMs: libLossyMsStr,
+			libM6LossyKB:  libM6LossyKBStr, libM6LossyMs: libM6LossyMsStr,
+			libLosslessKB: libLosslessKBStr, libLosslessMs: libLosslessMsStr,
+			goLossyKB:     goLossyKB, goLossyMs: goLossyMs, goLossyPSNR: goLossyPSNR,
+			goLosslessKB:  goLosslessKB, goLosslessMs: goLosslessMs,
+			hasAlpha:      hasAlpha, alphaTransPct: alphaTransPct,
 		})
 	}
 
 	// print to console
-	fmt.Printf("\n%-40s %9s | %11s %7s | %11s %7s | %12s %7s | %9s %7s %10s | %11s %7s\n",
+	fmt.Printf("\n%-40s %9s | %11s %7s | %11s %7s | %12s %7s | %9s %7s %10s | %11s %7s | %s\n",
 		"File", "Original",
 		"lib -m4", "time",
 		"lib -m6", "time",
 		"lib lossless", "time",
 		"go lossy", "time", "PSNR",
-		"go lossless", "time")
-	fmt.Println(strings.Repeat("-", 155))
+		"go lossless", "time", "alpha trans%")
+	fmt.Println(strings.Repeat("-", 170))
 	for _, r := range rows {
-		fmt.Printf("%-40s %8.1fkb | %11s %7s | %11s %7s | %12s %7s | %8.1fkb %7.0fms %10s | %10.1fkb %7.0fms\n",
+		fmt.Printf("%-40s %8.1fkb | %11s %7s | %11s %7s | %12s %7s | %8.1fkb %7.0fms %10s | %10.1fkb %7.0fms | %s\n",
 			r.name, r.srcKB,
 			r.libLossyKB, r.libLossyMs,
 			r.libM6LossyKB, r.libM6LossyMs,
 			r.libLosslessKB, r.libLosslessMs,
 			r.goLossyKB, r.goLossyMs, r.goLossyPSNR,
-			r.goLosslessKB, r.goLosslessMs)
+			r.goLosslessKB, r.goLosslessMs,
+			r.alphaTransPct)
 	}
 	fmt.Println()
 
@@ -254,18 +280,20 @@ func TestCompareWithCwebp(t *testing.T) {
 	var md strings.Builder
 	md.WriteString("# WebP Conversion Comparison\n\n")
 	md.WriteString("Parameters: quality=90. `hidden/` images resized to 300×300.\n\n")
-	md.WriteString("| File | Original | cwebp -m4 | time | cwebp -m6 | time | lib lossless | lib lossless time | go lossy | go lossy time | PSNR (go) | go lossless | go lossless time |\n")
-	md.WriteString("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	md.WriteString("| File | Original | cwebp -m4 | time | cwebp -m6 | time | lib lossless | lib lossless time | go lossy | go lossy time | PSNR (go) | go lossless | go lossless time | alpha trans% |\n")
+	md.WriteString("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, r := range rows {
-		md.WriteString(fmt.Sprintf("| %s | %.1f kb | %s | %s | %s | %s | %s | %s | %.1f kb | %.0f ms | %s | %.1f kb | %.0f ms |\n",
+		md.WriteString(fmt.Sprintf("| %s | %.1f kb | %s | %s | %s | %s | %s | %s | %.1f kb | %.0f ms | %s | %.1f kb | %.0f ms | %s |\n",
 			r.name, r.srcKB,
 			r.libLossyKB, r.libLossyMs,
 			r.libM6LossyKB, r.libM6LossyMs,
 			r.libLosslessKB, r.libLosslessMs,
 			r.goLossyKB, r.goLossyMs, r.goLossyPSNR,
-			r.goLosslessKB, r.goLosslessMs))
+			r.goLosslessKB, r.goLosslessMs,
+			r.alphaTransPct))
 	}
-	mdPath := "test_data/compare_results.md"
+	ts := time.Now().Format("20060102-150405")
+	mdPath := fmt.Sprintf("test_data/compare_results-%s.md", ts)
 	os.WriteFile(mdPath, []byte(md.String()), 0644)
 	t.Logf("results saved to %s", mdPath)
 }
