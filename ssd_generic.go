@@ -2,7 +2,7 @@
 // Copyright 2011 Google Inc. All Rights Reserved.
 // BSD 3-Clause License — see /Users/bayshark/-projects/self/libwebp/COPYING
 
-//go:build !arm64
+//go:build !arm64 && !amd64
 
 package gowebp
 
