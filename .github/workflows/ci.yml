@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "feat/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test-arm64:
+    name: Test (arm64, macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test ./...
+      - name: Benchmark (arm64 NEON)
+        run: go test -bench='BenchmarkEncodeSynthetic' -benchtime=3s -run=^$
+
+  test-amd64:
+    name: Test (amd64, Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test ./...
+      - name: Benchmark (amd64 SSE2)
+        run: go test -bench='BenchmarkEncodeSynthetic' -benchtime=3s -run=^$

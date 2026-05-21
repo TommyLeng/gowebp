@@ -14,10 +14,16 @@ import (
 )
 
 func TestLumaQuality(t *testing.T) {
-	f, _ := os.Open("test_data/original/hidden/CD15 - Gallarde,Nica_fix.jpg")
+	f, err := os.Open("test_data/original/hidden/CD15 - Gallarde,Nica_fix.jpg")
+	if err != nil {
+		t.Skip("test image not found")
+	}
 	defer f.Close()
-	src, _ := jpeg.Decode(f)
-	
+	src, err := jpeg.Decode(f)
+	if err != nil || src == nil {
+		t.Skip("could not decode test image")
+	}
+
 	dst := image.NewNRGBA(image.Rect(0, 0, 300, 300))
 	xdraw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Src, nil)
 	
