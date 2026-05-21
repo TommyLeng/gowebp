@@ -18,7 +18,7 @@ jobs:
       - name: Test
         run: go test ./...
       - name: Benchmark (arm64 NEON)
-        run: go test -bench='BenchmarkEncode300x300|BenchmarkEncodeKodak768x512' -benchtime=3s -run=^$
+        run: go test -bench='BenchmarkEncodeSynthetic' -benchtime=3s -run=^$
 
   test-amd64:
     name: Test (amd64, Linux)
@@ -31,4 +31,4 @@ jobs:
       - name: Test
         run: go test ./...
       - name: Benchmark (amd64 SSE2)
-        run: go test -bench='BenchmarkEncode300x300|BenchmarkEncodeKodak768x512' -benchtime=3s -run=^$
+        run: go test -bench='BenchmarkEncodeSynthetic' -benchtime=3s -run=^$
