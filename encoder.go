@@ -173,6 +173,12 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 	// Allocate workspace once for the whole frame; reused across all MBs.
 	ws := new(mbWorkspace)
 
+	// Precomputed probability-table pointers (frame-invariant). Hoisted out
+	// of the inner loops so the pointer casts don't run per block.
+	i4ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])
+	i16ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])
+	uvProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])
+
 	for mbY := 0; mbY < mbH; mbY++ {
 		leftNzY := [5]int{}
 		leftNzU := [3]int{}
@@ -308,57 +314,28 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						// note below the i4 block) sees the same magnitude as before.
 						bestBlkOldScore := int64(1<<62 - 1)
 
-						// runRD evaluates mode's full RD cost using the prediction
-						// already in ws.pred4. It updates best{Blk*} if this mode wins.
-						runRD := func(mode int) {
-							// Forward DCT of (src - pred)
+						// trellisCtx0 is a loop-invariant for this block.
+						trellisCtx0 := topNzI4[bx] + leftNzI4[by]
+						if trellisCtx0 > 2 {
+							trellisCtx0 = 2
+						}
+
+						if variance16 < flatThreshold16 {
+							// Very flat block: only DC mode is worth trying.
+							intra4Predict(B_DC_PRED, ctx, ws.pred4[:])
+							// --- runRD(B_DC_PRED) inlined ---
+							mode := B_DC_PRED
 							fTransform(src4[:], ws.pred4[:], ws.dctOut[:])
-
-							// Trellis-quantize all 16 coefficients (i4: no WHT, first=0).
-							trellisCtx0 := topNzI4[bx] + leftNzI4[by]
-							if trellisCtx0 > 2 {
-								trellisCtx0 = 2
-							}
 							trellisQuantize(ws.dctOut[:], ws.acQ[:], &qm.y1, 0, mbLambdaTrellisI4, trellisI4Costs,
-								(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]), trellisCtx0)
-
-							// Inverse DCT → reconstructed block.
+								i4ProbsPtr, trellisCtx0)
 							iTransform4x4(ws.dctOut[:], ws.pred4[:], ws.recBlock[:])
-
-							// Distortion = SSD of source vs actual reconstructed pixels
 							distortion := ssd4x4(src4[:], ws.recBlock[:])
-
-							// Mode bit cost H (header).
 							modeBits := i4ModeBitCost(mode, topPred, leftPred)
-
-							// Coefficient bit cost R: mirrors VP8GetCostLuma4 in libwebp's
-							// PickBestIntra4 (quant_enc.c:1110). Without this, directional
-							// modes that produce a more-compressible residual (but slightly
-							// higher mode-bit cost) are unfairly penalised, and the encoder
-							// over-selects DC/TM.
-							rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs,
-								(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3]))
-
-							// Flatness penalty: if a non-DC mode produced a block with
-							// ≤ flatnessLimitI4 non-zero AC coefficients (so the residual
-							// is essentially flat), bias against it so DC_PRED wins.
-							// Mirrors PickBestIntra4 in libwebp quant_enc.c:1097-1103:
-							// `R += FLATNESS_PENALTY * kNumBlocks` (kNumBlocks=1 for I4).
-							flatBitsR := int64(0)
-							if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
-								flatBitsR = flatnessPenalty
-							}
-
-							// Match libwebp's SetRDScore (quant_enc.c:558):
-							//   score = lambda*(R+H) + RD_DISTO_MULT*(D+SD)   with RD_DISTO_MULT=256.
-							// All bit costs (modeBits=H, rCost=R, flatBitsR=R bias) live in
-							// the lambda-scaled term; distortion (D) is multiplied by 256.
-							score := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*(modeBits+int64(rCost)+flatBitsR)
+							rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs, i4ProbsPtr)
+							// mode==0 (DC), so no flatness penalty.
+							score := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*(modeBits+int64(rCost))
 							if score < bestBlkScore {
 								bestBlkScore = score
-								// Old-scale score for the MB-level i4-vs-i16 decision:
-								// keep distortion at 1× so it compares against the
-								// unscaled i16PostQuantDistortion term unchanged.
 								bestBlkOldScore = distortion + int64(mbLambdaI4)*modeBits
 								bestBlkMode = mode
 								copy(ws.bestBlkAcLevels[:], ws.acQ[:])
@@ -366,42 +343,66 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 									ws.bestBlkRecon[i] = uint8(ws.recBlock[i])
 								}
 							}
-						}
-
-						if variance16 < flatThreshold16 {
-							// Very flat block: only DC mode is worth trying.
-							intra4Predict(B_DC_PRED, ctx, ws.pred4[:])
-							runRD(B_DC_PRED)
 						} else {
 							// SAD pre-screening: compute cheap Sum of Absolute Differences for
 							// all 10 modes, then only run the full DCT+quantize path on the
 							// top sadTopN candidates. Gives ~2.5× speedup for the i4 path.
 							const sadTopN = 4
-							// Cache all 10 SAD-phase predictions to avoid repeating them in the RD phase.
-							var sadPreds [numI4Modes][16]int16
+							// Cache all 10 SAD-phase predictions in workspace (sadPreds is
+							// part of ws to avoid 320 B of per-iteration stack growth).
+							var localSAD [numI4Modes]int64
 							for i := 0; i < numI4Modes; i++ {
-								intra4Predict(i, ctx, sadPreds[i][:])
-								ws.sadScores[i] = sad4x4(src4[:], sadPreds[i][:])
+								intra4Predict(i, ctx, ws.sadPreds[i][:])
+								s := sad4x4(src4[:], ws.sadPreds[i][:])
+								ws.sadScores[i] = s
+								localSAD[i] = s
 							}
-							// Find sadTopN-th lowest SAD via partial selection sort on a copy.
-							copy(ws.sadTmp[:], ws.sadScores[:])
+							// Find sadTopN-th lowest SAD via partial selection sort on a
+							// stack-local copy (avoids bounds-check on ws.sadTmp slice).
 							for k := 0; k < sadTopN; k++ {
 								minIdx := k
+								minVal := localSAD[k]
 								for j := k + 1; j < numI4Modes; j++ {
-									if ws.sadTmp[j] < ws.sadTmp[minIdx] {
+									if localSAD[j] < minVal {
 										minIdx = j
+										minVal = localSAD[j]
 									}
 								}
-								ws.sadTmp[k], ws.sadTmp[minIdx] = ws.sadTmp[minIdx], ws.sadTmp[k]
+								if minIdx != k {
+									localSAD[minIdx] = localSAD[k]
+									localSAD[k] = minVal
+								}
 							}
-							sadCutoff := ws.sadTmp[sadTopN-1]
+							sadCutoff := localSAD[sadTopN-1]
 
 							for mode := 0; mode < numI4Modes; mode++ {
 								if ws.sadScores[mode] > sadCutoff {
 									continue
 								}
-								copy(ws.pred4[:], sadPreds[mode][:])
-								runRD(mode)
+								// --- runRD(mode) inlined ---
+								// Use the cached SAD prediction directly (avoids a 16-int16 copy).
+								predSlice := ws.sadPreds[mode][:]
+								fTransform(src4[:], predSlice, ws.dctOut[:])
+								trellisQuantize(ws.dctOut[:], ws.acQ[:], &qm.y1, 0, mbLambdaTrellisI4, trellisI4Costs,
+									i4ProbsPtr, trellisCtx0)
+								iTransform4x4(ws.dctOut[:], predSlice, ws.recBlock[:])
+								distortion := ssd4x4(src4[:], ws.recBlock[:])
+								modeBits := i4ModeBitCost(mode, topPred, leftPred)
+								rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs, i4ProbsPtr)
+								flatBitsR := int64(0)
+								if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
+									flatBitsR = flatnessPenalty
+								}
+								score := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*(modeBits+int64(rCost)+flatBitsR)
+								if score < bestBlkScore {
+									bestBlkScore = score
+									bestBlkOldScore = distortion + int64(mbLambdaI4)*modeBits
+									bestBlkMode = mode
+									copy(ws.bestBlkAcLevels[:], ws.acQ[:])
+									for i := 0; i < 16; i++ {
+										ws.bestBlkRecon[i] = uint8(ws.recBlock[i])
+									}
+								}
 							}
 						}
 
@@ -452,7 +453,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					ws.yDcRaw16[n] = ws.i16DctOut[0]
 					ws.i16DctOut[0] = 0
 					trellisQuantize(ws.i16DctOut[:], ws.mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
-						(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0]), 0)
+						i16ProbsPtr, 0)
 				}
 			}
 			fTransformWHT(ws.yDcRaw16[:], ws.whtOut16[:])
@@ -686,7 +687,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						}
 						fTransform(ws.uvSrc4[:], ws.uvPred4[:], ws.uvDctOut[:])
 						trellisQuantize(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
-							(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2]), 0)
+							uvProbsPtr, 0)
 						ws.uvLevels[bn] = ws.uvQuant
 					}
 				}

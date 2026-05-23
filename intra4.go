@@ -162,9 +162,11 @@ func buildPred4Context(yuv *yuvImage, recon []uint8, reconStride int, bpx, bpy i
 	return ctx
 }
 
-// intra4Predict fills pred[16] with the 4x4 prediction for the given mode.
-// Uses pred4Context for neighbor pixels.
-func intra4Predict(mode int, ctx pred4Context, pred []int16) {
+// intra4PredScalar fills pred[16] with the 4x4 prediction for the given mode.
+// Uses pred4Context for neighbor pixels. This is the pure-Go reference
+// implementation; on arm64 the four most-common modes (DC/TM/VE/HE) are
+// dispatched to NEON-vectorised helpers via intra4Predict in intra4_arm64.go.
+func intra4PredScalar(mode int, ctx pred4Context, pred []int16) {
 	X := ctx.topLeft
 	// left pixels: I=left[0]=row0, J=left[1], K=left[2], L=left[3]
 	I := ctx.left[0]
