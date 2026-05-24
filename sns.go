@@ -552,15 +552,13 @@ func makeSegmentParamsFromQ(q int) segmentParams {
 	setupMatrix(&qm.uv, 2)
 
 	// Lambda computation (SetupMatrices in libwebp).
-	var y1qSum, y2qSum, uvqSum int
+	var y1qSum, y2qSum int
 	for i := 0; i < 16; i++ {
 		y1qSum += int(qm.y1.q[i])
 		y2qSum += int(qm.y2.q[i])
-		uvqSum += int(qm.uv.q[i])
 	}
 	qI4 := (y1qSum + 8) >> 4
 	qI16 := (y2qSum + 8) >> 4
-	qUV := (uvqSum + 8) >> 4
 
 	lambdaI4 := (3 * qI4 * qI4) >> 7
 	if lambdaI4 < 1 {
@@ -582,11 +580,6 @@ func makeSegmentParamsFromQ(q int) segmentParams {
 	if lambdaTrellisI16 < 1 {
 		lambdaTrellisI16 = 1
 	}
-	lambdaTrellisUV := (qUV * qUV) << 1
-	if lambdaTrellisUV < 1 {
-		lambdaTrellisUV = 1
-	}
-
 	return segmentParams{
 		qm:               qm,
 		baseQ:            q,
@@ -595,10 +588,8 @@ func makeSegmentParamsFromQ(q int) segmentParams {
 		lambdaMode:       lambdaMode,
 		lambdaTrellisI4:  lambdaTrellisI4,
 		lambdaTrellisI16: lambdaTrellisI16,
-		lambdaTrellisUV:  lambdaTrellisUV,
 		trellisI4Costs:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])),
 		trellisI16Costs:  buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])),
-		trellisUVCosts:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])),
 	}
 }
 

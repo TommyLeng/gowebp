@@ -202,7 +202,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 			// out of the per-block path so the pointer casts don't run per block.
 			i4ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])
 			i16ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])
-			uvProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])
+
 
 			// Per-row left-neighbor NZ state (reset at each row start).
 			var leftNzY [5]int
@@ -257,10 +257,8 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				mbLambdaMode := seg.lambdaMode
 				mbLambdaTrellisI4 := seg.lambdaTrellisI4
 				mbLambdaTrellisI16 := seg.lambdaTrellisI16
-				mbLambdaTrellisUV := seg.lambdaTrellisUV
 				trellisI4Costs := &seg.trellisI4Costs
 				trellisI16Costs := &seg.trellisI16Costs
-				trellisUVCosts := &seg.trellisUVCosts
 
 				// Extract full 16x16 source block into workspace.
 				src16 := &ws.src16
@@ -427,6 +425,17 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 									iTransform4x4(ws.dctOut[:], predSlice, ws.recBlock[:])
 									distortion := ssd4x4(src4[:], ws.recBlock[:])
 									modeBits := i4ModeBitCost(mode, topPred, leftPred)
+
+									// Phase-1 early-out: D-only score (no coefficient rate).
+									// This is a lower bound on the true RD score, so if it already
+									// loses to the best, the full score will too. Skip coeffBitCost.
+									if bestBlkScore < int64(1<<62-1) {
+										earlyScore := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*modeBits
+										if earlyScore >= bestBlkScore {
+											continue
+										}
+									}
+
 									rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs, i4ProbsPtr)
 									flatBitsR := int64(0)
 									if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
@@ -649,8 +658,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 								}
 							}
 							fTransform(ws.uvSrc4[:], ws.uvPred4[:], ws.uvDctOut[:])
-							trellisQuantize(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
-								uvProbsPtr, 0)
+							quantizeBlock(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0)
 							ws.uvLevels[bn] = ws.uvQuant
 						}
 					}

@@ -22,10 +22,8 @@ type segmentParams struct {
 	lambdaMode      int
 	lambdaTrellisI4  int
 	lambdaTrellisI16 int
-	lambdaTrellisUV  int
 	trellisI4Costs  trellisCostTables
 	trellisI16Costs trellisCostTables
-	trellisUVCosts  trellisCostTables
 }
 
 // makeSegmentParams builds a segmentParams for a given quality level.
@@ -33,15 +31,13 @@ func makeSegmentParams(quality int) segmentParams {
 	qm := buildQuantMatrices(quality)
 	q := qualityToLevel(quality)
 
-	var y1qSum, y2qSum, uvqSum int
+	var y1qSum, y2qSum int
 	for i := 0; i < 16; i++ {
 		y1qSum += int(qm.y1.q[i])
 		y2qSum += int(qm.y2.q[i])
-		uvqSum += int(qm.uv.q[i])
 	}
 	qI4 := (y1qSum + 8) >> 4
 	qI16 := (y2qSum + 8) >> 4
-	qUV := (uvqSum + 8) >> 4
 
 	lambdaI4 := (3 * qI4 * qI4) >> 7
 	if lambdaI4 < 1 {
@@ -63,11 +59,6 @@ func makeSegmentParams(quality int) segmentParams {
 	if lambdaTrellisI16 < 1 {
 		lambdaTrellisI16 = 1
 	}
-	lambdaTrellisUV := (qUV * qUV) << 1
-	if lambdaTrellisUV < 1 {
-		lambdaTrellisUV = 1
-	}
-
 	return segmentParams{
 		qm:               qm,
 		baseQ:            q,
@@ -76,10 +67,8 @@ func makeSegmentParams(quality int) segmentParams {
 		lambdaMode:       lambdaMode,
 		lambdaTrellisI4:  lambdaTrellisI4,
 		lambdaTrellisI16: lambdaTrellisI16,
-		lambdaTrellisUV:  lambdaTrellisUV,
 		trellisI4Costs:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])),
 		trellisI16Costs:  buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])),
-		trellisUVCosts:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])),
 	}
 }
 
@@ -177,7 +166,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 	// of the inner loops so the pointer casts don't run per block.
 	i4ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])
 	i16ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])
-	uvProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])
+
 
 	for mbY := 0; mbY < mbH; mbY++ {
 		leftNzY := [5]int{}
@@ -201,10 +190,8 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 			mbLambdaMode := seg.lambdaMode
 			mbLambdaTrellisI4 := seg.lambdaTrellisI4
 			mbLambdaTrellisI16 := seg.lambdaTrellisI16
-			mbLambdaTrellisUV := seg.lambdaTrellisUV
 			trellisI4Costs := &seg.trellisI4Costs
 			trellisI16Costs := &seg.trellisI16Costs
-			trellisUVCosts := &seg.trellisUVCosts
 
 			// Extract full 16x16 source block into workspace.
 			src16 := &ws.src16
@@ -388,6 +375,17 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 								iTransform4x4(ws.dctOut[:], predSlice, ws.recBlock[:])
 								distortion := ssd4x4(src4[:], ws.recBlock[:])
 								modeBits := i4ModeBitCost(mode, topPred, leftPred)
+
+								// Phase-1 early-out: D-only score (no coefficient rate).
+								// This is a lower bound on the true RD score, so if it already
+								// loses to the best, the full score will too. Skip coeffBitCost.
+								if bestBlkScore < int64(1<<62-1) {
+									earlyScore := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*modeBits
+									if earlyScore >= bestBlkScore {
+										continue
+									}
+								}
+
 								rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs, i4ProbsPtr)
 								flatBitsR := int64(0)
 								if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
@@ -686,8 +684,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							}
 						}
 						fTransform(ws.uvSrc4[:], ws.uvPred4[:], ws.uvDctOut[:])
-						trellisQuantize(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
-							uvProbsPtr, 0)
+						quantizeBlock(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0)
 						ws.uvLevels[bn] = ws.uvQuant
 					}
 				}
