@@ -5,8 +5,8 @@
 package gowebp
 
 // fTransform computes the 4x4 forward DCT of (src - ref), storing into out[16].
-// The horizontal pass is vectorised with NEON; the vertical pass is scalar
-// because it contains a data-dependent conditional (+1 when a3 != 0).
+// Both passes are fully vectorised with NEON (int32x4, one lane per column).
+// The data-dependent +1 when a3 != 0 is handled branchlessly via CMEQ/NOT/USHR.
 //
 //go:noescape
 func fTransform(src []int16, ref []int16, out []int16)

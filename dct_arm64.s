@@ -7,7 +7,7 @@
 // func fTransform(src []int16, ref []int16, out []int16)
 //
 // Computes the 4×4 forward DCT of (src - ref), storing 16 int16 coefficients into out.
-// Horizontal pass vectorised with NEON; vertical pass in scalar ARM64.
+// Both passes fully vectorised with NEON (int32x4 lanes = one lane per column).
 //
 // Stack convention (FP-based, NOSPLIT with $64 locals):
 //   src_base+0(FP), ref_base+24(FP), out_base+48(FP)
@@ -31,6 +31,15 @@
 // SMULL/SMLAL/SMLSL using V15 (Rm=15, Rm[4]=0, even elements only):
 //   H=0,L=0 → elem 0 = V15.H[0] = 2217
 //   H=0,L=1 → elem 2 = V15.H[2] = 5352
+//
+// Vertical pass WORD encodings (instruction base | Rn<<5 | Rd):
+//   DUP  Vd.4S, Wn              base = 0x4E040C00 + (Rn<<5) + Rd
+//   MUL  Vd.4S, Vn.4S, Vm.4S   base = 0x4EA09C00 + (Rm<<16) + (Rn<<5) + Rd
+//   CMEQ Vd.4S, Vn.4S, #0      base = 0x4EA09800 + (Rn<<5) + Rd
+//   NOT  Vd.16B, Vn.16B         base = 0x6E205800 + (Rn<<5) + Rd
+//   USHR Vd.4S, Vn.4S, #sh     base = 0x6F000400 + ((64-sh)<<16) + (Rn<<5) + Rd
+//   SSHR Vd.4S, Vn.4S, #sh     base = 0x4F000400 + ((64-sh)<<16) + (Rn<<5) + Rd
+//   XTN  Vd.4H, Vn.4S          base = 0x0E612800 + (Rn<<5) + Rd
 
 TEXT ·fTransform(SB),NOSPLIT,$64-72
 	// Uses FP-based arg convention (src_base+0, ref_base+24, out_base+48)
@@ -115,66 +124,84 @@ TEXT ·fTransform(SB),NOSPLIT,$64-72
 	MOVD    RSP, R11
 	VST4    [V24.S4, V25.S4, V26.S4, V27.S4], (R11)
 
-	// ── VERTICAL PASS ────────────────────────────────────────────────────────
-	// R11=tmp base, R19=out.ptr
-	// Registers: R0=i, R1=i*4, R2-R5=tmp values, R6=a0, R7=a1, R8=a2, R9=a3
-	//            R10,R12=scratch, R13=$2217, R14=$5352, R15,R16=mul results
-	MOVD    $0, R0
-	MOVD    $2217, R13
-	MOVD    $5352, R14
-vloop:
-	LSL     $2, R0, R1             // R1 = i*4 (byte offset)
-	MOVW    (R11)(R1), R2           // tmp[0+i]
-	// Compute base+offset for subsequent loads
-	ADD     $16, R11, R20
-	MOVW    (R20)(R1), R3           // tmp[4+i]  (R11+16+R1)
-	ADD     $32, R11, R20
-	MOVW    (R20)(R1), R4           // tmp[8+i]
-	ADD     $48, R11, R20
-	MOVW    (R20)(R1), R5           // tmp[12+i]
+	// ── VERTICAL PASS (NEON, fully vectorised) ───────────────────────────────
+	// VST4 layout at R11: each group of 4 consecutive int32s at offsets 0,16,32,48
+	// forms one position (row) across all 4 columns.  Lane i = column i.
+	//
+	// Load 4 rows from stack into int32x4 vectors:
+	//   V0[i] = tmp[0+i]  (pos 0, col i)
+	//   V1[i] = tmp[4+i]  (pos 1, col i)
+	//   V2[i] = tmp[8+i]  (pos 2, col i)
+	//   V3[i] = tmp[12+i] (pos 3, col i)
+	VLD1    (R11), [V0.S4]
+	ADD     $16, R11, R0
+	VLD1    (R0), [V1.S4]
+	ADD     $32, R11, R0
+	VLD1    (R0), [V2.S4]
+	ADD     $48, R11, R0
+	VLD1    (R0), [V3.S4]
 
-	ADD     R2, R5, R6    // a0 = tmp[0+i] + tmp[12+i]
-	ADD     R3, R4, R7    // a1 = tmp[4+i] + tmp[8+i]
-	SUB     R4, R3, R8    // a2 = tmp[4+i] - tmp[8+i]
-	SUB     R5, R2, R9    // a3 = tmp[0+i] - tmp[12+i]
+	// Butterfly:  V4=a0, V5=a1, V6=a2, V7=a3
+	VADD    V3.S4, V0.S4, V4.S4   // a0 = row0 + row3
+	VADD    V2.S4, V1.S4, V5.S4   // a1 = row1 + row2
+	VSUB    V2.S4, V1.S4, V6.S4   // a2 = row1 - row2
+	VSUB    V3.S4, V0.S4, V7.S4   // a3 = row0 - row3
 
-	// out[0+i] = (a0+a1+7) >> 4
-	ADD     R7, R6, R10
-	ADD     $7, R10, R10
-	ASR     $4, R10, R10
-	MOVH    R10, (R19)(R0<<1)          // out[0+i] at R19 + i*2
+	// Load rotation constants as int32x4 broadcast vectors
+	// V8=2217, V9=5352, V10=12000, V11=51000
+	MOVD    $2217, R5
+	WORD    $0x4E040CA8   // DUP V8.4S, R5
+	MOVD    $5352, R6
+	WORD    $0x4E040CC9   // DUP V9.4S, R6
+	MOVD    $12000, R7
+	WORD    $0x4E040CEA   // DUP V10.4S, R7
+	MOVD    $51000, R8
+	WORD    $0x4E040D0B   // DUP V11.4S, R8
 
-	// out[8+i] = (a0-a1+7) >> 4
-	SUB     R7, R6, R10
-	ADD     $7, R10, R10
-	ASR     $4, R10, R10
-	ADD     $16, R19, R20              // R20 = &out[8]
-	MOVH    R10, (R20)(R0<<1)          // out[8+i] at (R19+16) + i*2
+	// out[0..3] = (a0+a1+7) >> 4  →  V20
+	VADD    V5.S4, V4.S4, V20.S4
+	MOVD    $7, R5
+	WORD    $0x4E040CA0   // DUP V0.4S, R5  (broadcast 7)
+	VADD    V0.S4, V20.S4, V20.S4
+	WORD    $0x4F3C0694   // SSHR V20.4S, V20.4S, #4
 
-	// out[4+i] = ((a2*2217 + a3*5352 + 12000) >> 16) + (a3 != 0)
-	MUL     R13, R8, R15   // a2 * 2217
-	MUL     R14, R9, R16   // a3 * 5352
-	ADD     R16, R15, R15
-	ADD     $12000, R15, R15
-	ASR     $16, R15, R15
-	CMP     $0, R9
-	CSET    NE, R16
-	ADD     R16, R15, R15
-	ADD     $8, R19, R20               // R20 = &out[4]
-	MOVH    R15, (R20)(R0<<1)          // out[4+i] at (R19+8) + i*2
+	// out[8..11] = (a0-a1+7) >> 4  →  V22
+	VSUB    V5.S4, V4.S4, V22.S4
+	VADD    V0.S4, V22.S4, V22.S4
+	WORD    $0x4F3C06D6   // SSHR V22.4S, V22.4S, #4
 
-	// out[12+i] = (a3*2217 - a2*5352 + 51000) >> 16
-	MUL     R13, R9, R15   // a3 * 2217
-	MUL     R14, R8, R16   // a2 * 5352
-	SUB     R16, R15, R15
-	ADD     $51000, R15, R15
-	ASR     $16, R15, R15
-	ADD     $24, R19, R20              // R20 = &out[12]
-	MOVH    R15, (R20)(R0<<1)          // out[12+i] at (R19+24) + i*2
+	// out[4..7] = ((a2*2217 + a3*5352 + 12000) >> 16) + (a3 != 0)  →  V21
+	//   Step 1: a2*2217 in V12, a3*5352 in V13
+	WORD    $0x4EA89CCC   // MUL V12.4S, V6.4S, V8.4S  (a2 * 2217)
+	WORD    $0x4EA99CED   // MUL V13.4S, V7.4S, V9.4S  (a3 * 5352)
+	VADD    V13.S4, V12.S4, V21.S4
+	VADD    V10.S4, V21.S4, V21.S4
+	WORD    $0x4F3006B5   // SSHR V21.4S, V21.4S, #16
+	//   Step 2: branchless (a3 != 0) → +1
+	//   CMEQ V16.4S, V7.4S, #0  → 0xFFFFFFFF where a3==0
+	WORD    $0x4EA098F0   // CMEQ V16.4S, V7.4S, #0
+	//   NOT V17.16B, V16.16B   → 0xFFFFFFFF where a3!=0
+	WORD    $0x6E205A11   // NOT V17.16B, V16.16B
+	//   USHR V17.4S, V17.4S, #31  → 1 where a3!=0, 0 otherwise
+	WORD    $0x6F210631   // USHR V17.4S, V17.4S, #31
+	VADD    V17.S4, V21.S4, V21.S4
 
-	ADD     $1, R0, R0
-	CMP     $4, R0
-	BLT     vloop
+	// out[12..15] = (a3*2217 - a2*5352 + 51000) >> 16  →  V23
+	WORD    $0x4EA89CEE   // MUL V14.4S, V7.4S, V8.4S  (a3 * 2217)
+	WORD    $0x4EA99CCF   // MUL V15.4S, V6.4S, V9.4S  (a2 * 5352)
+	VSUB    V15.S4, V14.S4, V23.S4
+	VADD    V11.S4, V23.S4, V23.S4
+	WORD    $0x4F3006F7   // SSHR V23.4S, V23.4S, #16
+
+	// Narrow int32x4 → int16x4 for all 4 output groups
+	WORD    $0x0E612A94   // XTN V20.4H, V20.4S  (out[0..3])
+	WORD    $0x0E612AB5   // XTN V21.4H, V21.4S  (out[4..7])
+	WORD    $0x0E612AD6   // XTN V22.4H, V22.4S  (out[8..11])
+	WORD    $0x0E612AF7   // XTN V23.4H, V23.4S  (out[12..15])
+
+	// Store 4 × int16x4 = 32 bytes = out[0..15]
+	// out[0..3] at R19+0, out[4..7] at R19+8, out[8..11] at R19+16, out[12..15] at R19+24
+	VST1    [V20.H4, V21.H4, V22.H4, V23.H4], (R19)
 
 	RET
 
