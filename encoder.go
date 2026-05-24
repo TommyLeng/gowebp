@@ -262,6 +262,11 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					leftNzI4[by] = leftNzY[by]
 				}
 
+				// Precompute the top-row and left-column patch for this MB once,
+				// eliminating 16 × 13 per-pixel bounds-check calls in the inner loop.
+				fillI4Patch(&ws.i4Patch, recon, reconStride, px, py, yuv.mbW, yuv.mbH)
+				mbHasTop := mbY > 0
+
 				var i4TotalScore int64
 
 				for by := 0; by < 4; by++ {
@@ -270,9 +275,8 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						bpx := px + bx*4
 						bpy := py + by*4
 
-						// Build prediction context (uses global recon for already-encoded MBs,
-						// and mbReconI4 for within this MB — containing true reconstructed pixels).
-						ctx := buildPred4ContextWithMBRecon(yuv, recon, reconStride, ws.mbReconI4[:], px, py, bpx, bpy)
+						// Build prediction context from precomputed patch (no bounds-checking).
+						ctx := buildPred4ContextFromPatch(&ws.i4Patch, ws.mbReconI4[:], px, py, bpx, bpy, mbHasTop, yuv.mbW)
 
 						// Extract 4x4 source
 						src4 := &ws.src4
@@ -793,6 +797,202 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 	result = append(result, part0Data...)
 	result = append(result, tokenData...)
 	return result
+}
+
+// fillI4Patch precomputes the 37-byte neighbourhood patch for a macroblock.
+// It must be called once before the 16-block i4 inner loop.
+//
+// Patch layout (see mbWorkspace.i4Patch):
+//   patch[0..20]  = top border row: y=mbPY-1, x=mbPX-1..mbPX+19 (21 pixels)
+//   patch[21..36] = left border col: y=mbPY..mbPY+15, x=mbPX-1   (16 pixels)
+//
+// Border rules match buildPred4ContextWithMBRecon exactly:
+//   x < 0  → 129, y < 0 → 127, x/y beyond image bounds → 128 (or edge-clamped
+//   from the recon buffer for the top border row x >= mbPX+16).
+func fillI4Patch(patch *[37]uint8, recon []uint8, reconStride int,
+	mbPX, mbPY, reconW, reconH int) {
+
+	// --- top border row: patch[0..20] ---
+	// patch[0]     = (mbPX-1, mbPY-1)  — top-left corner of the MB
+	// patch[1..16] = (mbPX+0..15, mbPY-1) — top row of the MB
+	// patch[17..20]= (mbPX+16..19, mbPY-1) — right-of-top (needed by LD/VL on bx=3)
+	topY := mbPY - 1
+	for i := 0; i < 21; i++ {
+		x := mbPX - 1 + i
+		if topY < 0 {
+			patch[i] = 127
+		} else if x < 0 {
+			patch[i] = 129
+		} else if x >= reconW || topY >= reconH {
+			patch[i] = 128
+		} else {
+			patch[i] = recon[topY*reconStride+x]
+		}
+	}
+
+	// --- left border column: patch[21..36] ---
+	// patch[21+j] = (mbPX-1, mbPY+j) for j=0..15
+	leftX := mbPX - 1
+	for j := 0; j < 16; j++ {
+		y := mbPY + j
+		if leftX < 0 {
+			patch[21+j] = 129
+		} else if y >= reconH {
+			patch[21+j] = 128
+		} else {
+			patch[21+j] = recon[y*reconStride+leftX]
+		}
+	}
+}
+
+// buildPred4ContextFromPatch builds the intra4 context for a 4×4 block using
+// the precomputed i4Patch (top row + left column) plus the current MB's
+// in-progress reconstruction (mbRecon). No bounds checking is required: all
+// border-clamping was done once in fillI4Patch.
+//
+// Parameters:
+//   patch     — pointer to ws.i4Patch (must be freshly filled by fillI4Patch)
+//   mbRecon   — ws.mbReconI4 (16×16, partially reconstructed, flat row-major)
+//   mbPX/mbPY — MB origin in image coords
+//   bpx/bpy   — 4×4 block origin in image coords
+//   mbHasTop  — mbPY > 0 (controls right-of-top clamping for bx=3 sub-rows)
+//   reconW    — padded image width (mbW*16), for right-of-MB clamping
+func buildPred4ContextFromPatch(patch *[37]uint8, mbRecon []uint8,
+	mbPX, mbPY, bpx, bpy int, mbHasTop bool, reconW int) pred4Context {
+
+	var ctx pred4Context
+
+	bx := (bpx - mbPX) >> 2 // 0..3
+	by := (bpy - mbPY) >> 2 // 0..3
+
+	hasLeft := bpx > 0
+	hasTop := bpy > 0
+
+	// --- left column: get(bpx-1, bpy+i) for i=0..3 ---
+	if !hasLeft {
+		ctx.left[0] = 129
+		ctx.left[1] = 129
+		ctx.left[2] = 129
+		ctx.left[3] = 129
+	} else if bx == 0 {
+		// Left column of MB → read from patch left border (patch[21..36])
+		base := 21 + by*4
+		ctx.left[0] = int(patch[base])
+		ctx.left[1] = int(patch[base+1])
+		ctx.left[2] = int(patch[base+2])
+		ctx.left[3] = int(patch[base+3])
+	} else {
+		// Within the MB → read from mbRecon (already-reconstructed pixels)
+		rxLeft := bx*4 - 1
+		ryBase := by * 4
+		ctx.left[0] = int(mbRecon[ryBase*16+rxLeft])
+		ctx.left[1] = int(mbRecon[(ryBase+1)*16+rxLeft])
+		ctx.left[2] = int(mbRecon[(ryBase+2)*16+rxLeft])
+		ctx.left[3] = int(mbRecon[(ryBase+3)*16+rxLeft])
+	}
+
+	// --- top-left corner: get(bpx-1, bpy-1) ---
+	if hasTop && hasLeft {
+		if bx == 0 && by == 0 {
+			ctx.topLeft = int(patch[0]) // patch[0] = (mbPX-1, mbPY-1)
+		} else if by == 0 {
+			// bx>0, by==0: top row but left is inside MB at (bx*4-1, by*4-1==-1 → above MB)
+			// y = bpy-1 = mbPY-1: use top border row, x=mbPX+(bx*4-1)
+			ctx.topLeft = int(patch[1+bx*4-1]) // patch[1+rx] where rx=bx*4-1
+		} else if bx == 0 {
+			// bx==0, by>0: left border col, y=bpy-1=mbPY+(by*4-1)
+			ctx.topLeft = int(patch[21+by*4-1])
+		} else {
+			// Both inside MB: (bx*4-1, by*4-1)
+			ctx.topLeft = int(mbRecon[(by*4-1)*16+(bx*4-1)])
+		}
+	} else if hasTop {
+		ctx.topLeft = 127
+	} else if hasLeft {
+		// hasLeft && !hasTop
+		if mbPY == 0 {
+			ctx.topLeft = 127
+		} else {
+			ctx.topLeft = 129
+		}
+	} else {
+		// corner of image
+		if mbPY == 0 {
+			ctx.topLeft = 127
+		} else {
+			ctx.topLeft = 129
+		}
+	}
+
+	// --- top row: get(bpx+i, bpy-1) for i=0..3 ---
+	if !hasTop {
+		ctx.top[0] = 127
+		ctx.top[1] = 127
+		ctx.top[2] = 127
+		ctx.top[3] = 127
+	} else if by == 0 {
+		// Top of MB → top border row, x = mbPX+bx*4+i → patch index = 1+bx*4+i
+		base := 1 + bx*4
+		ctx.top[0] = int(patch[base])
+		ctx.top[1] = int(patch[base+1])
+		ctx.top[2] = int(patch[base+2])
+		ctx.top[3] = int(patch[base+3])
+	} else {
+		// Within MB → row by*4-1 of mbRecon
+		ry := by*4 - 1
+		rxBase := bx * 4
+		ctx.top[0] = int(mbRecon[ry*16+rxBase])
+		ctx.top[1] = int(mbRecon[ry*16+rxBase+1])
+		ctx.top[2] = int(mbRecon[ry*16+rxBase+2])
+		ctx.top[3] = int(mbRecon[ry*16+rxBase+3])
+	}
+
+	// --- top[4..7]: right-of-top (used by LD/VL diagonal predictors) ---
+	// Mirrors the logic in buildPred4ContextWithMBRecon lines 867-889.
+	if !hasTop {
+		ctx.top[4] = 127
+		ctx.top[5] = 127
+		ctx.top[6] = 127
+		ctx.top[7] = 127
+	} else {
+		for i := 0; i < 4; i++ {
+			x := bpx + 4 + i // global x
+			if x >= mbPX+16 {
+				// Right-of-MB: VP8IteratorRotateI4 convention — always use the
+				// MB's top border row (y=mbPY-1), never the in-progress rows.
+				if mbHasTop {
+					// patch[0..20] = top border row, x=mbPX-1..mbPX+19
+					// x = mbPX+16..19 → patch index = 1+16+i..1+19 = 17..20
+					px := x - (mbPX - 1) // offset into patch top row
+					if px < 21 {
+						ctx.top[4+i] = int(patch[px])
+					} else {
+						ctx.top[4+i] = int(patch[20]) // clamp to last valid
+					}
+				} else {
+					ctx.top[4+i] = 127
+				}
+			} else if by == 0 {
+				// Within MB top border → use patch top row
+				// x = mbPX+bx*4+4+i, patch index = 1 + (bx*4+4+i)
+				pIdx := 1 + bx*4 + 4 + i
+				ctx.top[4+i] = int(patch[pIdx])
+			} else {
+				// Within MB, not top row: get(x, bpy-1) = mbRecon[(by*4-1)*16+(bx*4+4+i)]
+				ry := by*4 - 1
+				rx := bx*4 + 4 + i
+				if rx < 16 {
+					ctx.top[4+i] = int(mbRecon[ry*16+rx])
+				} else {
+					// Should not happen for bx<=2 (bx*4+4+i <=14), only bx=3 can hit x>=mbPX+16
+					// which is handled above. This branch is dead code kept for safety.
+					ctx.top[4+i] = int(mbRecon[ry*16+15])
+				}
+			}
+		}
+	}
+
+	return ctx
 }
 
 // buildPred4ContextWithMBRecon builds the intra4 context using both the

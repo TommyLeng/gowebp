@@ -70,6 +70,18 @@ type mbWorkspace struct {
 	// local copies of i4 accumulators (used within the i4 block, then assigned to ws fields)
 	localI4AcLevels [16][16]int16
 	localI4DcLevels [16]int16
+
+	// i4Patch is a precomputed 21×21 neighbourhood extracted once per MB,
+	// before the 16-block inner loop. It eliminates the per-pixel bounds-check
+	// closure inside buildPred4ContextWithMBRecon.
+	//
+	// Layout (37 bytes total):
+	//   i4Patch[0..20]  = top border row: y=mbPY-1, x=mbPX-1..mbPX+19 (21 pixels)
+	//   i4Patch[21..36] = left border col: y=mbPY..mbPY+15, x=mbPX-1   (16 pixels)
+	//
+	// The MB interior (ws.mbReconI4) is NOT copied here; it is read directly and
+	// updated block-by-block as before, which is required for correct intra context.
+	i4Patch [37]uint8
 }
 
 // parallelThreshold is the minimum total MB count (mbW*mbH) above which
@@ -312,6 +324,11 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						leftNzI4[by] = leftNzY[by]
 					}
 
+					// Precompute top-row and left-column patch for this MB once,
+					// eliminating 16 × 13 per-pixel bounds-check calls in the inner loop.
+					fillI4Patch(&ws.i4Patch, recon, reconStride, px, py, yuv.mbW, yuv.mbH)
+					mbHasTop := ry > 0
+
 					var i4TotalScore int64
 
 					for by := 0; by < 4; by++ {
@@ -320,7 +337,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							bpx := px + bx*4
 							bpy := py + by*4
 
-							ctx := buildPred4ContextWithMBRecon(yuv, recon, reconStride, ws.mbReconI4[:], px, py, bpx, bpy)
+							ctx := buildPred4ContextFromPatch(&ws.i4Patch, ws.mbReconI4[:], px, py, bpx, bpy, mbHasTop, yuv.mbW)
 
 							src4 := &ws.src4
 							for y := 0; y < 4; y++ {
