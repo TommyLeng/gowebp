@@ -203,6 +203,26 @@ func trellisQuantize(
 		last++
 	}
 
+	// Sparse-block fast path: if the scan found no position above the coeff²
+	// threshold (last==0 after the increment, requires first==0 — never fires
+	// for first==1), all 16 coefficients have coeff²≤q[1]²/4.  In this regime
+	// the Viterbi processes at most one position (n=0, DC) with level0=0 and
+	// threshLevel≤1, so any non-zero trellis output would carry large distortion.
+	// Fall through to greedy quantization instead, which is simpler and
+	// produces zero output in virtually all cases at quality≥10.
+	// The trellis in[] invariant (in[kZigzag[n]] = dequantized value) is
+	// maintained by the explicit dequantize loop below.
+	if last < 1 {
+		nz := quantizeBlock(in, out, m, first)
+		// Restore in[] to dequantized values to satisfy the caller invariant
+		// (iTransform4x4 uses in[] for reconstruction in the i4 path).
+		for n := 0; n < 16; n++ {
+			j := int(kZigzag[n])
+			in[j] = int16(int32(out[n]) * int32(m.q[j]))
+		}
+		return nz
+	}
+
 	// "Skip all" baseline: cost of emitting EOB at the start (all-zero block).
 	// = VP8BitCost(0, probs[firstBand][ctx0][0]) * lambda
 	firstBand := int(vp8EncBands[first])
