@@ -67,7 +67,6 @@ type mbWorkspace struct {
 	i16RasterCoeffs [16]int16
 	i16RecBlock [16]int16
 	i16Pred4b   [16]int16
-	i16Recon    [256]uint8 // cached i16 reconstruction for recon-buffer copy
 	// local copies of i4 accumulators (used within the i4 block, then assigned to ws fields)
 	localI4AcLevels [16][16]int16
 	localI4DcLevels [16]int16
@@ -203,7 +202,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 			// out of the per-block path so the pointer casts don't run per block.
 			i4ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])
 			i16ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])
-
+			uvProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])
 
 			// Per-row left-neighbor NZ state (reset at each row start).
 			var leftNzY [5]int
@@ -258,8 +257,10 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				mbLambdaMode := seg.lambdaMode
 				mbLambdaTrellisI4 := seg.lambdaTrellisI4
 				mbLambdaTrellisI16 := seg.lambdaTrellisI16
+				mbLambdaTrellisUV := seg.lambdaTrellisUV
 				trellisI4Costs := &seg.trellisI4Costs
 				trellisI16Costs := &seg.trellisI16Costs
+				trellisUVCosts := &seg.trellisUVCosts
 
 				// Extract full 16x16 source block into workspace.
 				src16 := &ws.src16
@@ -523,9 +524,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								rpx := ws.i16RecBlock[y*4+x]
-								ws.i16Recon[(by*4+y)*16+(bx*4+x)] = uint8(rpx)
-								d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(rpx)
+								d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(ws.i16RecBlock[y*4+x])
 								i16PostQuantDistortion += d * d
 							}
 						}
@@ -600,11 +599,21 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						}
 					}
 				} else {
-					// i16: reconstructed pixels were cached in ws.i16Recon during the RD section.
-					// Copy directly without re-running dequantizeBlock + iTransform4x4.
-					for y := 0; y < 16; y++ {
-						for x := 0; x < 16; x++ {
-							recon[(py+y)*reconStride+(px+x)] = ws.i16Recon[y*16+x]
+					for by := 0; by < 4; by++ {
+						for bx := 0; bx < 4; bx++ {
+							n := by*4 + bx
+							for y := 0; y < 4; y++ {
+								for x := 0; x < 4; x++ {
+									ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
+								}
+							}
+							dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
+							iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
+							for y := 0; y < 4; y++ {
+								for x := 0; x < 4; x++ {
+									recon[(py+by*4+y)*reconStride+(px+bx*4+x)] = uint8(ws.i16RecBlock[y*4+x])
+								}
+							}
 						}
 					}
 				}
@@ -651,7 +660,8 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 								}
 							}
 							fTransform(ws.uvSrc4[:], ws.uvPred4[:], ws.uvDctOut[:])
-							quantizeBlock(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0)
+							trellisQuantize(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
+							uvProbsPtr, 0)
 							ws.uvLevels[bn] = ws.uvQuant
 						}
 					}

@@ -22,8 +22,10 @@ type segmentParams struct {
 	lambdaMode      int
 	lambdaTrellisI4  int
 	lambdaTrellisI16 int
+	lambdaTrellisUV  int
 	trellisI4Costs  trellisCostTables
 	trellisI16Costs trellisCostTables
+	trellisUVCosts  trellisCostTables
 }
 
 // makeSegmentParams builds a segmentParams for a given quality level.
@@ -31,13 +33,15 @@ func makeSegmentParams(quality int) segmentParams {
 	qm := buildQuantMatrices(quality)
 	q := qualityToLevel(quality)
 
-	var y1qSum, y2qSum int
+	var y1qSum, y2qSum, uvqSum int
 	for i := 0; i < 16; i++ {
 		y1qSum += int(qm.y1.q[i])
 		y2qSum += int(qm.y2.q[i])
+		uvqSum += int(qm.uv.q[i])
 	}
 	qI4 := (y1qSum + 8) >> 4
 	qI16 := (y2qSum + 8) >> 4
+	qUV := (uvqSum + 8) >> 4
 
 	lambdaI4 := (3 * qI4 * qI4) >> 7
 	if lambdaI4 < 1 {
@@ -59,6 +63,10 @@ func makeSegmentParams(quality int) segmentParams {
 	if lambdaTrellisI16 < 1 {
 		lambdaTrellisI16 = 1
 	}
+	lambdaTrellisUV := (qUV * qUV) << 1
+	if lambdaTrellisUV < 1 {
+		lambdaTrellisUV = 1
+	}
 	return segmentParams{
 		qm:               qm,
 		baseQ:            q,
@@ -67,8 +75,10 @@ func makeSegmentParams(quality int) segmentParams {
 		lambdaMode:       lambdaMode,
 		lambdaTrellisI4:  lambdaTrellisI4,
 		lambdaTrellisI16: lambdaTrellisI16,
+		lambdaTrellisUV:  lambdaTrellisUV,
 		trellisI4Costs:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])),
 		trellisI16Costs:  buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])),
+		trellisUVCosts:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])),
 	}
 }
 
@@ -166,7 +176,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 	// of the inner loops so the pointer casts don't run per block.
 	i4ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])
 	i16ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])
-
+	uvProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])
 
 	for mbY := 0; mbY < mbH; mbY++ {
 		leftNzY := [5]int{}
@@ -190,8 +200,10 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 			mbLambdaMode := seg.lambdaMode
 			mbLambdaTrellisI4 := seg.lambdaTrellisI4
 			mbLambdaTrellisI16 := seg.lambdaTrellisI16
+			mbLambdaTrellisUV := seg.lambdaTrellisUV
 			trellisI4Costs := &seg.trellisI4Costs
 			trellisI16Costs := &seg.trellisI16Costs
+			trellisUVCosts := &seg.trellisUVCosts
 
 			// Extract full 16x16 source block into workspace.
 			src16 := &ws.src16
@@ -478,9 +490,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
 					for y := 0; y < 4; y++ {
 						for x := 0; x < 4; x++ {
-							rpx := ws.i16RecBlock[y*4+x]
-							ws.i16Recon[(by*4+y)*16+(bx*4+x)] = uint8(rpx)
-							d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(rpx)
+							d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(ws.i16RecBlock[y*4+x])
 							i16PostQuantDistortion += d * d
 						}
 					}
@@ -565,11 +575,21 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					}
 				}
 			} else {
-				// i16: reconstructed pixels were cached in ws.i16Recon during the RD section.
-				// Copy directly without re-running dequantizeBlock + iTransform4x4.
-				for y := 0; y < 16; y++ {
-					for x := 0; x < 16; x++ {
-						recon[(py+y)*reconStride+(px+x)] = ws.i16Recon[y*16+x]
+				for by := 0; by < 4; by++ {
+					for bx := 0; bx < 4; bx++ {
+						n := by*4 + bx
+						for y := 0; y < 4; y++ {
+							for x := 0; x < 4; x++ {
+								ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
+							}
+						}
+						dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
+						iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
+						for y := 0; y < 4; y++ {
+							for x := 0; x < 4; x++ {
+								recon[(py+by*4+y)*reconStride+(px+bx*4+x)] = uint8(ws.i16RecBlock[y*4+x])
+							}
+						}
 					}
 				}
 			}
@@ -674,7 +694,8 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							}
 						}
 						fTransform(ws.uvSrc4[:], ws.uvPred4[:], ws.uvDctOut[:])
-						quantizeBlock(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0)
+						trellisQuantize(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
+							uvProbsPtr, 0)
 						ws.uvLevels[bn] = ws.uvQuant
 					}
 				}
