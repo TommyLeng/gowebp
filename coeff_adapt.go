@@ -232,7 +232,7 @@ func coeffBitCost(ctx0 int, coeffs []int16, first int,
 	}
 
 	// Current level-cost table for (band, ctx) of the current position.
-	t := costs[firstBand][ctx0][:]
+	t := &costs[firstBand][ctx0]
 
 	// Walk through all non-zero positions strictly before the last one.
 	n := first
@@ -250,7 +250,7 @@ func coeffBitCost(ctx0 int, coeffs []int16, first int,
 			nextCtx = 1
 		}
 		nextBand := int(vp8EncBands[n+1])
-		t = costs[nextBand][nextCtx][:]
+		t = &costs[nextBand][nextCtx]
 		// Sign bit (uniform, cost = 1 bit = 256 in our units) only for non-zero
 		// coeffs.
 		if v != 0 {

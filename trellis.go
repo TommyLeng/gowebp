@@ -121,7 +121,7 @@ func variableLevelCost(level int, p []uint8) int {
 
 // levelCostFromTable returns the total bit-cost of coding level v.
 // Mirrors VP8LevelCost(): vp8LevelFixedCosts[level] + table[min(level,67)]
-func levelCostFromTable(table []int16, level int) int {
+func levelCostFromTable(table *[maxVariableLevel + 1]int16, level int) int {
 	if level > maxLevel {
 		level = maxLevel
 	}
@@ -173,9 +173,13 @@ func trellisQuantize(
 	// scoreState holds the accumulated RD score and the cost table pointer
 	// for the CURRENT position. When this becomes ss_prev, we use its table
 	// to compute the cost of emitting the level at the next position.
+	// costs is a pointer to a fixed-size [maxVariableLevel+1]int16 array inside
+	// trellisCostTables; using *[N]int16 instead of []int16 shrinks the field
+	// from 24 bytes (slice header) to 8 bytes (pointer), reducing memory traffic
+	// in the Viterbi DP inner loop.
 	type scoreState struct {
 		score int64
-		costs []int16 // pointer into trellisCostTables[band][ctx][:], nil if dead
+		costs *[maxVariableLevel + 1]int16 // nil if dead
 	}
 
 	var nodes [16][numNodes]trellisNode
@@ -210,7 +214,7 @@ func trellisQuantize(
 	// ss[cur][m].costs = cost table for position `first` with context ctx0.
 	// In libwebp: rate = (ctx0 == 0) ? VP8BitCost(1, last_proba) : 0
 	// because for ctx0==0 the "non-zero" flag is not part of the level cost table.
-	initTable := costs[firstBand][ctx0][:]
+	initTable := &costs[firstBand][ctx0]
 	initRate := int64(0)
 	if ctx0 == 0 {
 		initRate = int64(vp8BitCost(1, lastProba)) * int64(lambda)
@@ -293,7 +297,7 @@ func trellisQuantize(
 			}
 			nextBand := int(vp8EncBands[n+1]) // sentinel at 16 is 0, harmless
 			if n+1 < 16 {
-				ss[curIdx][m2].costs = costs[nextBand][ctx][:]
+				ss[curIdx][m2].costs = &costs[nextBand][ctx]
 			} else {
 				ss[curIdx][m2].costs = nil
 			}
