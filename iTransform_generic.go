@@ -2,7 +2,7 @@
 // Copyright 2011 Google Inc. All Rights Reserved.
 // BSD 3-Clause License — see /Users/bayshark/-projects/self/libwebp/COPYING
 
-//go:build !arm64
+//go:build !arm64 && !amd64
 
 package gowebp
 
@@ -16,8 +16,8 @@ package gowebp
 // MUL1(a) = ((a * 20091) >> 16) + a = (a * 85627) >> 16
 // MUL2(a) = (a * 35468) >> 16
 //
-// Scalar fallback for non-arm64 platforms. The arm64 NEON implementation
-// lives in dct_arm64.s.
+// Scalar fallback for platforms without SIMD. The arm64 NEON implementation
+// lives in dct_arm64.s; the amd64 SSE2 implementation lives in iTransform_amd64.s.
 func iTransform4x4(coeffs []int16, pred []int16, out []int16) {
 	// c1 = 85627 = 65536 * cos(pi/8) * sqrt(2) (exact same value as decoder's idct.go).
 	// c2 = 35468 = 65536 * sin(pi/8) * sqrt(2).
