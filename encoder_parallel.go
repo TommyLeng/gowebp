@@ -67,6 +67,7 @@ type mbWorkspace struct {
 	i16RasterCoeffs [16]int16
 	i16RecBlock [16]int16
 	i16Pred4b   [16]int16
+	i16Recon    [256]uint8 // cached i16 reconstruction for recon-buffer copy
 	// local copies of i4 accumulators (used within the i4 block, then assigned to ws fields)
 	localI4AcLevels [16][16]int16
 	localI4DcLevels [16]int16
@@ -522,7 +523,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
 						for y := 0; y < 4; y++ {
 							for x := 0; x < 4; x++ {
-								d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(ws.i16RecBlock[y*4+x])
+								rpx := ws.i16RecBlock[y*4+x]
+								ws.i16Recon[(by*4+y)*16+(bx*4+x)] = uint8(rpx)
+								d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(rpx)
 								i16PostQuantDistortion += d * d
 							}
 						}
@@ -597,21 +600,11 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						}
 					}
 				} else {
-					for by := 0; by < 4; by++ {
-						for bx := 0; bx < 4; bx++ {
-							n := by*4 + bx
-							for y := 0; y < 4; y++ {
-								for x := 0; x < 4; x++ {
-									ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
-								}
-							}
-							dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
-							iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
-							for y := 0; y < 4; y++ {
-								for x := 0; x < 4; x++ {
-									recon[(py+by*4+y)*reconStride+(px+bx*4+x)] = uint8(ws.i16RecBlock[y*4+x])
-								}
-							}
+					// i16: reconstructed pixels were cached in ws.i16Recon during the RD section.
+					// Copy directly without re-running dequantizeBlock + iTransform4x4.
+					for y := 0; y < 16; y++ {
+						for x := 0; x < 16; x++ {
+							recon[(py+y)*reconStride+(px+x)] = ws.i16Recon[y*16+x]
 						}
 					}
 				}
