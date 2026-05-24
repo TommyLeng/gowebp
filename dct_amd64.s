@@ -7,8 +7,9 @@
 // func fTransform(src []int16, ref []int16, out []int16)
 //
 // Computes the 4×4 forward DCT of (src - ref), storing 16 int16 coefficients
-// into out. Horizontal pass fully vectorised with SSE2 (PMADDWD for the
-// rotation terms); vertical pass uses scalar 32-bit integer math.
+// into out. Both passes fully vectorised with SSE2: horizontal pass uses
+// PMADDWD for rotation terms; vertical pass processes all 4 columns in
+// parallel using PMADDWD with int16 narrowing (no PMULLD required).
 //
 // Stack convention (FP-based, NOSPLIT with $64 locals):
 //   src_base+0(FP), ref_base+24(FP), out_base+48(FP)
@@ -18,8 +19,8 @@
 //   R15 = m's processor (p)    — avoid as scratch
 //   Safe GPRs: AX, BX, CX, DX, SI, DI, R8, R9, R10, R11, R12, R13
 //
-// The horizontal pass is done entirely in XMM registers (X0..X11), so R14 is
-// untouched. The scalar vertical pass uses only AX, BX, CX, DX, SI, R8..R13.
+// Both passes use only XMM registers (X0..X15); no GPR scratch is needed
+// for the vertical pass. R14 (goroutine pointer) is never touched.
 //
 // Horizontal pass algorithm (all 4 rows processed in parallel):
 //   1. Load src/ref as 2×128-bit (each holds 2 rows of 4 int16) and PSUBW.
@@ -86,6 +87,25 @@ DATA  ·bias937<>+0x04(SB)/4, $937
 DATA  ·bias937<>+0x08(SB)/4, $937
 DATA  ·bias937<>+0x0c(SB)/4, $937
 GLOBL ·bias937<>(SB), (NOPTR+RODATA), $16
+
+// Vertical-pass bias constants (int32×4 broadcast).
+DATA  ·vbias7<>+0x00(SB)/4, $7
+DATA  ·vbias7<>+0x04(SB)/4, $7
+DATA  ·vbias7<>+0x08(SB)/4, $7
+DATA  ·vbias7<>+0x0c(SB)/4, $7
+GLOBL ·vbias7<>(SB), (NOPTR+RODATA), $16
+
+DATA  ·vbias12000<>+0x00(SB)/4, $12000
+DATA  ·vbias12000<>+0x04(SB)/4, $12000
+DATA  ·vbias12000<>+0x08(SB)/4, $12000
+DATA  ·vbias12000<>+0x0c(SB)/4, $12000
+GLOBL ·vbias12000<>(SB), (NOPTR+RODATA), $16
+
+DATA  ·vbias51000<>+0x00(SB)/4, $51000
+DATA  ·vbias51000<>+0x04(SB)/4, $51000
+DATA  ·vbias51000<>+0x08(SB)/4, $51000
+DATA  ·vbias51000<>+0x0c(SB)/4, $51000
+GLOBL ·vbias51000<>(SB), (NOPTR+RODATA), $16
 
 TEXT ·fTransform(SB),NOSPLIT,$64-72
 	// ── LOAD POINTERS ───────────────────────────────────────────────────────
@@ -160,87 +180,162 @@ TEXT ·fTransform(SB),NOSPLIT,$64-72
 	PSRAL   $9, X3                  // >> 9
 	MOVOU   X3, 48(SP)              // store t3_vec at SP[48..63]
 
-	// ── VERTICAL PASS (scalar 32-bit) ───────────────────────────────────────
-	// Reads tmp on stack column-by-column: for column i (0..3), the 4 values
-	//   val0..val3 live at SP[i*16 + {0,4,8,12}].
+	// ── VERTICAL PASS (SSE2, fully vectorised) ──────────────────────────────
+	// Lane layout: lane i holds column i (i=0..3) for all 4 output rows.
 	//
-	// out[ 0+i] = int16((a0+a1+7) >> 4)
-	// out[ 4+i] = int16(((a2*2217 + a3*5352 + 12000) >> 16) + (a3!=0 ? 1 : 0))
-	// out[ 8+i] = int16((a0-a1+7) >> 4)
-	// out[12+i] = int16((a3*2217 - a2*5352 + 51000) >> 16)
+	// Stack layout (from horizontal pass):
+	//   SP[ 0..15] = t0_vec = [t0_r0, t0_r1, t0_r2, t0_r3]  (int32×4)
+	//   SP[16..31] = t1_vec = [t1_r0, t1_r1, t1_r2, t1_r3]
+	//   SP[32..47] = t2_vec = [t2_r0, t2_r1, t2_r2, t2_r3]
+	//   SP[48..63] = t3_vec = [t3_r0, t3_r1, t3_r2, t3_r3]
 	//
-	// Registers: SI=out (preserved), CX=i (loop counter).
-	//            Scratch: AX, BX, DX, DI, R8..R13.
-	//            R14, R15 are NEVER touched.
+	// Vertical algorithm (vectorised over all 4 columns simultaneously):
+	//   a0 = t0 + t3,  a1 = t1 + t2,  a2 = t1 - t2,  a3 = t0 - t3
+	//   out[ 0..3]  = (a0+a1+7) >> 4             [int32 → int16]
+	//   out[ 4..7]  = ((a2*2217+a3*5352+12000)>>16) + (a3!=0)
+	//   out[ 8..11] = (a0-a1+7) >> 4
+	//   out[12..15] = (a3*2217-a2*5352+51000) >> 16
+	//
+	// For the rotation terms, a2 and a3 are bounded by the horizontal >>9
+	// shift and fit in int16.  We narrow them via PACKSSLW, interleave with
+	// PUNPCKLWL, then run PMADDWL exactly as the horizontal pass does.
+	//
+	// Plan9 mnemonic notes (same as horizontal pass):
+	//   PADDL=PADDD, PSUBL=PSUBD, PSRAL=PSRAD, PSRLL=PSRLD
+	//   PCMPEQL=PCMPEQD, PUNPCKLWL=PUNPCKLWD, PMADDWL=PMADDWD
+	//   PACKSSLW=PACKSSDW (pack int32→int16), PANDN=PANDN
+	//
+	// PACKSSLW Plan9: "PACKSSLW src, dst" → Intel PACKSSDW(dst,src)
+	//   → dst = [sat16(dst[0..3]) | sat16(src[0..3])]
+	//   So "PACKSSLW X14(zero), Xr" → Xr = [sat16(Xr[0..3]) | zeros]
+	//   → int16×4 values in the low 64 bits of Xr.
+	//
+	// PUNPCKLWL Plan9: "PUNPCKLWL src, dst" → Intel PUNPCKLWD(dst,src)
+	//   → dst = [dst[0],src[0], dst[1],src[1], dst[2],src[2], dst[3],src[3]]
+	//
+	// Register map:
+	//   X0 = t0_vec, X1 = t1_vec, X2 = t2_vec, X3 = t3_vec  (int32×4)
+	//   X4 = a0,  X5 = a1,  X6 = a2,  X7 = a3              (int32×4)
+	//   X8 = out[0..3]  intermediate, then reused as a2_int16_packed
+	//   X9 = out[8..11] intermediate, then reused as a3_int16_packed
+	//   X10 = PMADDWL result for out[4..7]
+	//   X11 = PMADDWL result for out[12..15]
+	//   X12 = a3 saved copy for branchless correction
+	//   X13 = bias constants (reused for each step)
+	//   X14 = zero register (PXOR once, stays zero throughout)
+	//   X15 = scratch for narrowing/MOVQ stores
 
-	// Set up base of tmp on stack into DI so we can use indexed addressing
-	// without relying on `(SP)(index*N)` syntax.
-	LEAQ    0(SP), DI               // DI = &tmp[0]
+	// ── Step 1: Load t0..t3 from stack ──────────────────────────────────────
+	MOVOU    0(SP), X0              // X0 = t0_vec (int32×4)
+	MOVOU   16(SP), X1              // X1 = t1_vec
+	MOVOU   32(SP), X2              // X2 = t2_vec
+	MOVOU   48(SP), X3              // X3 = t3_vec
 
-	XORQ    CX, CX                  // CX = i = 0
-vloop:
-	// Compute byte offset i*16 into the tmp buffer.
-	MOVQ    CX, BX
-	SHLQ    $4, BX                  // BX = i*16
+	// ── Step 2: Butterfly ───────────────────────────────────────────────────
+	MOVO    X0, X4
+	PADDL   X3, X4                  // X4 = a0 = t0 + t3
+	MOVO    X1, X5
+	PADDL   X2, X5                  // X5 = a1 = t1 + t2
+	MOVO    X1, X6
+	PSUBL   X2, X6                  // X6 = a2 = t1 - t2
+	MOVO    X0, X7
+	PSUBL   X3, X7                  // X7 = a3 = t0 - t3
 
-	// Load 4 int32 values: val0,val1,val2,val3 = tmp[i*4 + 0..3].
-	MOVL    (DI)(BX*1), R8          // R8  = val0  (h_t0_r? — actually h_ti_r0)
-	MOVL    4(DI)(BX*1), R9         // R9  = val1
-	MOVL    8(DI)(BX*1), R10        // R10 = val2
-	MOVL    12(DI)(BX*1), R11       // R11 = val3
+	// ── Step 3: out[0..3] = (a0+a1+7) >> 4 → X8 ────────────────────────────
+	MOVOU   ·vbias7<>(SB), X13     // X13 = [7, 7, 7, 7] (int32×4)
+	MOVO    X4, X8
+	PADDL   X5, X8                  // a0 + a1
+	PADDL   X13, X8                 // + 7
+	PSRAL   $4, X8                  // >> 4  →  X8 = out[0..3] int32×4
 
-	// a0 = val0 + val3
-	MOVL    R8, BX
-	ADDL    R11, BX                 // BX = a0  (int32)
-	// a1 = val1 + val2
-	MOVL    R9, DX
-	ADDL    R10, DX                 // DX = a1
-	// a2 = val1 - val2   (R9 clobbered to hold a2)
-	SUBL    R10, R9                 // R9 = a2
-	// a3 = val0 - val3   (R8 clobbered to hold a3)
-	SUBL    R11, R8                 // R8 = a3
+	// ── Step 4: out[8..11] = (a0-a1+7) >> 4 → X9 ───────────────────────────
+	MOVO    X4, X9
+	PSUBL   X5, X9                  // a0 - a1
+	PADDL   X13, X9                 // + 7
+	PSRAL   $4, X9                  // >> 4  →  X9 = out[8..11] int32×4
 
-	// out[0+i] = int16((a0 + a1 + 7) >> 4)
-	MOVL    BX, AX
-	ADDL    DX, AX
-	ADDL    $7, AX
-	SARL    $4, AX
-	MOVW    AX, (SI)(CX*2)          // out[0+i] is at SI + i*2
+	// ── Step 5: out[4..7] = ((a2*2217 + a3*5352 + 12000) >> 16) + (a3!=0) ──
+	// Save a3 (int32×4) before we overwrite registers used for int16 packing.
+	MOVO    X7, X12                 // X12 = a3 saved copy
 
-	// out[8+i] = int16((a0 - a1 + 7) >> 4)
-	MOVL    BX, AX
-	SUBL    DX, AX
-	ADDL    $7, AX
-	SARL    $4, AX
-	MOVW    AX, 16(SI)(CX*2)        // out[8+i] is at SI + 8*2 + i*2
+	// Establish zero register (used by PACKSSLW to produce int16 in low 64b).
+	PXOR    X14, X14                // X14 = 0
 
-	// out[4+i] = int16(((a2*2217 + a3*5352 + 12000) >> 16) + (a3!=0?1:0))
-	MOVL    R9, AX
-	IMULL   $2217, AX               // AX = a2 * 2217
-	MOVL    R8, R12
-	IMULL   $5352, R12              // R12 = a3 * 5352
-	ADDL    R12, AX                 // AX = a2*2217 + a3*5352
-	ADDL    $12000, AX
-	SARL    $16, AX                 // AX = >> 16
-	XORL    R12, R12                // extra = 0
-	TESTL   R8, R8                  // a3 != 0?
-	SETNE   R12                     // R12 (low byte) = (a3 != 0) ? 1 : 0
-	MOVBLZX R12, R12                // zero-extend low byte to int32
-	ADDL    R12, AX
-	MOVW    AX, 8(SI)(CX*2)         // out[4+i] is at SI + 4*2 + i*2
+	// Narrow a2 (X6) and a3 (X7) from int32×4 → int16×4 (low 64 bits).
+	// "PACKSSLW X14, X6": Plan9 → Intel PACKSSDW(X6, X14)
+	//   → X6 = [sat16(X6[0..3]) | sat16(X14[0..3])]
+	//   → X6 low 64b = [a2[0],a2[1],a2[2],a2[3]] as int16×4
+	PACKSSLW X14, X6               // X6 = a2_int16×4 in low 64b
+	PACKSSLW X14, X7               // X7 = a3_int16×4 in low 64b
 
-	// out[12+i] = int16((a3*2217 - a2*5352 + 51000) >> 16)
-	MOVL    R8, AX
-	IMULL   $2217, AX               // AX = a3 * 2217
-	MOVL    R9, R12
-	IMULL   $5352, R12              // R12 = a2 * 5352
-	SUBL    R12, AX                 // AX = a3*2217 - a2*5352
-	ADDL    $51000, AX
-	SARL    $16, AX
-	MOVW    AX, 24(SI)(CX*2)        // out[12+i] is at SI + 12*2 + i*2
+	// Interleave: [a2[0],a3[0], a2[1],a3[1], a2[2],a3[2], a2[3],a3[3]]
+	// "PUNPCKLWL X7, X6": Plan9 → Intel PUNPCKLWD(X6, X7)
+	//   → X6 = [X6[0],X7[0], X6[1],X7[1], X6[2],X7[2], X6[3],X7[3]]
+	//   → X6 = [a2[0],a3[0], a2[1],a3[1], ...] ✓
+	PUNPCKLWL X7, X6               // X6 = [a2,a3 interleaved] int16×8
 
-	INCQ    CX
-	CMPQ    CX, $4
-	JL      vloop
+	// PMADDWL with rot_k1 = [2217,5352,...]: result = a2*2217 + a3*5352
+	MOVO    X6, X10
+	PMADDWL ·rot_k1<>(SB), X10    // X10 = int32×4 of (a2*2217 + a3*5352)
+	MOVOU   ·vbias12000<>(SB), X13
+	PADDL   X13, X10               // + 12000
+	PSRAL   $16, X10               // >> 16
+
+	// Branchless (a3 != 0) → +1 correction.
+	// Strategy: X15 = (a3==0) mask via PCMPEQL, then invert via PANDN with all-ones.
+	// "PANDN src, dst": Plan9 → Intel PANDN(dst,src) = ~dst & src.
+	// We want: X15 = ~(a3==0).  Use all-ones constant in X13 as src.
+	MOVO    X12, X15               // X15 = a3 (copy from saved X12)
+	PCMPEQL X14, X15               // X15 = 0xFFFFFFFF where a3[i]==0, 0 elsewhere
+	MOVO    X14, X13
+	PCMPEQL X13, X13               // X13 = 0xFFFFFFFF all lanes (all-ones)
+	PANDN   X13, X15               // X15 = ~X15 & X13 = ~(a3==0) = (a3!=0) mask
+	PSRLL   $31, X15               // X15 = 1 where a3!=0, 0 where a3==0
+	PADDL   X15, X10               // X10 = out[4..7] int32×4
+
+	// ── Step 6: out[12..15] = (a3*2217 - a2*5352 + 51000) >> 16 ────────────
+	// Need interleaved [a3[0],a2[0], a3[1],a2[1], ...] for rot_k3=[2217,-5352,...].
+	// Repack a3 (from X12) and a2: but X6 is already clobbered by PUNPCKLWL.
+	// We need fresh int16 packs.  Re-derive from original int32 vectors.
+	// But X6 and X7 are clobbered.  We saved a3 in X12 (int32×4); re-pack it.
+	// For a2, we need to re-derive: a2 = t1 - t2 = X1 - X2 (still in X1, X2? No:
+	//   X1 and X2 were consumed by the butterfly and may be clobbered via PSUBL).
+	// Actually: PSUBL X2, X6 was "X6 = X1 - X2" where X1 was in X6 copy.
+	// X1 and X2 are still intact (we only wrote to X4,X5,X6,X7 in the butterfly).
+	// So a2 = X6_original, but X6 was overwritten by PACKSSLW + PUNPCKLWL.
+	// Re-compute a2 from X1 and X2 which are still intact:
+	MOVO    X1, X6                 // X6 = t1_vec (reloaded from still-intact X1)
+	PSUBL   X2, X6                 // X6 = a2 (re-computed; X1, X2 unchanged)
+
+	// Now pack a3 (X12 = int32×4) and fresh a2 (X6 = int32×4) → int16.
+	MOVO    X12, X11               // X11 = a3 (int32×4)
+	PACKSSLW X14, X11              // X11 = a3_int16×4 in low 64b
+	PACKSSLW X14, X6               // X6  = a2_int16×4 in low 64b
+
+	// Interleave: [a3[0],a2[0], a3[1],a2[1], ...]
+	// "PUNPCKLWL X6, X11": Plan9 → Intel PUNPCKLWD(X11,X6)
+	//   → X11 = [X11[0],X6[0], X11[1],X6[1], ...] = [a3[0],a2[0], ...] ✓
+	PUNPCKLWL X6, X11              // X11 = [a3,a2 interleaved] int16×8
+
+	// PMADDWL with rot_k3 = [2217,-5352,...]: X11 = a3*2217 - a2*5352
+	PMADDWL ·rot_k3<>(SB), X11    // X11 = int32×4 of (a3*2217 - a2*5352)
+	MOVOU   ·vbias51000<>(SB), X13
+	PADDL   X13, X11               // + 51000
+	PSRAL   $16, X11               // X11 = out[12..15] int32×4
+
+	// ── Step 7: Narrow int32→int16 and store ────────────────────────────────
+	// "PACKSSLW X14(zero), Xr": Plan9 → Intel PACKSSDW(Xr, X14)
+	//   → Xr = [sat16(Xr[0..3]) | sat16(X14[0..3])] = [Xr_packed | zeros]
+	//   → low 64 bits of Xr hold the 4 int16 output values.
+	// MOVQ Xr, mem stores the low 64 bits (8 bytes = 4 int16).
+	PACKSSLW X14, X8               // X8  = out[0..3]  int16×4 in low 64b
+	PACKSSLW X14, X10              // X10 = out[4..7]  int16×4 in low 64b
+	PACKSSLW X14, X9               // X9  = out[8..11] int16×4 in low 64b
+	PACKSSLW X14, X11              // X11 = out[12..15] int16×4 in low 64b
+
+	MOVQ    X8,   0(SI)            // out[0..3]
+	MOVQ    X10,  8(SI)            // out[4..7]
+	MOVQ    X9,  16(SI)            // out[8..11]
+	MOVQ    X11, 24(SI)            // out[12..15]
 
 	RET
