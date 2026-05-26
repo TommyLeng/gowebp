@@ -401,7 +401,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							iTransform4x4(ws.dctOut[:], ws.pred4[:], ws.recBlock[:])
 							distortion := ssd4x4(src4[:], ws.recBlock[:])
 							modeBits := i4ModeBitCost(mode, topPred, leftPred)
-							rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs, i4ProbsPtr)
+							rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs)
 							// mode==0 (DC), so no flatness penalty.
 							score := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*(modeBits+int64(rCost))
 							if score < bestBlkScore {
@@ -469,7 +469,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 									}
 								}
 
-								rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs, i4ProbsPtr)
+								rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs)
 								flatBitsR := int64(0)
 								if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
 									flatBitsR = flatnessPenalty

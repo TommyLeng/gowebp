@@ -78,12 +78,13 @@ var vp8LevelCodes = [maxVariableLevel][2]uint16{
 // Indexed [band][ctx][level] where level ranges 0..maxVariableLevel.
 // table.level[band][ctx][v] = variable-cost of emitting level v in context (band, ctx).
 // Total level cost = vp8LevelFixedCosts[level] + table.level[band][ctx][min(level,67)].
-// table.eob[band][ctx] = VP8BitCost(0, probs[band][ctx][0]) — the EOB bit cost at
-// (band, ctx). Precomputed here so the Viterbi terminal-state check avoids cold
-// 4D-array dereferences through the probs pointer on every non-zero level.
+// table.eob[band][ctx]  = VP8BitCost(0, probs[band][ctx][0]) — EOB bit cost (block zero).
+// table.eob1[band][ctx] = VP8BitCost(1, probs[band][ctx][0]) — non-zero block flag cost.
+// Both precomputed to avoid cold 4D probs-array dereferences in hot paths.
 type trellisCostTables struct {
 	level [numBands][numCtx][maxVariableLevel + 1]int16
 	eob   [numBands][numCtx]int32
+	eob1  [numBands][numCtx]int32
 }
 
 // buildTrellisCostTables precomputes all level cost tables from a coefficient
@@ -97,8 +98,9 @@ func buildTrellisCostTables(probs *[numBands][numCtx][numProbas]uint8) trellisCo
 			if ctx > 0 {
 				cost0 = vp8BitCost(1, int(p[0]))
 			}
-			// EOB cost: probability of "no more non-zero coefficients" = probs[band][ctx][0].
+			// EOB costs: probability of "no / at-least-one more non-zero" at (band, ctx).
 			tables.eob[band][ctx] = int32(vp8BitCost(0, int(p[0])))
+			tables.eob1[band][ctx] = int32(vp8BitCost(1, int(p[0])))
 			// Level 0: emit the "non-zero = 0" bit.
 			tables.level[band][ctx][0] = int16(vp8BitCost(0, int(p[1])) + cost0)
 			// Levels 1..maxVariableLevel: non-zero + variable coding.
@@ -129,13 +131,16 @@ func variableLevelCost(level int, p []uint8) int {
 
 // levelCostFromTable returns the total bit-cost of coding level v.
 // Mirrors VP8LevelCost(): vp8LevelFixedCosts[level] + table[min(level,67)]
+//
+// The maxLevel (2047) clamp is kept for safety but is never reached at
+// quality ≥ 10 — practical levels stay well below maxVariableLevel (67).
 func levelCostFromTable(table *[maxVariableLevel + 1]int16, level int) int {
-	if level > maxLevel {
-		level = maxLevel
-	}
 	vl := level
 	if vl > maxVariableLevel {
 		vl = maxVariableLevel
+		if level > maxLevel {
+			level = maxLevel
+		}
 	}
 	return int(vp8LevelFixedCosts[level]) + int(table[vl])
 }

@@ -197,13 +197,11 @@ func vp8BitCost(bit int, prob int) int {
 //   - first: 0 for i4/UV, 1 for i16-AC.
 //   - costs: pointer to the trellisCostTables for this coeffType (already
 //     built from the coefficient probability table; e.g. trellisI4Costs).
-//   - probs: pointer to the raw [numBands][numCtx][numProbas] probability slab
-//     for the same coeffType — needed for the trailing EOB-flag cost only.
+//     costs.eob[band][ctx] holds the EOB bit cost, avoiding a raw probs lookup.
 //
 // Returns cost in millibits×1024 (same units as vp8EntropyCost / VP8FixedCostsI4).
 func coeffBitCost(ctx0 int, coeffs []int16, first int,
-	costs *trellisCostTables,
-	probs *[numBands][numCtx][numProbas]uint8) int {
+	costs *trellisCostTables) int {
 	// Locate the last non-zero coefficient.
 	last := -1
 	for i := 15; i >= first; i-- {
@@ -214,21 +212,30 @@ func coeffBitCost(ctx0 int, coeffs []int16, first int,
 	}
 
 	firstBand := int(vp8EncBands[first])
-	// Probability of the EOB bit at the very first position.
-	p0 := int(probs[firstBand][ctx0][0])
 
 	if last < 0 {
 		// All-zero block: just the cost of emitting the "no non-zero" flag.
-		return vp8BitCost(0, p0)
+		// costs.eob[band][ctx] = VP8BitCost(0, probs[band][ctx][0]).
+		return int(costs.eob[firstBand][ctx0])
 	}
 
 	// Initial cost includes the "non-zero exists" flag, but ONLY when
 	// ctx0 == 0. Mirrors the (ctx0==0) branch in GetResidualCost_C:
 	// for ctx0 > 0, the level-cost table already has VP8BitCost(1, p[0])
 	// baked into its non-zero levels via cost_base.
+	// VP8BitCost(1, p) = vp8EntropyCost[255-p]; we derive it from the eob
+	// cost: eob = vp8EntropyCost[p], so 1-bit cost = vp8EntropyCost[255-p].
+	// Since we don't have a direct "1-bit cost" field, keep vp8BitCost call
+	// here — it is called at most once per coeffBitCost invocation.
 	cost := 0
 	if ctx0 == 0 {
-		cost = vp8BitCost(1, p0)
+		// Reconstruct p0 from the eob cost entry via table reverse-lookup is
+		// complex; just read probs via the level-cost table's cost0 encoding.
+		// In buildTrellisCostTables: for ctx==0, cost0=0 so
+		//   table[band][0][0] = VP8BitCost(0, p[1]) (level-zero cost)
+		// The "non-zero exists" cost VP8BitCost(1, p[0]) is not directly stored.
+		// We keep a small parallel eob1[band][ctx] field for this case.
+		cost = int(costs.eob1[firstBand][ctx0])
 	}
 
 	// Current level-cost table for (band, ctx) of the current position.
@@ -251,8 +258,7 @@ func coeffBitCost(ctx0 int, coeffs []int16, first int,
 		}
 		nextBand := int(vp8EncBands[n+1])
 		t = &costs.level[nextBand][nextCtx]
-		// Sign bit (uniform, cost = 1 bit = 256 in our units) only for non-zero
-		// coeffs.
+		// Sign bit (uniform, cost = 1 bit = 256 in our units) only for non-zero.
 		if v != 0 {
 			cost += 256
 		}
@@ -266,16 +272,13 @@ func coeffBitCost(ctx0 int, coeffs []int16, first int,
 		}
 		cost += levelCostFromTable(t, v)
 		cost += 256 // sign bit
-		// If last < 15, the bitstream emits an EOB flag (more=0) at position
-		// n+1 using probability probs[VP8EncBands[n+1]][ctx][0] where ctx is
-		// the context produced by v: 1 if v==1, else 2.
+		// EOB flag after the last non-zero: costs.eob[nextBand][ctxAfter].
 		if n < 15 {
 			ctxAfter := 2
 			if v == 1 {
 				ctxAfter = 1
 			}
-			eobP := int(probs[int(vp8EncBands[n+1])][ctxAfter][0])
-			cost += vp8BitCost(0, eobP)
+			cost += int(costs.eob[int(vp8EncBands[n+1])][ctxAfter])
 		}
 	}
 	return cost
