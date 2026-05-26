@@ -217,7 +217,6 @@ func trellisQuantize(
 	// Determine the last interesting coefficient position.
 	// Use per-position zthresh: any trailing coeff with |coeff| <= zthresh[j]
 	// will always quantize to zero regardless of trellis, so skip it.
-	// This is tighter than the old q[1]^2/4 fixed threshold.
 	last := first - 1
 	for n := 15; n >= first; n-- {
 		j := int(kZigzag[n])
@@ -234,19 +233,11 @@ func trellisQuantize(
 		last++
 	}
 
-	// Sparse-block fast path: if the scan found no position above the coeff²
-	// threshold (last==0 after the increment, requires first==0 — never fires
-	// for first==1), all 16 coefficients have coeff²≤q[1]²/4.  In this regime
-	// the Viterbi processes at most one position (n=0, DC) with level0=0 and
-	// threshLevel≤1, so any non-zero trellis output would carry large distortion.
-	// Fall through to greedy quantization instead, which is simpler and
-	// produces zero output in virtually all cases at quality≥10.
-	// The trellis in[] invariant (in[kZigzag[n]] = dequantized value) is
-	// maintained by the explicit dequantize loop below.
+	// Sparse-block fast path: no position above zthresh — fall through to greedy
+	// quantization. The trellis in[] invariant is maintained by the explicit
+	// dequantize loop below.
 	if last < 1 {
 		nz := quantizeBlock(in, out, m, first)
-		// Restore in[] to dequantized values to satisfy the caller invariant
-		// (iTransform4x4 uses in[] for reconstruction in the i4 path).
 		for n := 0; n < 16; n++ {
 			j := int(kZigzag[n])
 			in[j] = int16(int32(out[n]) * int32(m.q[j]))
@@ -268,11 +259,6 @@ func trellisQuantize(
 	initTable := &costs.level[firstBand][ctx0]
 	initRate := int64(0)
 	if ctx0 == 0 {
-		// eob[band][ctx] = VP8BitCost(0, p[0]); the non-zero flag is
-		// VP8BitCost(1, p[0]) = vp8EntropyCost[255 - p[0]].
-		// We compute it from the eob cost using the identity:
-		//   VP8BitCost(1, p) = vp8EntropyCost[255-p]
-		// but it's simpler to keep a direct lookup.
 		lastProba := int(probs[firstBand][ctx0][0])
 		initRate = int64(vp8BitCost(1, lastProba)) * int64(lambda)
 	}
@@ -285,8 +271,6 @@ func trellisQuantize(
 	bestPath := [3]int{-1, -1, -1}
 
 	// Precompute quantized level bounds for each coefficient position.
-	// Separating this from the Viterbi DP lets the compiler optimize both phases
-	// independently and avoids redundant field loads inside the inner loop.
 	const neutralBias = uint32(0)
 	biasHalf := uint32(0x80) << (qfix - 8) // BIAS(0x80)
 	var lvl0 [16]int   // floor level (no rounding bias)
