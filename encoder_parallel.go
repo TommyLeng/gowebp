@@ -304,9 +304,67 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				_ = ws.pred16Best
 
 				// -------------------------------------------------------
+				// i16 post-quantization RD (moved before i4 loop so that
+				// i16Score is available for per-sub-block early-out).
+				// Safe: intra16PredictFromRecon reads only the global recon
+				// buffer (neighbor MBs), unaffected by the i4 loop below.
+				// -------------------------------------------------------
+				intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, ry, yuv.mbW, yuv.mbH, ws.mbI16Pred[:])
+				for by := 0; by < 4; by++ {
+					for bx := 0; bx < 4; bx++ {
+						n := by*4 + bx
+						for y := 0; y < 4; y++ {
+							for x := 0; x < 4; x++ {
+								ws.i16Src4[y*4+x] = src16[(by*4+y)*16+(bx*4+x)]
+								ws.i16Pred4[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
+							}
+						}
+						fTransform(ws.i16Src4[:], ws.i16Pred4[:], ws.i16DctOut[:])
+						ws.yDcRaw16[n] = ws.i16DctOut[0]
+						ws.i16DctOut[0] = 0
+						trellisQuantize(ws.i16DctOut[:], ws.mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
+							i16ProbsPtr, 0)
+					}
+				}
+				fTransformWHT(ws.yDcRaw16[:], ws.whtOut16[:])
+				quantizeBlockWHT(ws.whtOut16[:], ws.mbI16DcQuantLevels[:], &qm.y2)
+
+				for n := 0; n < 16; n++ {
+					j := int(kZigzag[n])
+					ws.whtRaster16[j] = int16(int32(ws.mbI16DcQuantLevels[n]) * int32(qm.y2.q[j]))
+				}
+				inverseWHT16(ws.whtRaster16[:], ws.dcBlockCoeffs16[:])
+
+				var i16PostQuantDistortion int64
+				for by := 0; by < 4; by++ {
+					for bx := 0; bx < 4; bx++ {
+						n := by*4 + bx
+						for y := 0; y < 4; y++ {
+							for x := 0; x < 4; x++ {
+								ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
+							}
+						}
+						dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
+						iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
+						for y := 0; y < 4; y++ {
+							for x := 0; x < 4; x++ {
+								d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(ws.i16RecBlock[y*4+x])
+								i16PostQuantDistortion += d * d
+							}
+						}
+					}
+				}
+
+				i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
+				// i4HeaderCost: fixed overhead for signalling i4 mode in partition 0.
+				// Defined here so it is available both in the per-block early-out and
+				// in the final i4-vs-i16 comparison below.
+				i4HeaderCost := int64(mbLambdaMode) * 211
+
+				// -------------------------------------------------------
 				// Try intra4
 				// -------------------------------------------------------
-				var bestI4Score int64
+				var bestI4Score int64 // set inside block below; value valid after i4EarlyOut label
 
 				{
 					var topBlkMode [4]int
@@ -478,6 +536,14 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							ws.localI4DcLevels[blkIdx] = 0
 							i4TotalScore += bestBlkOldScore
 
+							// Per-block early-out: if accumulated i4 cost already exceeds i16,
+							// remaining sub-blocks cannot recover — bail out and use i16.
+							// Port of libwebp's PickBestIntra4 check (quant_enc.c:1121):
+							//   if (rd_best.score >= rd_i16->score) return 0;
+							if i4TotalScore+i4HeaderCost >= i16Score {
+								goto i4EarlyOut
+							}
+
 							bestNZ := 0
 							if findLast(ws.bestBlkAcLevels[:], 0) >= 0 {
 								bestNZ = 1
@@ -496,60 +562,10 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						leftBlkMode[by] = ws.localI4Modes[by*4+3]
 					}
 
+				i4EarlyOut:
 					bestI4Score = i4TotalScore
 				}
 
-				// -------------------------------------------------------
-				// i16 post-quantization RD
-				// -------------------------------------------------------
-				intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, ry, yuv.mbW, yuv.mbH, ws.mbI16Pred[:])
-				for by := 0; by < 4; by++ {
-					for bx := 0; bx < 4; bx++ {
-						n := by*4 + bx
-						for y := 0; y < 4; y++ {
-							for x := 0; x < 4; x++ {
-								ws.i16Src4[y*4+x] = src16[(by*4+y)*16+(bx*4+x)]
-								ws.i16Pred4[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
-							}
-						}
-						fTransform(ws.i16Src4[:], ws.i16Pred4[:], ws.i16DctOut[:])
-						ws.yDcRaw16[n] = ws.i16DctOut[0]
-						ws.i16DctOut[0] = 0
-						trellisQuantize(ws.i16DctOut[:], ws.mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
-							i16ProbsPtr, 0)
-					}
-				}
-				fTransformWHT(ws.yDcRaw16[:], ws.whtOut16[:])
-				quantizeBlockWHT(ws.whtOut16[:], ws.mbI16DcQuantLevels[:], &qm.y2)
-
-				for n := 0; n < 16; n++ {
-					j := int(kZigzag[n])
-					ws.whtRaster16[j] = int16(int32(ws.mbI16DcQuantLevels[n]) * int32(qm.y2.q[j]))
-				}
-				inverseWHT16(ws.whtRaster16[:], ws.dcBlockCoeffs16[:])
-
-				var i16PostQuantDistortion int64
-				for by := 0; by < 4; by++ {
-					for bx := 0; bx < 4; bx++ {
-						n := by*4 + bx
-						for y := 0; y < 4; y++ {
-							for x := 0; x < 4; x++ {
-								ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
-							}
-						}
-						dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
-						iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
-						for y := 0; y < 4; y++ {
-							for x := 0; x < 4; x++ {
-								d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(ws.i16RecBlock[y*4+x])
-								i16PostQuantDistortion += d * d
-							}
-						}
-					}
-				}
-
-				i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
-				i4HeaderCost := int64(mbLambdaMode) * 211
 				i4Score := bestI4Score + i4HeaderCost
 
 				info := &mbInfos[mbIdx]

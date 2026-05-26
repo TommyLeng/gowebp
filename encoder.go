@@ -237,12 +237,77 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 			_ = ws.pred16Best
 
 			// -------------------------------------------------------
+			// Compute i16 post-quantization distortion (moved before i4 loop
+			// so that i16Score is available for per-sub-block early-out).
+			// Safe: intra16PredictFromRecon reads only the global recon buffer
+			// (neighbor MBs), which is not written until after i4 is complete.
+			// -------------------------------------------------------
+			intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, mbY, yuv.mbW, yuv.mbH, ws.mbI16Pred[:])
+			for by := 0; by < 4; by++ {
+				for bx := 0; bx < 4; bx++ {
+					n := by*4 + bx
+					for y := 0; y < 4; y++ {
+						for x := 0; x < 4; x++ {
+							ws.i16Src4[y*4+x] = src16[(by*4+y)*16+(bx*4+x)]
+							ws.i16Pred4[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
+						}
+					}
+					fTransform(ws.i16Src4[:], ws.i16Pred4[:], ws.i16DctOut[:])
+					ws.yDcRaw16[n] = ws.i16DctOut[0]
+					ws.i16DctOut[0] = 0
+					trellisQuantize(ws.i16DctOut[:], ws.mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
+						i16ProbsPtr, 0)
+				}
+			}
+			fTransformWHT(ws.yDcRaw16[:], ws.whtOut16[:])
+			quantizeBlockWHT(ws.whtOut16[:], ws.mbI16DcQuantLevels[:], &qm.y2)
+
+			// Dequantize WHT → iWHT → per-block DC coeffs
+			for n := 0; n < 16; n++ {
+				j := int(kZigzag[n])
+				ws.whtRaster16[j] = int16(int32(ws.mbI16DcQuantLevels[n]) * int32(qm.y2.q[j]))
+			}
+			inverseWHT16(ws.whtRaster16[:], ws.dcBlockCoeffs16[:])
+
+			// Reconstruct i16 and measure post-quantization distortion
+			var i16PostQuantDistortion int64
+			for by := 0; by < 4; by++ {
+				for bx := 0; bx < 4; bx++ {
+					n := by*4 + bx
+					for y := 0; y < 4; y++ {
+						for x := 0; x < 4; x++ {
+							ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
+						}
+					}
+					dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
+					iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
+					for y := 0; y < 4; y++ {
+						for x := 0; x < 4; x++ {
+							d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(ws.i16RecBlock[y*4+x])
+							i16PostQuantDistortion += d * d
+						}
+					}
+				}
+			}
+
+			// MB-level RD decision: compare i4 vs i16.
+			// i16Score uses lambdaI16 (large) which inflates the bit-cost term,
+			// biasing the comparison toward i4. This matches libwebp's intent:
+			// at high quality, i4 wins whenever its distortion is comparable to
+			// i16, resulting in better compression for natural images.
+			i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
+			// i4HeaderCost: fixed overhead for signalling i4 mode in partition 0.
+			// Defined here so it is available both in the per-block early-out and
+			// in the final i4-vs-i16 comparison below.
+			i4HeaderCost := int64(mbLambdaMode) * 211
+
+			// -------------------------------------------------------
 			// Try intra4: for each of 16 4x4 blocks pick best mode
 			// -------------------------------------------------------
 			// We process blocks in raster order and update mbRecon with the
 			// actual reconstructed pixels (pred + dequantized residual)
 			// so subsequent blocks get correct intra4 prediction contexts.
-			var bestI4Score int64
+			var bestI4Score int64 // set inside block below; value valid after i4EarlyOut label
 
 			{
 				// Track per-block top/left mode context
@@ -425,6 +490,14 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						ws.localI4DcLevels[blkIdx] = 0 // i4 has no WHT DC
 						i4TotalScore += bestBlkOldScore
 
+						// Per-block early-out: if accumulated i4 cost already exceeds i16,
+						// remaining sub-blocks cannot recover — bail out and use i16.
+						// Port of libwebp's PickBestIntra4 check (quant_enc.c:1121):
+						//   if (rd_best.score >= rd_i16->score) return 0;
+						if i4TotalScore+i4HeaderCost >= i16Score {
+							goto i4EarlyOut
+						}
+
 						// Update NZ context for subsequent blocks' trellis decisions.
 						bestNZ := 0
 						if findLast(ws.bestBlkAcLevels[:], 0) >= 0 {
@@ -447,69 +520,11 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					leftBlkMode[by] = ws.localI4Modes[by*4+3]
 				}
 
+			i4EarlyOut:
 				bestI4Score = i4TotalScore
 			}
 
-			// -------------------------------------------------------
-			// Compute i16 post-quantization distortion.
-			// -------------------------------------------------------
-			intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, mbY, yuv.mbW, yuv.mbH, ws.mbI16Pred[:])
-			for by := 0; by < 4; by++ {
-				for bx := 0; bx < 4; bx++ {
-					n := by*4 + bx
-					for y := 0; y < 4; y++ {
-						for x := 0; x < 4; x++ {
-							ws.i16Src4[y*4+x] = src16[(by*4+y)*16+(bx*4+x)]
-							ws.i16Pred4[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
-						}
-					}
-					fTransform(ws.i16Src4[:], ws.i16Pred4[:], ws.i16DctOut[:])
-					ws.yDcRaw16[n] = ws.i16DctOut[0]
-					ws.i16DctOut[0] = 0
-					trellisQuantize(ws.i16DctOut[:], ws.mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
-						i16ProbsPtr, 0)
-				}
-			}
-			fTransformWHT(ws.yDcRaw16[:], ws.whtOut16[:])
-			quantizeBlockWHT(ws.whtOut16[:], ws.mbI16DcQuantLevels[:], &qm.y2)
-
-			// Dequantize WHT → iWHT → per-block DC coeffs
-			for n := 0; n < 16; n++ {
-				j := int(kZigzag[n])
-				ws.whtRaster16[j] = int16(int32(ws.mbI16DcQuantLevels[n]) * int32(qm.y2.q[j]))
-			}
-			inverseWHT16(ws.whtRaster16[:], ws.dcBlockCoeffs16[:])
-
-			// Reconstruct i16 and measure post-quantization distortion
-			var i16PostQuantDistortion int64
-			for by := 0; by < 4; by++ {
-				for bx := 0; bx < 4; bx++ {
-					n := by*4 + bx
-					for y := 0; y < 4; y++ {
-						for x := 0; x < 4; x++ {
-							ws.i16Pred4b[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
-						}
-					}
-					dequantizeBlock(ws.mbI16AcLevels[n][:], ws.i16RasterCoeffs[:], &qm.y1, ws.dcBlockCoeffs16[n])
-					iTransform4x4(ws.i16RasterCoeffs[:], ws.i16Pred4b[:], ws.i16RecBlock[:])
-					for y := 0; y < 4; y++ {
-						for x := 0; x < 4; x++ {
-							d := int64(src16[(by*4+y)*16+(bx*4+x)]) - int64(ws.i16RecBlock[y*4+x])
-							i16PostQuantDistortion += d * d
-						}
-					}
-				}
-			}
-
-			// MB-level RD decision: compare i4 vs i16.
-			// i16Score uses lambdaI16 (large) which inflates the bit-cost term,
-			// biasing the comparison toward i4. This matches libwebp's intent:
-			// at high quality, i4 wins whenever its distortion is comparable to
-			// i16, resulting in better compression for natural images.
-			i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
-			i4HeaderCost := int64(mbLambdaMode) * 211
 			i4Score := bestI4Score + i4HeaderCost
-
 			info := &mbInfos[mbIdx]
 			if i4Score < i16Score {
 				info.isI4 = true
