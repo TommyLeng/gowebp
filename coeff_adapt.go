@@ -249,12 +249,10 @@ func coeffBitCost(ctx0 int, coeffs []int16, first int,
 			v = -v
 		}
 		cost += levelCostFromTable(t, v)
-		// Next context: 0 if v==0, 1 if v==1, 2 if v>=2.
-		nextCtx := 0
-		if v >= 2 {
+		// Next context: min(v, 2). One branch instead of two.
+		nextCtx := v
+		if nextCtx > 2 {
 			nextCtx = 2
-		} else if v == 1 {
-			nextCtx = 1
 		}
 		nextBand := int(vp8EncBands[n+1])
 		t = &costs.level[nextBand][nextCtx]
