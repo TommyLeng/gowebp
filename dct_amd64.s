@@ -529,3 +529,341 @@ TEXT ·fTransformWHT(SB),NOSPLIT,$0-48
 	MOVOU   X12, 16(DI)              // out[8..15]
 
 	RET
+
+// func fTransform2Plane(srcPlane []byte, srcStride, srcX, srcY int,
+//                       pred []int16, predStride int, out []int16)
+//
+// Computes the 4×4 forward DCT for two horizontally-adjacent 4×4 blocks.
+// Reads 8 uint8 per row from srcPlane[srcY..srcY+3][srcX..srcX+7], subtracts
+// 8 int16 pred per row, then runs the VP8 forward DCT on each 4-wide half.
+//
+// SSE2 strategy:
+//   1. Load 8 uint8 per row (MOVQ + PUNPCKLBW zero-extend → int16×8)
+//   2. Load 8 int16 pred per row (MOVOU) and subtract (PSUBW)
+//   3. Process left half (X[0..3] = cols 0-3 = block0) and right half
+//      (X[4..7] = cols 4-7 = block1) through the existing SSE2 horizontal
+//      pass (FTransformPass1 pattern using PUNPCKLWL + butterfly).
+//   4. Store block0 tmp to SP[0..63], block1 tmp to SP[64..127].
+//   5. Run the vertical pass twice (for each block's tmp on stack).
+//
+// Arg layout (FP-based, $192 locals = 128 bytes tmp + 64 bytes alignment):
+//   srcPlane_base +0(FP)   srcStride +24(FP)   srcX +32(FP)   srcY +40(FP)
+//   pred_base +48(FP)      predStride +72(FP)   out_base +80(FP)
+//
+// Stack layout (aligned 16-byte blocks):
+//   SP[  0.. 63] = block0 tmp (t0,t1,t2,t3 as int32×4 each = 16 bytes each)
+//   SP[ 64..127] = block1 tmp
+//   SP[128..191] = scratch (for saving registers if needed)
+//
+// Register map:
+//   AX = src row pointer    CX = pred row pointer
+//   DX = srcStride          SI = out.ptr (callee-save via R13-style)
+//   DI = predStride bytes   R8 = scratch
+//   X0-X7  = per-row data (after load, zero-extend, subtract)
+//   X8-X15 = butterfly / tmp computations
+//
+// Note: we process 4 rows for each block's horizontal pass using the same
+// structure as FTransform_SSE2, but sourcing uint8 instead of int16.
+
+TEXT ·fTransform2Plane(SB),NOSPLIT,$192-104
+	MOVQ    srcPlane_base+0(FP), AX
+	MOVQ    srcStride+24(FP), DX
+	MOVQ    srcX+32(FP), R8
+	MOVQ    srcY+40(FP), R9
+	MOVQ    pred_base+48(FP), CX
+	MOVQ    predStride+72(FP), DI   // DI = predStride (int16 count)
+	MOVQ    out_base+80(FP), SI
+
+	// Compute AX = srcPlane + srcY*srcStride + srcX
+	IMULQ   DX, R9
+	ADDQ    R9, AX
+	ADDQ    R8, AX              // AX = &srcPlane[srcY][srcX]
+
+	// predStride in bytes
+	SHLQ    $1, DI              // DI = predStride * 2 bytes
+
+	PXOR    X15, X15            // X15 = zero (for zero-extension)
+
+	// ── LOAD 4 ROWS, ZERO-EXTEND, SUBTRACT PRED ─────────────────────────────
+	// Row 0
+	MOVQ    (AX), X0            // 8 uint8 bytes from row 0
+	PUNPCKLBW X15, X0           // zero-extend: X0 = row0 as int16×8
+	MOVOU   (CX), X1            // pred row 0 (8 int16)
+	PSUBW   X1, X0              // X0 = diff row 0
+
+	ADDQ    DX, AX
+	ADDQ    DI, CX
+
+	// Row 1
+	MOVQ    (AX), X1
+	PUNPCKLBW X15, X1           // X1 = diff row 1 (uint8 expanded to int16)
+	MOVOU   (CX), X2
+	PSUBW   X2, X1              // X1 = diff row 1
+
+	ADDQ    DX, AX
+	ADDQ    DI, CX
+
+	// Row 2
+	MOVQ    (AX), X2
+	PUNPCKLBW X15, X2
+	MOVOU   (CX), X3
+	PSUBW   X3, X2              // X2 = diff row 2
+
+	ADDQ    DX, AX
+	ADDQ    DI, CX
+
+	// Row 3
+	MOVQ    (AX), X3
+	PUNPCKLBW X15, X3
+	MOVOU   (CX), X4
+	PSUBW   X4, X3              // X3 = diff row 3
+
+	// Now X0=row0, X1=row1, X2=row2, X3=row3, each int16×8 (cols 0..7)
+	// Split: lo 64 bits = cols 0-3 (block0), hi 64 bits = cols 4-7 (block1)
+
+	// ── BLOCK0 HORIZONTAL PASS (cols 0-3, same as FTransform_SSE2) ──────────
+	// Transpose via PUNPCKLWL (interleave rows 0,2 and rows 1,3)
+	MOVO    X0, X4
+	PUNPCKLWL X2, X4            // X4 = [r0c0,r2c0,r0c1,r2c1,r0c2,r2c2,r0c3,r2c3]
+	MOVO    X1, X5
+	PUNPCKLWL X3, X5            // X5 = [r1c0,r3c0,r1c1,r3c1,r1c2,r3c2,r1c3,r3c3]
+	MOVO    X4, X6
+	PUNPCKLWL X5, X6            // X6 = [d0_col | d1_col] (col0 in lo64, col1 in hi64)
+	PUNPCKHWL X5, X4            // X4 = [d2_col | d3_col]
+
+	// Butterfly: a0=d0+d3, a1=d1+d2, a3=d0-d3, a2=d1-d2
+	PSHUFD  $0x4E, X4, X7       // X7 = [d3 | d2]
+	MOVO    X6, X8
+	PADDW   X7, X8              // X8 = [a0 | a1]
+	MOVO    X6, X9
+	PSUBW   X7, X9              // X9 = [a3 | a2]
+
+	// DC terms: (a0+a1)*8 and (a0-a1)*8
+	PSHUFD  $0x4E, X8, X10      // X10 = [a1 | a0]
+	MOVO    X8, X11
+	PADDW   X10, X11            // X11 lo = a0+a1
+	PSLLW   $3, X11
+	MOVO    X11, X12
+	PUNPCKLWL X12, X12
+	PSRAL   $16, X12            // X12 = t0_b0 int32×4
+	MOVOU   X12, 0(SP)          // store block0 t0
+
+	MOVO    X8, X11
+	PSUBW   X10, X11            // X11 lo = a0-a1
+	PSLLW   $3, X11
+	MOVO    X11, X12
+	PUNPCKLWL X12, X12
+	PSRAL   $16, X12            // X12 = t2_b0 int32×4
+	MOVOU   X12, 32(SP)         // store block0 t2
+
+	// Rotation terms for block0
+	PSHUFD  $0x4E, X9, X7       // X7 = [a2 | a3]
+	MOVO    X7, X10
+	PUNPCKLWL X9, X10           // X10 = [a2,a3 interleaved] for rot_k1
+	MOVO    X10, X12
+	PMADDWL ·rot_k1<>(SB), X12  // X12 = a2*2217 + a3*5352
+	PADDL   ·bias1812<>(SB), X12
+	PSRAL   $9, X12             // X12 = t1_b0 int32×4
+	MOVOU   X12, 16(SP)         // store block0 t1
+
+	PUNPCKLWL X7, X9            // X9 = [a3,a2 interleaved] for rot_k3
+	PMADDWL ·rot_k3<>(SB), X9
+	PADDL   ·bias937<>(SB), X9
+	PSRAL   $9, X9              // X9 = t3_b0 int32×4
+	MOVOU   X9, 48(SP)          // store block0 t3
+
+	// ── BLOCK1 HORIZONTAL PASS (cols 4-7) ────────────────────────────────────
+	// Use PUNPCKHWL to extract cols 4-7 from each row
+	MOVO    X0, X4
+	PUNPCKHWL X2, X4            // X4 = [r0c4,r2c4,r0c5,r2c5,r0c6,r2c6,r0c7,r2c7]
+	MOVO    X1, X5
+	PUNPCKHWL X3, X5            // X5 = [r1c4,r3c4,r1c5,r3c5,...]
+	MOVO    X4, X6
+	PUNPCKLWL X5, X6            // X6 = [d0' | d1'] block1 cols
+	PUNPCKHWL X5, X4            // X4 = [d2' | d3'] block1 cols
+
+	// Butterfly
+	PSHUFD  $0x4E, X4, X7       // X7 = [d3' | d2']
+	MOVO    X6, X8
+	PADDW   X7, X8              // X8 = [a0' | a1']
+	MOVO    X6, X9
+	PSUBW   X7, X9              // X9 = [a3' | a2']
+
+	// DC terms block1
+	PSHUFD  $0x4E, X8, X10
+	MOVO    X8, X11
+	PADDW   X10, X11
+	PSLLW   $3, X11
+	MOVO    X11, X12
+	PUNPCKLWL X12, X12
+	PSRAL   $16, X12
+	MOVOU   X12, 64(SP)         // block1 t0
+
+	MOVO    X8, X11
+	PSUBW   X10, X11
+	PSLLW   $3, X11
+	MOVO    X11, X12
+	PUNPCKLWL X12, X12
+	PSRAL   $16, X12
+	MOVOU   X12, 96(SP)         // block1 t2
+
+	// Rotation terms block1
+	PSHUFD  $0x4E, X9, X7
+	MOVO    X7, X10
+	PUNPCKLWL X9, X10
+	MOVO    X10, X12
+	PMADDWL ·rot_k1<>(SB), X12
+	PADDL   ·bias1812<>(SB), X12
+	PSRAL   $9, X12
+	MOVOU   X12, 80(SP)         // block1 t1
+
+	PUNPCKLWL X7, X9
+	PMADDWL ·rot_k3<>(SB), X9
+	PADDL   ·bias937<>(SB), X9
+	PSRAL   $9, X9
+	MOVOU   X9, 112(SP)         // block1 t3
+
+	// ── VERTICAL PASS: BLOCK 0 (SP[0..63] → out[0..15]) ─────────────────────
+	MOVOU    0(SP), X0           // t0_b0
+	MOVOU   16(SP), X1           // t1_b0
+	MOVOU   32(SP), X2           // t2_b0
+	MOVOU   48(SP), X3           // t3_b0
+
+	// Butterfly
+	MOVO    X0, X4
+	PADDL   X3, X4              // a0 = t0 + t3
+	MOVO    X1, X5
+	PADDL   X2, X5              // a1 = t1 + t2
+	MOVO    X1, X6
+	PSUBL   X2, X6              // a2 = t1 - t2
+	MOVO    X0, X7
+	PSUBL   X3, X7              // a3 = t0 - t3
+
+	// out[0..3] = (a0+a1+7) >> 4
+	MOVOU   ·vbias7<>(SB), X13
+	MOVO    X4, X8
+	PADDL   X5, X8
+	PADDL   X13, X8
+	PSRAL   $4, X8
+
+	// out[8..11] = (a0-a1+7) >> 4
+	MOVO    X4, X9
+	PSUBL   X5, X9
+	PADDL   X13, X9
+	PSRAL   $4, X9
+
+	// out[4..7] = ((a2*2217 + a3*5352 + 12000) >> 16) + (a3 != 0)
+	MOVO    X7, X12             // save a3
+	PXOR    X14, X14
+	PACKSSLW X14, X6            // a2 int16 in lo64
+	PACKSSLW X14, X7            // a3 int16 in lo64
+	PUNPCKLWL X7, X6            // [a2,a3 interleaved]
+	MOVO    X6, X10
+	PMADDWL ·rot_k1<>(SB), X10
+	MOVOU   ·vbias12000<>(SB), X13
+	PADDL   X13, X10
+	PSRAL   $16, X10
+	// branchless a3!=0 correction
+	MOVO    X12, X15
+	PCMPEQL X14, X15
+	MOVO    X14, X13
+	PCMPEQL X13, X13
+	PANDN   X13, X15
+	PSRLL   $31, X15
+	PADDL   X15, X10
+
+	// out[12..15] = (a3*2217 - a2*5352 + 51000) >> 16
+	MOVO    X1, X6              // reload t1 = a2's original source? No, recompute a2
+	PSUBL   X2, X6              // a2 = t1 - t2 (X1 and X2 still intact)
+	MOVO    X12, X11            // a3 (saved)
+	PACKSSLW X14, X11
+	PACKSSLW X14, X6
+	PUNPCKLWL X6, X11           // [a3,a2 interleaved]
+	PMADDWL ·rot_k3<>(SB), X11
+	MOVOU   ·vbias51000<>(SB), X13
+	PADDL   X13, X11
+	PSRAL   $16, X11
+
+	// Narrow and store out[0..15]
+	PXOR    X14, X14
+	PACKSSLW X14, X8
+	PACKSSLW X14, X10
+	PACKSSLW X14, X9
+	PACKSSLW X14, X11
+	MOVQ    X8,   0(SI)
+	MOVQ    X10,  8(SI)
+	MOVQ    X9,  16(SI)
+	MOVQ    X11, 24(SI)
+
+	// ── VERTICAL PASS: BLOCK 1 (SP[64..127] → out[16..31]) ──────────────────
+	MOVOU   64(SP), X0
+	MOVOU   80(SP), X1
+	MOVOU   96(SP), X2
+	MOVOU  112(SP), X3
+
+	// Butterfly
+	MOVO    X0, X4
+	PADDL   X3, X4
+	MOVO    X1, X5
+	PADDL   X2, X5
+	MOVO    X1, X6
+	PSUBL   X2, X6
+	MOVO    X0, X7
+	PSUBL   X3, X7
+
+	// out[0..3] = (a0+a1+7) >> 4
+	MOVOU   ·vbias7<>(SB), X13
+	MOVO    X4, X8
+	PADDL   X5, X8
+	PADDL   X13, X8
+	PSRAL   $4, X8
+
+	// out[8..11]
+	MOVO    X4, X9
+	PSUBL   X5, X9
+	PADDL   X13, X9
+	PSRAL   $4, X9
+
+	// out[4..7]
+	MOVO    X7, X12
+	PXOR    X14, X14
+	PACKSSLW X14, X6
+	PACKSSLW X14, X7
+	PUNPCKLWL X7, X6
+	MOVO    X6, X10
+	PMADDWL ·rot_k1<>(SB), X10
+	MOVOU   ·vbias12000<>(SB), X13
+	PADDL   X13, X10
+	PSRAL   $16, X10
+	MOVO    X12, X15
+	PCMPEQL X14, X15
+	MOVO    X14, X13
+	PCMPEQL X13, X13
+	PANDN   X13, X15
+	PSRLL   $31, X15
+	PADDL   X15, X10
+
+	// out[12..15]
+	MOVO    X1, X6
+	PSUBL   X2, X6
+	MOVO    X12, X11
+	PACKSSLW X14, X11
+	PACKSSLW X14, X6
+	PUNPCKLWL X6, X11
+	PMADDWL ·rot_k3<>(SB), X11
+	MOVOU   ·vbias51000<>(SB), X13
+	PADDL   X13, X11
+	PSRAL   $16, X11
+
+	// Narrow and store out[16..31]
+	PXOR    X14, X14
+	PACKSSLW X14, X8
+	PACKSSLW X14, X10
+	PACKSSLW X14, X9
+	PACKSSLW X14, X11
+	MOVQ    X8,  32(SI)
+	MOVQ    X10, 40(SI)
+	MOVQ    X9,  48(SI)
+	MOVQ    X11, 56(SI)
+
+	RET

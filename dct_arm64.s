@@ -585,3 +585,321 @@ TEXT ·fTransformWHT(SB),NOSPLIT,$0-48
 	VST1    [V20.H4, V21.H4, V22.H4, V23.H4], (R1)
 
 	RET
+
+// func fTransform2Plane(srcPlane []byte, srcStride, srcX, srcY int,
+//                       pred []int16, predStride int, out []int16)
+//
+// Computes the 4×4 forward DCT for two horizontally-adjacent 4×4 blocks
+// by loading 8 uint8 pixels per row (both blocks contiguous), zero-extending
+// to int16, subtracting 8 int16 pred values, then running the VP8 forward DCT
+// butterfly independently for each 4-wide block.
+//
+// Arg layout (FP-based, $128 locals):
+//   srcPlane_base +0(FP)   srcPlane_len +8(FP)   srcPlane_cap +16(FP)
+//   srcStride     +24(FP)
+//   srcX          +32(FP)
+//   srcY          +40(FP)
+//   pred_base     +48(FP)  pred_len +56(FP)  pred_cap +64(FP)
+//   predStride    +72(FP)
+//   out_base      +80(FP)  out_len +88(FP)   out_cap +96(FP)
+//
+// Stack (128 bytes, 4×int32x4 per block):
+//   SP[ 0.. 63] = block0 tmp: [t0|t1|t2|t3] as 4×int32x4 (VST4 interleaved)
+//   SP[64..127] = block1 tmp: same layout
+//
+// Register map (horizontal pass):
+//   R0  = srcPlane.ptr + srcY*srcStride + srcX  (row pointer, advanced per row)
+//   R1  = pred.ptr + 0 (advanced per row by predStride*2 bytes)
+//   R2  = srcStride
+//   R3  = predStride (in int16 units; multiply by 2 for bytes)
+//   R19 = out.ptr (callee-saved for final store)
+//   R20 = row byte step for pred (predStride * 2)
+//   R4-V7 = raw uint8 rows (8 bytes each), then zero-extended to 8H int16
+//   V8-V11 = round-1 transpose (VZIP1/2 on H8)
+//   V12-V15 = round-2 transpose (VZIP1/2 on S4): col-pairs for each block
+//   V16-V17 = block0 horizontal pass rotation terms (int32x4)
+//   V18-V19 = block1 horizontal pass rotation terms (int32x4)
+//   V20 = DC0 (a0+a1)*8 as 8H (both blocks)
+//   V21 = DC2 (a0-a1)*8 as 8H (both blocks)
+//   V15 = rotation constants [2217, _, 5352, _] (shared between blocks)
+//   V28-V29 = block0 a2, a3 as 4H (for SMULL)
+//   V30-V31 = block1 a2, a3 as 4H (for SMULL)
+//
+// Register map (vertical pass, runs twice):
+//   R11 = pointer to current block's tmp on stack
+//   R19 = out.ptr (block0: out[0..15], block1: out[16..31])
+//   Reuses V0-V7 for butterfly, V8-V11 for constants, V20-V23 for outputs
+//
+// NEON WORDs used:
+//   USHLL Vd.8H, Vn.8B, #0  : Q=0,U=1,imm7=8,opcode=101001
+//   SSHLL Vd.4S, Vn.4H, #0  : Q=0,U=0,imm7=16,opcode=101001
+//   SSHLL2 Vd.4S, Vn.8H, #0 : Q=1,U=0,imm7=16,opcode=101001
+//   SHL Vd.8H, Vn.8H, #3    : Q=1,U=0,imm7=19,opcode=010101
+//   SSHR Vd.4S, Vn.4S, #9   : Q=1,U=0,imm7=55,opcode=000001
+//   SSHR Vd.4S, Vn.4S, #16  : Q=1,U=0,imm7=48,opcode=000001
+//   SSHR Vd.4S, Vn.4S, #4   : Q=1,U=0,imm7=60,opcode=000001
+//   USHR Vd.4S, Vn.4S, #31  : Q=1,U=1,imm7=33,opcode=000001
+//   CMEQ Vd.4S, Vn.4S, #0   : base 0x4EA09800
+//   NOT Vd.16B, Vn.16B       : base 0x6E205800
+//   XTN Vd.4H, Vn.4S        : base 0x0E612800
+//   MUL Vd.4S, Vn.4S, Vm.4S : base 0x4EA09C00
+
+TEXT ·fTransform2Plane(SB),NOSPLIT,$128-104
+	// ── LOAD POINTERS ────────────────────────────────────────────────────────
+	MOVD    srcPlane_base+0(FP), R0   // R0 = srcPlane.ptr
+	MOVD    srcStride+24(FP), R2     // R2 = srcStride
+	MOVD    srcX+32(FP), R4          // R4 = srcX
+	MOVD    srcY+40(FP), R5          // R5 = srcY
+	MOVD    pred_base+48(FP), R1     // R1 = pred.ptr
+	MOVD    predStride+72(FP), R3    // R3 = predStride (int16 count)
+	MOVD    out_base+80(FP), R19     // R19 = out.ptr (callee-saved)
+
+	// Compute srcRow base: R0 += srcY*srcStride + srcX
+	MUL     R2, R5, R5               // R5 = srcY * srcStride
+	ADD     R5, R0, R0               // R0 = srcPlane + srcY*srcStride
+	ADD     R4, R0, R0               // R0 += srcX
+
+	// predStride in bytes: R20 = predStride * 2
+	LSL     $1, R3, R20              // R20 = predStride * 2 bytes
+
+	// ── LOAD 4 ROWS × 8 uint8 FROM srcPlane ─────────────────────────────────
+	VLD1    (R0), [V4.B8]            // row 0
+	ADD     R2, R0, R0
+	VLD1    (R0), [V5.B8]            // row 1
+	ADD     R2, R0, R0
+	VLD1    (R0), [V6.B8]            // row 2
+	ADD     R2, R0, R0
+	VLD1    (R0), [V7.B8]            // row 3
+
+	// ── ZERO-EXTEND uint8x8 → int16x8 ────────────────────────────────────────
+	WORD    $0x2F08A484   // USHLL V4.8H, V4.8B, #0
+	WORD    $0x2F08A4A5   // USHLL V5.8H, V5.8B, #0
+	WORD    $0x2F08A4C6   // USHLL V6.8H, V6.8B, #0
+	WORD    $0x2F08A4E7   // USHLL V7.8H, V7.8B, #0
+
+	// ── LOAD 4 ROWS × 8 int16 PRED AND SUBTRACT ──────────────────────────────
+	VLD1    (R1), [V0.H8]
+	ADD     R20, R1, R1
+	VLD1    (R1), [V1.H8]
+	ADD     R20, R1, R1
+	VLD1    (R1), [V2.H8]
+	ADD     R20, R1, R1
+	VLD1    (R1), [V3.H8]
+
+	VSUB    V0.H8, V4.H8, V4.H8     // V4 = diff row 0
+	VSUB    V1.H8, V5.H8, V5.H8     // V5 = diff row 1
+	VSUB    V2.H8, V6.H8, V6.H8     // V6 = diff row 2
+	VSUB    V3.H8, V7.H8, V7.H8     // V7 = diff row 3
+
+	// ── TRANSPOSE 4-ROW × 8-COL int16 MATRIX ────────────────────────────────
+	// Round 1: zip adjacent row pairs → interleaved H8 vectors
+	VZIP1   V5.H8, V4.H8, V8.H8    // rows 0,1 interleaved (cols 0-3 in lo)
+	VZIP2   V5.H8, V4.H8, V9.H8    // rows 0,1 interleaved (cols 4-7 in lo)
+	VZIP1   V7.H8, V6.H8, V10.H8   // rows 2,3 interleaved (cols 0-3)
+	VZIP2   V7.H8, V6.H8, V11.H8   // rows 2,3 interleaved (cols 4-7)
+	// Round 2: zip S4 pairs → full column vectors (rows in order 0,1,2,3)
+	VZIP1   V10.S4, V8.S4, V12.S4  // V12=[col0|col1] block0
+	VZIP2   V10.S4, V8.S4, V13.S4  // V13=[col2|col3] block0
+	VZIP1   V11.S4, V9.S4, V14.S4  // V14=[col4|col5] block1
+	VZIP2   V11.S4, V9.S4, V15.S4  // V15=[col6|col7] block1
+
+	// ── EXTRACT UPPER 4H (d1 and d3) ─────────────────────────────────────────
+	VEXT    $8, V12.B16, V12.B16, V8.B16   // V8.4H  = col1 (d1 block0)
+	VEXT    $8, V13.B16, V13.B16, V9.B16   // V9.4H  = col3 (d3 block0)
+	VEXT    $8, V14.B16, V14.B16, V10.B16  // V10.4H = col5 (d1 block1)
+	VEXT    $8, V15.B16, V15.B16, V11.B16  // V11.4H = col7 (d3 block1)
+
+	// ── BUTTERFLY ─────────────────────────────────────────────────────────────
+	// Block0: d0=V12.lo4H, d1=V8.4H, d2=V13.lo4H, d3=V9.4H
+	VADD    V9.H4, V12.H4, V24.H4   // a0_b0 = d0+d3
+	VADD    V13.H4, V8.H4, V25.H4   // a1_b0 = d1+d2
+	VSUB    V13.H4, V8.H4, V28.H4   // a2_b0 = d1-d2
+	VSUB    V9.H4, V12.H4, V29.H4   // a3_b0 = d0-d3
+	// Block1: d0=V14.lo4H, d1=V10.4H, d2=V15.lo4H, d3=V11.4H
+	VADD    V11.H4, V14.H4, V26.H4  // a0_b1 = d0+d3
+	VADD    V15.H4, V10.H4, V27.H4  // a1_b1 = d1+d2
+	VSUB    V15.H4, V10.H4, V30.H4  // a2_b1 = d1-d2
+	VSUB    V11.H4, V14.H4, V31.H4  // a3_b1 = d0-d3
+
+	// ── DC TERMS: (a0+a1)*8 and (a0-a1)*8 ──────────────────────────────────
+	VADD    V25.H4, V24.H4, V0.H4   // block0 dc0 = a0+a1 → V0.4H
+	VSUB    V25.H4, V24.H4, V1.H4   // block0 dc2 = a0-a1 → V1.4H
+	VADD    V27.H4, V26.H4, V2.H4   // block1 dc0 = a0+a1 → V2.4H
+	VSUB    V27.H4, V26.H4, V3.H4   // block1 dc2 = a0-a1 → V3.4H
+
+	WORD    $0x0F135400   // SHL V0.4H, V0.4H, #3
+	WORD    $0x0F135421   // SHL V1.4H, V1.4H, #3
+	WORD    $0x0F135442   // SHL V2.4H, V2.4H, #3
+	WORD    $0x0F135463   // SHL V3.4H, V3.4H, #3
+
+	// ── ROTATION CONSTANTS ─────────────────────────────────────────────────
+	// V4 = bias1812 (4S), V5 = bias937 (4S)  [V4/V5 now free: rows consumed above]
+	// V15 = [2217, _, 5352, _] for SMULL indexed lane access
+	MOVD    $2217, R9
+	VMOV    R9, V15.H[0]
+	MOVD    $5352, R10
+	VMOV    R10, V15.H[2]
+	MOVD    $1812, R9
+	WORD    $0x4E040D24   // DUP V4.4S, R9   (bias1812)
+	MOVD    $937, R10
+	WORD    $0x4E040D45   // DUP V5.4S, R10  (bias937)
+
+	// ── WIDEN DC TERMS → 4S ───────────────────────────────────────────────────
+	// Block0: V0.4H → V16.4S (t0), V1.4H → V18.4S (t2)
+	WORD    $0x0F10A410   // SSHLL V16.4S, V0.4H, #0
+	WORD    $0x0F10A432   // SSHLL V18.4S, V1.4H, #0
+	// Block1: V2.4H → V20.4S (t0), V3.4H → V22.4S (t2)
+	WORD    $0x0F10A454   // SSHLL V20.4S, V2.4H, #0
+	WORD    $0x0F10A476   // SSHLL V22.4S, V3.4H, #0
+
+	// ── ROTATION TERM 1 (block0): (a2*2217 + a3*5352 + 1812) >> 9 → V17 ──────
+	// a2=V28.4H, a3=V29.4H; result → V17 (t1 for block0)
+	// SMULL V17.4S, V28.4H, V15.H[0]  (a2_b0 * 2217)
+	WORD    $0x0F4FA391   // SMULL V17.4S, V28.4H, V15.H[0]
+	// SMLAL V17.4S, V29.4H, V15.H[2]  (+a3_b0 * 5352)
+	WORD    $0x0F6F23B1   // SMLAL V17.4S, V29.4H, V15.H[2]
+	VADD    V4.S4, V17.S4, V17.S4
+	WORD    $0x4F370631   // SSHR V17.4S, V17.4S, #9
+
+	// SMULL V19.4S, V29.4H, V15.H[0]  (a3_b0 * 2217)
+	WORD    $0x0F4FA3B3   // SMULL V19.4S, V29.4H, V15.H[0]
+	// SMLSL V19.4S, V28.4H, V15.H[2]  (-a2_b0 * 5352)
+	WORD    $0x0F6F6393   // SMLSL V19.4S, V28.4H, V15.H[2]
+	VADD    V5.S4, V19.S4, V19.S4
+	WORD    $0x4F370673   // SSHR V19.4S, V19.4S, #9
+
+	// SMULL V21.4S, V30.4H, V15.H[0]  (a2_b1 * 2217)
+	WORD    $0x0F4FA3D5   // SMULL V21.4S, V30.4H, V15.H[0]
+	// SMLAL V21.4S, V31.4H, V15.H[2]  (+a3_b1 * 5352)
+	WORD    $0x0F6F23F5   // SMLAL V21.4S, V31.4H, V15.H[2]
+	VADD    V4.S4, V21.S4, V21.S4
+	WORD    $0x4F3706B5   // SSHR V21.4S, V21.4S, #9
+
+	// SMULL V23.4S, V31.4H, V15.H[0]  (a3_b1 * 2217)
+	WORD    $0x0F4FA3F7   // SMULL V23.4S, V31.4H, V15.H[0]
+	// SMLSL V23.4S, V30.4H, V15.H[2]  (-a2_b1 * 5352)
+	WORD    $0x0F6F63D7   // SMLSL V23.4S, V30.4H, V15.H[2]
+	VADD    V5.S4, V23.S4, V23.S4
+	WORD    $0x4F3706F7   // SSHR V23.4S, V23.4S, #9
+
+	// ── STORE TMP TO STACK (VST4 interleaved, contiguous registers) ───────────
+	// Block0: [t0=V16, t1=V17, t2=V18, t3=V19] → SP[0..63]
+	// Block1: [t0=V20, t1=V21, t2=V22, t3=V23] → SP[64..127]
+	// BOTH stored before vertical passes (block0 vertical overwrites V20-V23).
+	MOVD    RSP, R11
+	VST4    [V16.S4, V17.S4, V18.S4, V19.S4], (R11)
+	ADD     $64, R11, R12
+	VST4    [V20.S4, V21.S4, V22.S4, V23.S4], (R12)
+
+	// ── VERTICAL PASS: BLOCK 0 (SP[0..63] → out[0..15]) ─────────────────────
+	MOVD    $2217, R5
+	WORD    $0x4E040CA8   // DUP V8.4S, R5
+	MOVD    $5352, R6
+	WORD    $0x4E040CC9   // DUP V9.4S, R6
+	MOVD    $12000, R7
+	WORD    $0x4E040CEA   // DUP V10.4S, R7
+	MOVD    $51000, R8
+	WORD    $0x4E040D0B   // DUP V11.4S, R8
+
+	VLD1    (R11), [V0.S4]
+	ADD     $16, R11, R13
+	VLD1    (R13), [V1.S4]
+	ADD     $32, R11, R13
+	VLD1    (R13), [V2.S4]
+	ADD     $48, R11, R13
+	VLD1    (R13), [V3.S4]
+
+	VADD    V3.S4, V0.S4, V4.S4
+	VADD    V2.S4, V1.S4, V5.S4
+	VSUB    V2.S4, V1.S4, V6.S4
+	VSUB    V3.S4, V0.S4, V7.S4
+
+	VADD    V5.S4, V4.S4, V20.S4
+	MOVD    $7, R5
+	WORD    $0x4E040CA0   // DUP V0.4S, R5
+	VADD    V0.S4, V20.S4, V20.S4
+	WORD    $0x4F3C0694   // SSHR V20.4S, V20.4S, #4
+
+	VSUB    V5.S4, V4.S4, V22.S4
+	VADD    V0.S4, V22.S4, V22.S4
+	WORD    $0x4F3C06D6   // SSHR V22.4S, V22.4S, #4
+
+	WORD    $0x4EA89CCC   // MUL V12.4S, V6.4S, V8.4S
+	WORD    $0x4EA99CED   // MUL V13.4S, V7.4S, V9.4S
+	VADD    V13.S4, V12.S4, V21.S4
+	VADD    V10.S4, V21.S4, V21.S4
+	WORD    $0x4F3006B5   // SSHR V21.4S, V21.4S, #16
+	WORD    $0x4EA098F0   // CMEQ V16.4S, V7.4S, #0
+	WORD    $0x6E205A11   // NOT V17.16B, V16.16B
+	WORD    $0x6F210631   // USHR V17.4S, V17.4S, #31
+	VADD    V17.S4, V21.S4, V21.S4
+
+	WORD    $0x4EA89CEE   // MUL V14.4S, V7.4S, V8.4S
+	WORD    $0x4EA99CCF   // MUL V15.4S, V6.4S, V9.4S
+	VSUB    V15.S4, V14.S4, V23.S4
+	VADD    V11.S4, V23.S4, V23.S4
+	WORD    $0x4F3006F7   // SSHR V23.4S, V23.4S, #16
+
+	WORD    $0x0E612A94   // XTN V20.4H, V20.4S
+	WORD    $0x0E612AB5   // XTN V21.4H, V21.4S
+	WORD    $0x0E612AD6   // XTN V22.4H, V22.4S
+	WORD    $0x0E612AF7   // XTN V23.4H, V23.4S
+	VST1    [V20.H4, V21.H4, V22.H4, V23.H4], (R19)
+
+	// ── VERTICAL PASS: BLOCK 1 (SP[64..127] → out[16..31]) ──────────────────
+	// Load block1 tmp from stack
+	VLD1    (R12), [V0.S4]            // t0
+	ADD     $16, R12, R13
+	VLD1    (R13), [V1.S4]            // t1
+	ADD     $32, R12, R13
+	VLD1    (R13), [V2.S4]            // t2
+	ADD     $48, R12, R13
+	VLD1    (R13), [V3.S4]            // t3
+
+	// Butterfly
+	VADD    V3.S4, V0.S4, V4.S4
+	VADD    V2.S4, V1.S4, V5.S4
+	VSUB    V2.S4, V1.S4, V6.S4
+	VSUB    V3.S4, V0.S4, V7.S4
+
+	// Reload V0 = [7,7,7,7] (V0 was overwritten by VLD1 above)
+	MOVD    $7, R13
+	WORD    $0x4E040DA0   // DUP V0.4S, R13
+
+	// out[0..3] → V20
+	VADD    V5.S4, V4.S4, V20.S4
+	VADD    V0.S4, V20.S4, V20.S4
+	WORD    $0x4F3C0694   // SSHR V20.4S, V20.4S, #4
+
+	// out[8..11] → V22
+	VSUB    V5.S4, V4.S4, V22.S4
+	VADD    V0.S4, V22.S4, V22.S4
+	WORD    $0x4F3C06D6   // SSHR V22.4S, V22.4S, #4
+
+	// out[4..7] → V21
+	WORD    $0x4EA89CCC   // MUL V12.4S, V6.4S, V8.4S
+	WORD    $0x4EA99CED   // MUL V13.4S, V7.4S, V9.4S
+	VADD    V13.S4, V12.S4, V21.S4
+	VADD    V10.S4, V21.S4, V21.S4
+	WORD    $0x4F3006B5   // SSHR V21.4S, V21.4S, #16
+	WORD    $0x4EA098F0   // CMEQ V16.4S, V7.4S, #0
+	WORD    $0x6E205A11   // NOT V17.16B, V16.16B
+	WORD    $0x6F210631   // USHR V17.4S, V17.4S, #31
+	VADD    V17.S4, V21.S4, V21.S4
+
+	// out[12..15] → V23
+	WORD    $0x4EA89CEE   // MUL V14.4S, V7.4S, V8.4S
+	WORD    $0x4EA99CCF   // MUL V15.4S, V6.4S, V9.4S
+	VSUB    V15.S4, V14.S4, V23.S4
+	VADD    V11.S4, V23.S4, V23.S4
+	WORD    $0x4F3006F7   // SSHR V23.4S, V23.4S, #16
+
+	// Narrow and store out[16..31]
+	WORD    $0x0E612A94   // XTN V20.4H, V20.4S
+	WORD    $0x0E612AB5   // XTN V21.4H, V21.4S
+	WORD    $0x0E612AD6   // XTN V22.4H, V22.4S
+	WORD    $0x0E612AF7   // XTN V23.4H, V23.4S
+	ADD     $32, R19, R13
+	VST1    [V20.H4, V21.H4, V22.H4, V23.H4], (R13)
+
+	RET

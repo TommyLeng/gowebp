@@ -22,6 +22,22 @@ func fTransform(src []int16, ref []int16, out []int16)
 //go:noescape
 func iTransform4x4(coeffs []int16, pred []int16, out []int16)
 
+// fTransform2Plane computes the 4×4 forward DCT for two horizontally-adjacent
+// blocks, reading directly from the pixel plane (uint8) and int16 prediction.
+//
+// srcPlane: the full Y (or U/V) plane as uint8
+// srcStride: row stride of srcPlane (in bytes)
+// srcX, srcY: top-left pixel coordinates of the FIRST block (second is at srcX+4)
+// pred: int16 prediction buffer, row-major, predStride int16 elements per row
+// out: [32]int16, out[0..15]=DCT of first block, out[16..31]=DCT of second block
+//
+// NEON implementation in dct_arm64.s. Loads 8 uint8 pixels per row (both blocks),
+// zero-extends to int16x8, subtracts 8 int16 pred, then processes both 4-wide
+// column sets simultaneously through the DCT butterfly.
+//
+//go:noescape
+func fTransform2Plane(srcPlane []byte, srcStride, srcX, srcY int, pred []int16, predStride int, out []int16)
+
 // fTransformWHT computes the 4x4 Walsh-Hadamard Transform on the 16 DC values.
 // in[16] are the DC values from each 4x4 block's DCT output (one per block),
 // laid out row-major (in[r*4+c] = DC of block at row r, col c).
