@@ -458,19 +458,13 @@ func trellisQuantize(
 	// Clear outputs.
 	if first == 1 {
 		// i16-AC: preserve DC slot (kZigzag[0]=0).
-		for i := 1; i < 16; i++ {
-			out[i] = 0
-		}
+		clear(out[1:16])
 		saved := in[0]
-		for k := 0; k < 16; k++ {
-			in[k] = 0
-		}
+		clear(in[:16])
 		in[0] = saved // kZigzag[0] = 0, so raster[0] = DC preserved
 	} else {
-		for i := 0; i < 16; i++ {
-			out[i] = 0
-			in[i] = 0
-		}
+		clear(out[:16])
+		clear(in[:16])
 	}
 
 	if bestPath[0] == -1 {
