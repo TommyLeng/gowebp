@@ -89,6 +89,11 @@ type trellisCostTables struct {
 
 // buildTrellisCostTables precomputes all level cost tables from a coefficient
 // probability table. Mirrors VP8CalculateLevelCosts() in libwebp.
+//
+// tables.level[band][ctx][v] stores the TOTAL bit cost of emitting level v in
+// context (band, ctx): vp8LevelFixedCosts[v] + variablePart(v, probs).
+// This lets levelCostFromTable execute a single table lookup for v ≤ 67
+// instead of two separate accesses to vp8LevelFixedCosts and the variable table.
 func buildTrellisCostTables(probs *[numBands][numCtx][numProbas]uint8) trellisCostTables {
 	var tables trellisCostTables
 	for band := 0; band < numBands; band++ {
@@ -101,12 +106,12 @@ func buildTrellisCostTables(probs *[numBands][numCtx][numProbas]uint8) trellisCo
 			// EOB costs: probability of "no / at-least-one more non-zero" at (band, ctx).
 			tables.eob[band][ctx] = int32(vp8BitCost(0, int(p[0])))
 			tables.eob1[band][ctx] = int32(vp8BitCost(1, int(p[0])))
-			// Level 0: emit the "non-zero = 0" bit.
+			// Level 0: emit the "non-zero = 0" bit. Fixed cost for level 0 is 0.
 			tables.level[band][ctx][0] = int16(vp8BitCost(0, int(p[1])) + cost0)
-			// Levels 1..maxVariableLevel: non-zero + variable coding.
+			// Levels 1..maxVariableLevel: total = fixedCost[v] + variablePart.
 			costBase := vp8BitCost(1, int(p[1])) + cost0
 			for v := 1; v <= maxVariableLevel; v++ {
-				tables.level[band][ctx][v] = int16(costBase + variableLevelCost(v, p))
+				tables.level[band][ctx][v] = int16(int(vp8LevelFixedCosts[v]) + costBase + variableLevelCost(v, p))
 			}
 		}
 	}
@@ -130,19 +135,23 @@ func variableLevelCost(level int, p []uint8) int {
 }
 
 // levelCostFromTable returns the total bit-cost of coding level v.
-// Mirrors VP8LevelCost(): vp8LevelFixedCosts[level] + table[min(level,67)]
-//
-// The maxLevel (2047) clamp is kept for safety but is never reached at
-// quality ≥ 10 — practical levels stay well below maxVariableLevel (67).
+// table[v] already stores vp8LevelFixedCosts[v] + variablePart(v) for v ≤ 67,
+// so the common case (level ≤ maxVariableLevel) is a single table lookup.
+// For level > 67 (rare at quality ≥ 10): table[67] holds the variable part at
+// the saturation point; we add vp8LevelFixedCosts[level] minus the fixed cost
+// already embedded in table[67].  For simplicity we store the full total in the
+// table for levels 0..67, and for level > 67 fall back to the two-table sum.
 func levelCostFromTable(table *[maxVariableLevel + 1]int16, level int) int {
-	vl := level
-	if vl > maxVariableLevel {
-		vl = maxVariableLevel
-		if level > maxLevel {
-			level = maxLevel
-		}
+	if level <= maxVariableLevel {
+		return int(table[level])
 	}
-	return int(vp8LevelFixedCosts[level]) + int(table[vl])
+	// level > 67: rare. vp8LevelFixedCosts saturates at maxLevel (2047).
+	if level > maxLevel {
+		level = maxLevel
+	}
+	// table[67] = fixedCosts[67] + variablePart(67); for level > 67 the variable
+	// part is the same as level 67, so total = fixedCosts[level] + table[67] - fixedCosts[67].
+	return int(vp8LevelFixedCosts[level]) + int(table[maxVariableLevel]) - int(vp8LevelFixedCosts[maxVariableLevel])
 }
 
 // trellisNode stores the Viterbi DP state for one trellis candidate.
@@ -333,28 +342,42 @@ func trellisQuantize(
 		// Swap cur ↔ prev.
 		curIdx, prevIdx = prevIdx, curIdx
 
-		// Hoist values shared by both m2=0 and m2=1 bodies.
+		// Hoist all values shared by or derivable before the two m2 bodies.
 		wt := int64(kWeightTrellis[j])
 		coeff0sq := int64(coeff0) * int64(coeff0)
-		notLast := n < 15 // whether an EOB flag is needed after this position
 		prev0 := &ss[prevIdx][0]
 		prev1 := &ss[prevIdx][1]
+
+		// Precompute clamped context and nextCosts for both m2=0 (ctx0) and m2=1 (ctx1).
+		// ctx = min(level, 2); for m2=1 ctx1 = min(level0+1, 2) which is simply
+		// ctx0 when ctx0 == 2, and ctx0+1 otherwise — both computable without branches
+		// once we know ctx0.
+		ctx0 := level0
+		if ctx0 > 2 {
+			ctx0 = 2
+		}
+		ctx1 := level0 + 1
+		if ctx1 > 2 {
+			ctx1 = 2
+		}
+		// nextCosts: use zeroCostTable at n==15 (no successor position).
+		var nextCosts0, nextCosts1 *[maxVariableLevel + 1]int16
+		eobLC0, eobLC1 := int64(0), int64(0)
+		if n < 15 {
+			nextCosts0 = &costs.level[nextBand][ctx0]
+			nextCosts1 = &costs.level[nextBand][ctx1]
+			eobLC0 = int64(costs.eob[nextBand][ctx0]) * iLambda
+			eobLC1 = int64(costs.eob[nextBand][ctx1]) * iLambda
+		} else {
+			nextCosts0 = &zeroCostTable
+			nextCosts1 = &zeroCostTable
+		}
 
 		// ── m2 = 0: level = level0 ────────────────────────────────────────────
 		{
 			level := level0
 			if level >= 0 && level <= threshLevel {
-				ctx := level
-				if ctx > 2 {
-					ctx = 2
-				}
-				var nextCosts *[maxVariableLevel + 1]int16
-				if notLast {
-					nextCosts = &costs.level[nextBand][ctx]
-				} else {
-					nextCosts = &zeroCostTable
-				}
-				ss[curIdx][0].costs = nextCosts
+				ss[curIdx][0].costs = nextCosts0
 
 				newErr := coeff0 - int32(level)*Q
 				baseScore := wt*(int64(newErr)*int64(newErr)-coeff0sq)*rdDistoMult
@@ -386,11 +409,7 @@ func trellisQuantize(
 				ss[curIdx][0].score = bestCurScore
 
 				if level != 0 && bestCurScore < maxCost {
-					eobLC := int64(0)
-					if notLast {
-						eobLC = int64(costs.eob[nextBand][ctx]) * iLambda
-					}
-					if tot := bestCurScore + eobLC; tot < bestScore {
+					if tot := bestCurScore + eobLC0; tot < bestScore {
 						bestScore = tot
 						bestPath[0] = n
 						bestPath[1] = 0
@@ -407,17 +426,7 @@ func trellisQuantize(
 		{
 			level := level0 + 1
 			if level >= 0 && level <= threshLevel {
-				ctx := level
-				if ctx > 2 {
-					ctx = 2
-				}
-				var nextCosts *[maxVariableLevel + 1]int16
-				if notLast {
-					nextCosts = &costs.level[nextBand][ctx]
-				} else {
-					nextCosts = &zeroCostTable
-				}
-				ss[curIdx][1].costs = nextCosts
+				ss[curIdx][1].costs = nextCosts1
 
 				newErr := coeff0 - int32(level)*Q
 				baseScore := wt*(int64(newErr)*int64(newErr)-coeff0sq)*rdDistoMult
@@ -448,11 +457,7 @@ func trellisQuantize(
 				ss[curIdx][1].score = bestCurScore
 
 				if level != 0 && bestCurScore < maxCost {
-					eobLC := int64(0)
-					if notLast {
-						eobLC = int64(costs.eob[nextBand][ctx]) * iLambda
-					}
-					if tot := bestCurScore + eobLC; tot < bestScore {
+					if tot := bestCurScore + eobLC1; tot < bestScore {
 						bestScore = tot
 						bestPath[0] = n
 						bestPath[1] = 1
