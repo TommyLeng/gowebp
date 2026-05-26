@@ -64,6 +64,8 @@ type mbWorkspace struct {
 	i16Src4     [16]int16
 	i16Pred4    [16]int16
 	i16DctOut   [16]int16
+	// fTransform2Plane scratch: holds DCT output for two adjacent 4x4 blocks
+	dctPair     [32]int16
 	i16RasterCoeffs [16]int16
 	i16RecBlock [16]int16
 	i16Pred4b   [16]int16
@@ -311,18 +313,17 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				// -------------------------------------------------------
 				intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, ry, yuv.mbW, yuv.mbH, ws.mbI16Pred[:])
 				for by := 0; by < 4; by++ {
-					for bx := 0; bx < 4; bx++ {
-						n := by*4 + bx
-						for y := 0; y < 4; y++ {
-							for x := 0; x < 4; x++ {
-								ws.i16Src4[y*4+x] = src16[(by*4+y)*16+(bx*4+x)]
-								ws.i16Pred4[y*4+x] = ws.mbI16Pred[(by*4+y)*16+(bx*4+x)]
-							}
-						}
-						fTransform(ws.i16Src4[:], ws.i16Pred4[:], ws.i16DctOut[:])
-						ws.yDcRaw16[n] = ws.i16DctOut[0]
-						ws.i16DctOut[0] = 0
-						trellisQuantize(ws.i16DctOut[:], ws.mbI16AcLevels[n][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
+					for bx := 0; bx < 4; bx += 2 {
+						n0, n1 := by*4+bx, by*4+bx+1
+						fTransform2Plane(yuv.y, yuv.yStride, px+bx*4, py+by*4,
+							ws.mbI16Pred[:], 16, ws.dctPair[:])
+						ws.yDcRaw16[n0] = ws.dctPair[0]
+						ws.dctPair[0] = 0
+						trellisQuantize(ws.dctPair[0:16], ws.mbI16AcLevels[n0][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
+							i16ProbsPtr, 0)
+						ws.yDcRaw16[n1] = ws.dctPair[16]
+						ws.dctPair[16] = 0
+						trellisQuantize(ws.dctPair[16:32], ws.mbI16AcLevels[n1][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
 							i16ProbsPtr, 0)
 					}
 				}
@@ -678,25 +679,22 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 
 				for ch := 0; ch < 2; ch++ {
 					plane := yuv.u
-					predSlice := ws.predU8
+					predSlice := ws.predU8[:]
 					if ch == 1 {
 						plane = yuv.v
-						predSlice = ws.predV8
+						predSlice = ws.predV8[:]
 					}
 					for by := 0; by < 2; by++ {
-						for bx := 0; bx < 2; bx++ {
-							bn := ch*4 + by*2 + bx
-							extractBlock4x4UV(plane, yuv.uvStride, mbX*8+bx*4, ry*8+by*4, yuv.width, yuv.height, ws.uvSrc4[:])
-							for y := 0; y < 4; y++ {
-								for x := 0; x < 4; x++ {
-									ws.uvPred4[y*4+x] = predSlice[(by*4+y)*8+(bx*4+x)]
-								}
-							}
-							fTransform(ws.uvSrc4[:], ws.uvPred4[:], ws.uvDctOut[:])
-							trellisQuantize(ws.uvDctOut[:], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
+						bn0 := ch*4 + by*2
+						bn1 := ch*4 + by*2 + 1
+						fTransform2Plane(plane, yuv.uvStride, mbX*8, ry*8+by*4,
+							predSlice, 8, ws.dctPair[:])
+						trellisQuantize(ws.dctPair[0:16], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
 							uvProbsPtr, 0)
-							ws.uvLevels[bn] = ws.uvQuant
-						}
+						ws.uvLevels[bn0] = ws.uvQuant
+						trellisQuantize(ws.dctPair[16:32], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
+							uvProbsPtr, 0)
+						ws.uvLevels[bn1] = ws.uvQuant
 					}
 				}
 
