@@ -146,10 +146,12 @@ func levelCostFromTable(table *[maxVariableLevel + 1]int16, level int) int {
 }
 
 // trellisNode stores the Viterbi DP state for one trellis candidate.
+// level is the fully signed quantized coefficient (negative if original was negative).
+// Storing signed level avoids a branch in the backtrack unwind.
 type trellisNode struct {
 	prev  int8  // index of best predecessor node
-	sign  int8  // sign of coeff_i (0=positive, 1=negative)
-	level int16 // quantized level magnitude
+	_     int8  // padding (was sign; folded into level)
+	level int16 // signed quantized level (may be negative)
 }
 
 // maxCost is a sentinel "infinity" score for dead DP states.
@@ -374,8 +376,12 @@ func trellisQuantize(
 				}
 				bestCurScore += baseScore
 
-				nodes[n][0].sign = sign
-				nodes[n][0].level = int16(level)
+				// Store signed level directly: avoids a branch in backtrack unwind.
+				signedLvl := int16(level)
+				if sign != 0 {
+					signedLvl = -signedLvl
+				}
+				nodes[n][0].level = signedLvl
 				nodes[n][0].prev = int8(bestPrev)
 				ss[curIdx][0].score = bestCurScore
 
@@ -433,8 +439,11 @@ func trellisQuantize(
 				}
 				bestCurScore += baseScore
 
-				nodes[n][1].sign = sign
-				nodes[n][1].level = int16(level)
+				signedLvl := int16(level)
+				if sign != 0 {
+					signedLvl = -signedLvl
+				}
+				nodes[n][1].level = signedLvl
 				nodes[n][1].prev = int8(bestPrev)
 				ss[curIdx][1].score = bestCurScore
 
@@ -480,6 +489,7 @@ func trellisQuantize(
 	}
 
 	// Unwind best path, write quantized levels and dequantized raster values.
+	// node.level is already signed — write directly to out[n], no branch needed.
 	nz := false
 	bestNode := bestPath[1]
 	n := bestPath[0]
@@ -488,16 +498,12 @@ func trellisQuantize(
 	for ; n >= first; n-- {
 		node := &nodes[n][bestNode]
 		j := int(kZigzag[n])
-		lvl := int(node.level)
-		if node.sign != 0 {
-			out[n] = -int16(lvl)
-		} else {
-			out[n] = int16(lvl)
-		}
-		if lvl != 0 {
+		sl := node.level // signed quantized level
+		out[n] = sl
+		if sl != 0 {
 			nz = true
 		}
-		in[j] = int16(int32(out[n]) * int32(m.q[j]))
+		in[j] = int16(int32(sl) * int32(m.q[j]))
 		bestNode = int(node.prev)
 	}
 
