@@ -270,19 +270,43 @@ func trellisQuantize(
 	// bestPath[0]=best end pos, [1]=best node idx, [2]=best prev idx
 	bestPath := [3]int{-1, -1, -1}
 
-	// Single-pass DP: compute level bounds inline, eliminating the separate
-	// precompute arrays (lvl0/lvlMax) and their stores/loads.
+	// Precompute quantized level bounds for each coefficient position.
+	// Keeping this as a separate pass (not merged with the DP loop) allows the
+	// compiler to optimize both phases independently.
 	const neutralBias = uint32(0)
 	biasHalf := uint32(0x80) << (qfix - 8) // BIAS(0x80)
+	var lvl0 [16]int   // floor level (no rounding bias)
+	var lvlMax [16]int // threshold level (0.5 bias; candidates pruned above this)
+	for n := first; n <= last; n++ {
+		j := int(kZigzag[n])
+		iQ := uint32(m.iq[j])
+		raw := int32(in[j])
+		if raw < 0 {
+			raw = -raw
+		}
+		coeff0 := raw + int32(m.sharpen[j])
+		if coeff0 < 0 {
+			coeff0 = 0
+		}
+		l0 := int((uint32(coeff0)*iQ + neutralBias) >> qfix)
+		if l0 > maxLevel {
+			l0 = maxLevel
+		}
+		lMax := int((uint32(coeff0)*iQ + biasHalf) >> qfix)
+		if lMax > maxLevel {
+			lMax = maxLevel
+		}
+		lvl0[n] = l0
+		lvlMax[n] = lMax
+	}
 
 	iLambda := int64(lambda)
 
 	for n := first; n <= last; n++ {
 		j := int(kZigzag[n])
 		Q := int32(m.q[j])
-		iQ := uint32(m.iq[j])
 
-		// Compute coeff0 (with sharpening) and sign for distortion.
+		// Apply sharpening bias to get coeff0 for distortion computation.
 		// Mirrors libwebp: coeff0 = (sign ? -in[j] : in[j]) + mtx->sharpen[j].
 		raw := int32(in[j])
 		sign := int8(0)
@@ -295,15 +319,8 @@ func trellisQuantize(
 			coeff0 = 0
 		}
 
-		// Compute level bounds inline (was the precompute pass).
-		level0 := int((uint32(coeff0)*iQ + neutralBias) >> qfix)
-		if level0 > maxLevel {
-			level0 = maxLevel
-		}
-		threshLevel := int((uint32(coeff0)*iQ + biasHalf) >> qfix)
-		if threshLevel > maxLevel {
-			threshLevel = maxLevel
-		}
+		level0 := lvl0[n]
+		threshLevel := lvlMax[n]
 
 		// Precompute nextBand for this position — same for both m2 nodes.
 		nextBand := int(vp8EncBands[n+1]) // sentinel at 16 is 0, harmless
