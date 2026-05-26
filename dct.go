@@ -7,41 +7,10 @@ package gowebp
 // fTransformWHT computes the 4x4 Walsh-Hadamard Transform on the 16 DC
 // coefficients (one per 4x4 block in a 16x16 macroblock).
 //
-// in[0..15] are the DC values from each 4x4 block's DCT output,
-// but they are passed as in[n*16] (every 16th element) for the 4 rows of 4.
-// We take them as a flat in[0..15] here (caller lays them out).
-//
-// Ported from FTransformWHT_C() in libwebp/src/dsp/enc.c.
-func fTransformWHT(in []int16, out []int16) {
-	var tmp [16]int32
-	// Input is in[0*16], in[1*16], in[2*16], in[3*16] for each of 4 rows
-	// but in libwebp the inner loop advances 'in' by 64 each iteration.
-	// We receive 16 values directly, in row-major order [0..15].
-	for i := 0; i < 4; i++ {
-		a0 := int32(in[0+i*4]) + int32(in[2+i*4])
-		a1 := int32(in[1+i*4]) + int32(in[3+i*4])
-		a2 := int32(in[1+i*4]) - int32(in[3+i*4])
-		a3 := int32(in[0+i*4]) - int32(in[2+i*4])
-		tmp[0+i*4] = a0 + a1
-		tmp[1+i*4] = a3 + a2
-		tmp[2+i*4] = a3 - a2
-		tmp[3+i*4] = a0 - a1
-	}
-	for i := 0; i < 4; i++ {
-		a0 := tmp[0+i] + tmp[8+i]
-		a1 := tmp[4+i] + tmp[12+i]
-		a2 := tmp[4+i] - tmp[12+i]
-		a3 := tmp[0+i] - tmp[8+i]
-		b0 := a0 + a1
-		b1 := a3 + a2
-		b2 := a3 - a2
-		b3 := a0 - a1
-		out[0+i] = int16(b0 >> 1)
-		out[4+i] = int16(b1 >> 1)
-		out[8+i] = int16(b2 >> 1)
-		out[12+i] = int16(b3 >> 1)
-	}
-}
+// See fTransformWHT_generic.go (scalar fallback) and the platform-specific
+// SIMD implementations:
+//   - fTransformWHT_arm64.go / dct_arm64.s — NEON
+//   - fTransformWHT_amd64.go / dct_amd64.s — SSE2
 
 // iTransform4x4 computes the inverse 4x4 DCT and adds residuals to pred.
 // See iTransform_generic.go (scalar) and dct_arm64.s (NEON) for implementations.

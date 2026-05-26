@@ -21,3 +21,19 @@ func fTransform(src []int16, ref []int16, out []int16)
 //
 //go:noescape
 func iTransform4x4(coeffs []int16, pred []int16, out []int16)
+
+// fTransformWHT computes the 4x4 Walsh-Hadamard Transform on the 16 DC values.
+// in[16] are the DC values from each 4x4 block's DCT output (one per block),
+// laid out row-major (in[r*4+c] = DC of block at row r, col c).
+// out[16] receives the WHT coefficients in the same layout.
+//
+// NEON implementation in dct_arm64.s:
+//   - VLD4 deinterleaves the 16-input into 4 column-vectors (one lane per row).
+//   - Pass 1 butterflies in int16 across the 4 column-vectors.
+//   - 4x4 int16 transpose (TRN1/TRN2 on .H4, then on .S2).
+//   - Pass 2 widens to int32, butterflies, and uses SSHR #1 for >>1 (avoiding
+//     int16 overflow on b0..b3 which can reach 16-bit values).
+//   - XTN narrows back to int16; VST1 stores 4 contiguous int16x4 vectors.
+//
+//go:noescape
+func fTransformWHT(in []int16, out []int16)

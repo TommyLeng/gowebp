@@ -441,3 +441,147 @@ TEXT ·iTransform4x4(SB),NOSPLIT,$0-72
 	VST1    [V20.H4, V21.H4, V22.H4, V23.H4], (R2)
 
 	RET
+
+// func fTransformWHT(in []int16, out []int16)
+//
+// Computes the 4×4 Walsh-Hadamard Transform on the 16 DC coefficients.
+// Both passes are vectorised; pass 1 stays in int16, pass 2 widens to int32
+// (because b0..b3 can reach 16-bit unsigned which doesn't fit int16) before
+// the >>1 shift and narrow.
+//
+// Stack convention (FP-based, NOSPLIT $0):
+//   in_base+0(FP), out_base+24(FP)
+//
+// Strategy:
+//   1. VLD4 .4H deinterleaves the 16 int16 input into 4 col-vectors V0..V3
+//      where V_k.lane[j] = in[j*4+k]. This makes pass 1 a simple butterfly
+//      across the 4 vectors (lane-parallel for all 4 rows).
+//   2. Pass 1 in int16 (input max 12b → tmp max 14b, fits int16):
+//        a0 = V0 + V2,  a1 = V1 + V3,  a2 = V1 - V3,  a3 = V0 - V2
+//        tmp_p0 = a0+a1,  tmp_p1 = a3+a2,  tmp_p2 = a3-a2,  tmp_p3 = a0-a1
+//      tmp_p_k.lane[j] = tmp[k+j*4] = tmp col k.
+//   3. 4×4 int16 transpose so we obtain ROW-vectors of tmp:
+//        U_r = (tmp[r*4+0], tmp[r*4+1], tmp[r*4+2], tmp[r*4+3])
+//      Done via TRN1/TRN2 on .H4 (round 1) then TRN1/TRN2 on .S2 (round 2).
+//   4. SXTL widen each U_r to int32x4.
+//   5. Pass 2 in int32 (a0..a3 are 15b which would fit int16, but a0+a1 is 16b
+//      which doesn't — widening is the safe path):
+//        a0 = U0 + U2,  a1 = U1 + U3,  a2 = U1 - U3,  a3 = U0 - U2
+//        b0 = (a0+a1) >> 1,  b1 = (a3+a2) >> 1,  b2 = (a3-a2) >> 1,  b3 = (a0-a1) >> 1
+//      b_r.lane[c] = out[r*4+c].
+//   6. XTN narrow int32→int16, VST1 stores 4 × int16x4 contiguously to out.
+//
+// Register map:
+//   V0..V3   : col-vectors of in (after VLD4)
+//   V4..V7   : pass-1 a0..a3
+//   V8..V11  : pass-1 tmp_p0..tmp_p3 (col-vectors of tmp)
+//   V12..V19 : transpose scratch + transpose output
+//   V20..V23 : pass-2 inputs U_r (row-vectors of tmp, after SXTL → int32x4)
+//   V24..V27 : pass-2 a0..a3 (int32x4)
+//   V28..V31 : pass-2 b0..b3 (int32x4, then narrowed to int16x4 in V20..V23)
+//
+// Encodings (Plan9 syntax does not accept these instructions):
+//   TRN1 Vd.4H, Vn.4H, Vm.4H : 0x0E402800 | (Rm<<16) | (Rn<<5) | Rd
+//   TRN2 Vd.4H, Vn.4H, Vm.4H : 0x0E406800 | (Rm<<16) | (Rn<<5) | Rd
+//   TRN1 Vd.2S, Vn.2S, Vm.2S : 0x0E802800 | (Rm<<16) | (Rn<<5) | Rd
+//   TRN2 Vd.2S, Vn.2S, Vm.2S : 0x0E806800 | (Rm<<16) | (Rn<<5) | Rd
+//   SXTL Vd.4S, Vn.4H        : 0x0F10A400 | (Rn<<5) | Rd
+//   SSHR Vd.4S, Vn.4S, #1    : 0x4F3F0400 | (Rn<<5) | Rd
+//   XTN  Vd.4H, Vn.4S        : 0x0E612800 | (Rn<<5) | Rd
+
+TEXT ·fTransformWHT(SB),NOSPLIT,$0-48
+	MOVD    in_base+0(FP), R0
+	MOVD    out_base+24(FP), R1
+
+	// ── LOAD 16 int16 with de-interleave (4-way) ────────────────────────────
+	// VLD4 .4H: V_k.lane[j] = in[j*4+k] for k,j in [0..3].
+	// So V0=(in[0],in[4],in[8],in[12]), V1=(in[1],...,in[13]),
+	//    V2=(in[2],in[6],in[10],in[14]), V3=(in[3],in[7],in[11],in[15]).
+	VLD4    (R0), [V0.H4, V1.H4, V2.H4, V3.H4]
+
+	// ── PASS 1 in int16 ─────────────────────────────────────────────────────
+	// a0 = V0 + V2 → V4 ;  a1 = V1 + V3 → V5
+	// a2 = V1 - V3 → V6 ;  a3 = V0 - V2 → V7
+	VADD    V2.H4, V0.H4, V4.H4
+	VADD    V3.H4, V1.H4, V5.H4
+	VSUB    V3.H4, V1.H4, V6.H4
+	VSUB    V2.H4, V0.H4, V7.H4
+
+	// tmp_p0 = a0+a1 → V8
+	// tmp_p1 = a3+a2 → V9
+	// tmp_p2 = a3-a2 → V10
+	// tmp_p3 = a0-a1 → V11
+	VADD    V5.H4, V4.H4, V8.H4
+	VADD    V6.H4, V7.H4, V9.H4
+	VSUB    V6.H4, V7.H4, V10.H4
+	VSUB    V5.H4, V4.H4, V11.H4
+
+	// ── 4×4 INT16 TRANSPOSE (col-vectors → row-vectors of tmp) ──────────────
+	// Round 1 (TRN.4H on adjacent pairs):
+	//   V12 = TRN1.4H V8, V9   = (V8[0],V9[0], V8[2],V9[2])
+	//   V13 = TRN2.4H V8, V9   = (V8[1],V9[1], V8[3],V9[3])
+	//   V14 = TRN1.4H V10, V11 = (V10[0],V11[0], V10[2],V11[2])
+	//   V15 = TRN2.4H V10, V11 = (V10[1],V11[1], V10[3],V11[3])
+	WORD    $0x0E49290C   // TRN1 V12.4H, V8.4H, V9.4H    (Rm=9, Rn=8, Rd=12)
+	WORD    $0x0E49690D   // TRN2 V13.4H, V8.4H, V9.4H    (Rm=9, Rn=8, Rd=13)
+	WORD    $0x0E4B294E   // TRN1 V14.4H, V10.4H, V11.4H  (Rm=11, Rn=10, Rd=14)
+	WORD    $0x0E4B694F   // TRN2 V15.4H, V10.4H, V11.4H  (Rm=11, Rn=10, Rd=15)
+
+	// Round 2 (TRN.2S — treat 32-bit pairs in 64-bit registers):
+	//   V16 = TRN1.2S V12, V14 = (V12[0..31], V14[0..31])
+	//        = ((V8[0],V9[0]), (V10[0],V11[0]))
+	//        = (tmp[0+0*4], tmp[1+0*4], tmp[2+0*4], tmp[3+0*4]) = tmp ROW 0
+	//   V17 = TRN2.2S V12, V14 = ((V8[2],V9[2]), (V10[2],V11[2])) = tmp ROW 2
+	//   V18 = TRN1.2S V13, V15 = ((V8[1],V9[1]), (V10[1],V11[1])) = tmp ROW 1
+	//   V19 = TRN2.2S V13, V15 = ((V8[3],V9[3]), (V10[3],V11[3])) = tmp ROW 3
+	WORD    $0x0E8E2990   // TRN1 V16.2S, V12.2S, V14.2S  (Rm=14, Rn=12, Rd=16)
+	WORD    $0x0E8E6991   // TRN2 V17.2S, V12.2S, V14.2S  (Rm=14, Rn=12, Rd=17)
+	WORD    $0x0E8F29B2   // TRN1 V18.2S, V13.2S, V15.2S  (Rm=15, Rn=13, Rd=18)
+	WORD    $0x0E8F69B3   // TRN2 V19.2S, V13.2S, V15.2S  (Rm=15, Rn=13, Rd=19)
+
+	// After round 2: V16=row0, V18=row1, V17=row2, V19=row3 (int16x4 each).
+
+	// ── WIDEN TO INT32 ──────────────────────────────────────────────────────
+	// SXTL Vd.4S, Vn.4H : V20 = row0_i32, V21 = row1_i32, V22 = row2_i32, V23 = row3_i32
+	WORD    $0x0F10A614   // SXTL V20.4S, V16.4H  (Rn=16, Rd=20)
+	WORD    $0x0F10A655   // SXTL V21.4S, V18.4H  (Rn=18, Rd=21)
+	WORD    $0x0F10A636   // SXTL V22.4S, V17.4H  (Rn=17, Rd=22)
+	WORD    $0x0F10A677   // SXTL V23.4S, V19.4H  (Rn=19, Rd=23)
+
+	// ── PASS 2 in int32 ─────────────────────────────────────────────────────
+	// Now V20 = tmp_row0, V21 = tmp_row1, V22 = tmp_row2, V23 = tmp_row3.
+	// Scalar pass 2 reads: a0 = tmp[0+i] + tmp[8+i] = tmp_row0[i] + tmp_row2[i]
+	//                       a1 = tmp[4+i] + tmp[12+i] = tmp_row1[i] + tmp_row3[i]
+	//                       a2 = tmp_row1[i] - tmp_row3[i]
+	//                       a3 = tmp_row0[i] - tmp_row2[i]
+	VADD    V22.S4, V20.S4, V24.S4   // V24 = a0 = row0 + row2
+	VADD    V23.S4, V21.S4, V25.S4   // V25 = a1 = row1 + row3
+	VSUB    V23.S4, V21.S4, V26.S4   // V26 = a2 = row1 - row3
+	VSUB    V22.S4, V20.S4, V27.S4   // V27 = a3 = row0 - row2
+
+	// b0 = (a0+a1) >> 1 → V28 ;  b1 = (a3+a2) >> 1 → V29
+	// b2 = (a3-a2) >> 1 → V30 ;  b3 = (a0-a1) >> 1 → V31
+	VADD    V25.S4, V24.S4, V28.S4   // V28 = a0 + a1
+	VADD    V26.S4, V27.S4, V29.S4   // V29 = a3 + a2
+	VSUB    V26.S4, V27.S4, V30.S4   // V30 = a3 - a2
+	VSUB    V25.S4, V24.S4, V31.S4   // V31 = a0 - a1
+
+	// SSHR by #1 (signed arithmetic right shift, per int32 lane)
+	WORD    $0x4F3F079C   // SSHR V28.4S, V28.4S, #1
+	WORD    $0x4F3F07BD   // SSHR V29.4S, V29.4S, #1
+	WORD    $0x4F3F07DE   // SSHR V30.4S, V30.4S, #1
+	WORD    $0x4F3F07FF   // SSHR V31.4S, V31.4S, #1
+
+	// ── NARROW int32 → int16 ────────────────────────────────────────────────
+	// b_r is row r of output (lane c = out[r*4+c]).
+	// XTN Vd.4H, Vn.4S : narrow int32x4 → int16x4 (low 16 bits, no saturation).
+	WORD    $0x0E612B94   // XTN V20.4H, V28.4S  (Rn=28, Rd=20)
+	WORD    $0x0E612BB5   // XTN V21.4H, V29.4S  (Rn=29, Rd=21)
+	WORD    $0x0E612BD6   // XTN V22.4H, V30.4S  (Rn=30, Rd=22)
+	WORD    $0x0E612BF7   // XTN V23.4H, V31.4S  (Rn=31, Rd=23)
+
+	// ── STORE 4 × int16x4 = 32 bytes to out ─────────────────────────────────
+	// V20=out_row0, V21=out_row1, V22=out_row2, V23=out_row3 → contiguous.
+	VST1    [V20.H4, V21.H4, V22.H4, V23.H4], (R1)
+
+	RET

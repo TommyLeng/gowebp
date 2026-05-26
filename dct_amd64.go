@@ -16,3 +16,15 @@ package gowebp
 //
 //go:noescape
 func fTransform(src []int16, ref []int16, out []int16)
+
+// fTransformWHT computes the 4x4 Walsh-Hadamard Transform on the 16 DC values.
+// in[16] are the DC values from each 4x4 block's DCT output (one per block),
+// laid out row-major (in[r*4+c] = DC of block at row r, col c).
+// out[16] receives the WHT coefficients in the same layout.
+//
+// SSE2 implementation in dct_amd64.s. Mirrors FTransformWHT_SSE2 in libwebp.
+// Strategy: load each row as int16x4, accumulate via PUNPCK + PADDSW/PSUBSW
+// rotations, then narrow with PACKSSDW and PSRAW #1.
+//
+//go:noescape
+func fTransformWHT(in []int16, out []int16)

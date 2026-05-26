@@ -339,3 +339,193 @@ TEXT ·fTransform(SB),NOSPLIT,$64-72
 	MOVQ    X11, 24(SI)            // out[12..15]
 
 	RET
+
+// func fTransformWHT(in []int16, out []int16)
+//
+// Computes the 4×4 Walsh-Hadamard Transform on the 16 DC coefficients.
+// Pass 1 in int16 (input is 12b → tmp is 14b, fits int16).
+// Pass 2 widens to int32 (because b0..b3 reach 16-bit values that don't fit
+// signed int16), shifts >>1, then narrows via PACKSSDW (values fit, so the
+// saturation is a no-op).
+//
+// Stack convention (FP-based, NOSPLIT $0):
+//   in_base+0(FP), out_base+24(FP)
+//
+// Layout (4×4 row-major):
+//   in[0..3]   = row 0
+//   in[4..7]   = row 1
+//   in[8..11]  = row 2
+//   in[12..15] = row 3
+//
+// Strategy:
+//   1. Load 16 int16 = 32 bytes as 2 XMM (X0=rows0&1, X1=rows2&3).
+//   2. 4×4 int16 transpose via PUNPCKLWD/PUNPCKHWD to obtain c01 = (col0|col1)
+//      and c23 = (col2|col3) packed across 8 lanes.
+//   3. Pass 1 across columns (4 in parallel):
+//        a0a1 = c01 + c23 = (a0|a1)
+//        a3a2 = c01 - c23 = (a3|a2)
+//      then horizontal butterfly within each 64-bit half to get
+//      tmp_p0..tmp_p3 (col-vectors of tmp, each 4 int16 in low 64).
+//   4. Transpose 4 col-vectors → 4 row-vectors of tmp via PUNPCKLWD + PUNPCKLDQ.
+//   5. Widen each row-vector to int32x4 via PUNPCKLWD-with-self + PSRAD #16.
+//   6. Pass 2 in int32: a0..a3 then b0..b3 = (a0+a1, a3+a2, a3-a2, a0-a1).
+//   7. PSRAD #1 to get >>1; PACKSSDW narrows pairs (b0,b1) and (b2,b3) to int16x8.
+//   8. Store 2 × MOVOU = 32 bytes.
+//
+// Register map:
+//   AX = in.ptr
+//   DI = out.ptr
+//   X0 = rows 0,1 then a0a1 (pass 1 packed) then... reused
+//   X1 = rows 2,3 then a3a2 (pass 1 packed) then... reused
+//   X2..X5  = transpose / pass-1 scratch
+//   X6..X9  = tmp col-vectors (p0..p3), then row-vectors after re-transpose
+//   X10..X13 = pass-2 row-vectors as int32x4
+//   X14     = a/b scratch
+//   X15     = b3 (final)
+
+TEXT ·fTransformWHT(SB),NOSPLIT,$0-48
+	MOVQ    in_base+0(FP), AX
+	MOVQ    out_base+24(FP), DI
+
+	// ── LOAD 16 int16 = 32 bytes ────────────────────────────────────────────
+	MOVOU    0(AX), X0   // X0 = rows 0,1 = (r0[0..3], r1[0..3]) as 8 int16
+	MOVOU   16(AX), X1   // X1 = rows 2,3 = (r2[0..3], r3[0..3])
+
+	// ── 4×4 int16 TRANSPOSE: rows → (col0|col1), (col2|col3) ────────────────
+	// Goal: c01 = (c0[0..3] | c1[0..3]), c23 = (c2[0..3] | c3[0..3])
+	// where ck[r] = M[r][k] (i.e., col k value of row r).
+	//
+	// Step 1: interleave rows 0 with 2 and rows 1 with 3.
+	//   t0 = PUNPCKLWD(X0, X1)
+	//     PUNPCKLWD interleaves the LOW 64 bits: src0.lane[0..3] with src1.lane[0..3].
+	//     X0 low 64 = r0 = (r0[0..3]); X1 low 64 = r2 = (r2[0..3]).
+	//     t0 = (r0[0], r2[0], r0[1], r2[1], r0[2], r2[2], r0[3], r2[3])
+	//   t1 = PUNPCKHWD(X0, X1)
+	//     X0 high 64 = r1; X1 high 64 = r3.
+	//     t1 = (r1[0], r3[0], r1[1], r3[1], r1[2], r3[2], r1[3], r3[3])
+	MOVO    X0, X2
+	PUNPCKLWL X1, X2                // X2 = t0 = (r0,r2 interleaved at 16-bit)
+	MOVO    X0, X3
+	PUNPCKHWL X1, X3                // X3 = t1 = (r1,r3 interleaved)
+
+	// Step 2: interleave t0 with t1 to get c01 and c23.
+	//   c01 = PUNPCKLWD(t0, t1)
+	//     Low 64: (t0[0], t1[0], t0[1], t1[1]) = (r0[0], r1[0], r2[0], r3[0]) = c0
+	//     High 64: (t0[2], t1[2], t0[3], t1[3]) = (r0[1], r1[1], r2[1], r3[1]) = c1
+	//   c23 = PUNPCKHWD(t0, t1)
+	//     Low 64: (t0[4], t1[4], t0[5], t1[5]) = (r0[2], r1[2], r2[2], r3[2]) = c2
+	//     High 64: (r0[3], r1[3], r2[3], r3[3]) = c3
+	MOVO    X2, X4
+	PUNPCKLWL X3, X4                // X4 = c01 = (c0 | c1)
+	MOVO    X2, X5
+	PUNPCKHWL X3, X5                // X5 = c23 = (c2 | c3)
+
+	// ── PASS 1 (int16, 4 columns in parallel, packed in 8-lane XMMs) ────────
+	// a0a1 = c01 + c23 = (c0+c2 | c1+c3) = (a0 | a1)
+	// a3a2 = c01 - c23 = (c0-c2 | c1-c3) = (a3 | a2)
+	MOVO    X4, X0
+	PADDW   X5, X0                  // X0 = a0a1
+	MOVO    X4, X1
+	PSUBW   X5, X1                  // X1 = a3a2
+
+	// We need 4 col-vectors of tmp: p0, p1, p2, p3 (4 int16 each in low 64).
+	// p0 = a0+a1, p1 = a3+a2, p2 = a3-a2, p3 = a0-a1.
+	//
+	// X0 = (a0 | a1). PSHUFD $0x4E swaps 64-bit halves → (a1 | a0).
+	// (X0 + swap(X0)) low 64 = a0+a1 = p0.
+	// (X0 - swap(X0)) low 64 = a0-a1 = p3.
+	PSHUFD  $0x4E, X0, X2           // X2 = (a1 | a0)
+	MOVO    X0, X6
+	PADDW   X2, X6                  // X6 low 64 = a0+a1 = p0 ; high = a1+a0 = p0 (also)
+	MOVO    X0, X9
+	PSUBW   X2, X9                  // X9 low 64 = a0-a1 = p3
+
+	// X1 = (a3 | a2). swap = (a2 | a3).
+	// (X1 + swap) low 64 = a3+a2 = p1.
+	// (X1 - swap) low 64 = a3-a2 = p2.
+	PSHUFD  $0x4E, X1, X3
+	MOVO    X1, X7
+	PADDW   X3, X7                  // X7 low 64 = p1
+	MOVO    X1, X8
+	PSUBW   X3, X8                  // X8 low 64 = p2
+
+	// X6=p0, X7=p1, X8=p2, X9=p3 — col-vectors of tmp (each in low 64 = 4 int16).
+
+	// ── TRANSPOSE 4 col-vectors → 4 row-vectors ─────────────────────────────
+	// q01 = PUNPCKLWD(p0, p1) = (p0[0], p1[0], p0[1], p1[1], p0[2], p1[2], p0[3], p1[3])
+	// q23 = PUNPCKLWD(p2, p3) = (p2[0], p3[0], p2[1], p3[1], p2[2], p3[2], p2[3], p3[3])
+	PUNPCKLWL X7, X6                // X6 = q01
+	PUNPCKLWL X9, X8                // X8 = q23
+
+	// row01 = PUNPCKLDQ(q01, q23):
+	//   Low 64: q01 dword 0 (= (p0[0], p1[0])) + q23 dword 0 (= (p2[0], p3[0]))
+	//           = (p0[0], p1[0], p2[0], p3[0]) = ROW 0
+	//   High 64: q01 dword 1 + q23 dword 1 = (p0[1], p1[1], p2[1], p3[1]) = ROW 1
+	// row23 = PUNPCKHDQ(q01, q23):
+	//   Low 64: q01 dword 2 + q23 dword 2 = (p0[2], p1[2], p2[2], p3[2]) = ROW 2
+	//   High 64: q01 dword 3 + q23 dword 3 = (p0[3], p1[3], p2[3], p3[3]) = ROW 3
+	MOVO    X6, X2
+	PUNPCKLLQ X8, X2                // X2 = (ROW 0 | ROW 1)
+	MOVO    X6, X3
+	PUNPCKHLQ X8, X3                // X3 = (ROW 2 | ROW 3)
+
+	// ── WIDEN TO INT32 ─────────────────────────────────────────────────────
+	// PUNPCKLWD(X2, X2) duplicates each int16 lane: (a, a, b, b, c, c, d, d).
+	// As int32 view: lane k = (a_k << 16) | a_k (where a_k is uint16).
+	// PSRAD #16 arithmetic-shifts each int32 lane right by 16 → sign-extends
+	// the int16 to int32. So PUNPCKLWD-with-self + PSRAD #16 = sign-extend
+	// low half (lanes 0..3 = ROW 0) to int32x4.
+	// PUNPCKHWD-with-self + PSRAD #16 = sign-extend high half (ROW 1) to int32x4.
+	MOVO    X2, X10                 // row 0
+	PUNPCKLWL X10, X10
+	PSRAL   $16, X10                // X10 = row0 as int32x4
+	MOVO    X2, X11                 // row 1
+	PUNPCKHWL X11, X11
+	PSRAL   $16, X11                // X11 = row1 as int32x4
+	MOVO    X3, X12                 // row 2
+	PUNPCKLWL X12, X12
+	PSRAL   $16, X12                // X12 = row2 as int32x4
+	MOVO    X3, X13                 // row 3
+	PUNPCKHWL X13, X13
+	PSRAL   $16, X13                // X13 = row3 as int32x4
+
+	// ── PASS 2 in int32 ────────────────────────────────────────────────────
+	// a0 = row0 + row2, a1 = row1 + row3, a2 = row1 - row3, a3 = row0 - row2
+	MOVO    X10, X4
+	PADDL   X12, X4                 // X4 = a0
+	MOVO    X11, X5
+	PADDL   X13, X5                 // X5 = a1
+	MOVO    X11, X14
+	PSUBL   X13, X14                // X14 = a2
+	MOVO    X10, X15
+	PSUBL   X12, X15                // X15 = a3
+
+	// b0 = (a0+a1)>>1, b1 = (a3+a2)>>1, b2 = (a3-a2)>>1, b3 = (a0-a1)>>1
+	MOVO    X4, X10                 // X10 = a0
+	PADDL   X5, X10                 // X10 = a0 + a1
+	MOVO    X15, X11                // X11 = a3
+	PADDL   X14, X11                // X11 = a3 + a2
+	MOVO    X15, X12                // X12 = a3
+	PSUBL   X14, X12                // X12 = a3 - a2
+	MOVO    X4, X13                 // X13 = a0
+	PSUBL   X5, X13                 // X13 = a0 - a1
+
+	PSRAL   $1, X10                 // X10 = b0
+	PSRAL   $1, X11                 // X11 = b1
+	PSRAL   $1, X12                 // X12 = b2
+	PSRAL   $1, X13                 // X13 = b3
+
+	// ── NARROW int32 → int16 with saturation (values fit, no clipping) ─────
+	// PACKSSDW packs 2 int32x4 → int16x8.
+	// Plan9 "PACKSSLW src, dst" = Intel PACKSSDW(dst, src):
+	//   dst = (sat16(dst[0..3]), sat16(src[0..3]))
+	// So PACKSSLW X11, X10 → X10 = (b0[0..3], b1[0..3]) as int16x8.
+	// We want out[0..7] = b0 then b1, so this is correct.
+	PACKSSLW X11, X10               // X10 = (b0 int16 | b1 int16)
+	PACKSSLW X13, X12               // X12 = (b2 int16 | b3 int16)
+
+	// ── STORE 32 bytes ─────────────────────────────────────────────────────
+	MOVOU   X10, 0(DI)               // out[0..7]
+	MOVOU   X12, 16(DI)              // out[8..15]
+
+	RET
