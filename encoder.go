@@ -250,7 +250,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					// the pixel plane (yuv.y) and the prediction buffer (ws.mbI16Pred).
 					// This eliminates the ws.i16Src4/ws.i16Pred4 extraction loops.
 					fTransform2Plane(yuv.y, yuv.yStride, px+bx*4, py+by*4,
-						ws.mbI16Pred[:], 16, ws.dctPair[:])
+						ws.mbI16Pred[by*4*16:], 16, ws.dctPair[:])
 					ws.yDcRaw16[n0] = ws.dctPair[0]
 					ws.dctPair[0] = 0
 					trellisQuantize(ws.dctPair[0:16], ws.mbI16AcLevels[n0][:], &qm.y1, 1, mbLambdaTrellisI16, trellisI16Costs,
@@ -709,7 +709,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					bn0 := ch*4 + by*2
 					bn1 := ch*4 + by*2 + 1
 					fTransform2Plane(plane, yuv.uvStride, mbX*8, mbY*8+by*4,
-						predSlice, 8, ws.dctPair[:])
+						predSlice[by*4*8:], 8, ws.dctPair[:])
 					trellisQuantize(ws.dctPair[0:16], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
 						uvProbsPtr, 0)
 					ws.uvLevels[bn0] = ws.uvQuant
