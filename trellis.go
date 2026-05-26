@@ -76,9 +76,15 @@ var vp8LevelCodes = [maxVariableLevel][2]uint16{
 
 // trellisCostTables holds precomputed level cost tables for one coefficient type.
 // Indexed [band][ctx][level] where level ranges 0..maxVariableLevel.
-// table[band][ctx][v] = variable-cost of emitting level v in context (band, ctx).
-// Total level cost = vp8LevelFixedCosts[level] + table[band][ctx][min(level,67)].
-type trellisCostTables [numBands][numCtx][maxVariableLevel + 1]int16
+// table.level[band][ctx][v] = variable-cost of emitting level v in context (band, ctx).
+// Total level cost = vp8LevelFixedCosts[level] + table.level[band][ctx][min(level,67)].
+// table.eob[band][ctx] = VP8BitCost(0, probs[band][ctx][0]) — the EOB bit cost at
+// (band, ctx). Precomputed here so the Viterbi terminal-state check avoids cold
+// 4D-array dereferences through the probs pointer on every non-zero level.
+type trellisCostTables struct {
+	level [numBands][numCtx][maxVariableLevel + 1]int16
+	eob   [numBands][numCtx]int32
+}
 
 // buildTrellisCostTables precomputes all level cost tables from a coefficient
 // probability table. Mirrors VP8CalculateLevelCosts() in libwebp.
@@ -91,12 +97,14 @@ func buildTrellisCostTables(probs *[numBands][numCtx][numProbas]uint8) trellisCo
 			if ctx > 0 {
 				cost0 = vp8BitCost(1, int(p[0]))
 			}
+			// EOB cost: probability of "no more non-zero coefficients" = probs[band][ctx][0].
+			tables.eob[band][ctx] = int32(vp8BitCost(0, int(p[0])))
 			// Level 0: emit the "non-zero = 0" bit.
-			tables[band][ctx][0] = int16(vp8BitCost(0, int(p[1])) + cost0)
+			tables.level[band][ctx][0] = int16(vp8BitCost(0, int(p[1])) + cost0)
 			// Levels 1..maxVariableLevel: non-zero + variable coding.
 			costBase := vp8BitCost(1, int(p[1])) + cost0
 			for v := 1; v <= maxVariableLevel; v++ {
-				tables[band][ctx][v] = int16(costBase + variableLevelCost(v, p))
+				tables.level[band][ctx][v] = int16(costBase + variableLevelCost(v, p))
 			}
 		}
 	}
@@ -142,6 +150,12 @@ type trellisNode struct {
 // maxCost is a sentinel "infinity" score for dead DP states.
 const maxCost = int64(1) << 50
 
+// zeroCostTable is a dummy all-zero level-cost table used as a sentinel for
+// dead DP states or positions past n=15. Using a pointer to this instead of
+// nil avoids nil-pointer branches in the hot inner loop — dead states are
+// gated exclusively by score >= maxCost.
+var zeroCostTable [maxVariableLevel + 1]int16
+
 // trellisQuantize applies trellis quantization to a 4x4 DCT block.
 //
 // Parameters:
@@ -167,9 +181,6 @@ func trellisQuantize(
 	probs *[numBands][numCtx][numProbas]uint8,
 	ctx0 int,
 ) bool {
-	// We test candidates: level0 and level0+1 (MIN_DELTA=0, MAX_DELTA=1 → 2 nodes).
-	const numNodes = 2
-
 	// scoreState holds the accumulated RD score and the cost table pointer
 	// for the CURRENT position. When this becomes ss_prev, we use its table
 	// to compute the cost of emitting the level at the next position.
@@ -179,22 +190,26 @@ func trellisQuantize(
 	// in the Viterbi DP inner loop.
 	type scoreState struct {
 		score int64
-		costs *[maxVariableLevel + 1]int16 // nil if dead
+		costs *[maxVariableLevel + 1]int16
 	}
 
-	var nodes [16][numNodes]trellisNode
-	var ss [2][numNodes]scoreState
+	var nodes [16][2]trellisNode
+	var ss [2][2]scoreState
 	curIdx := 0
 	prevIdx := 1
 
 	// Determine the last interesting coefficient position.
-	// Skip trailing positions where coeff^2 <= q[1]^2/4 (libwebp's early-exit).
-	thresh := int32(m.q[1]) * int32(m.q[1]) / 4
+	// Use per-position zthresh: any trailing coeff with |coeff| <= zthresh[j]
+	// will always quantize to zero regardless of trellis, so skip it.
+	// This is tighter than the old q[1]^2/4 fixed threshold.
 	last := first - 1
 	for n := 15; n >= first; n-- {
 		j := int(kZigzag[n])
-		err := int32(in[j]) * int32(in[j])
-		if err > thresh {
+		v := int32(in[j])
+		if v < 0 {
+			v = -v
+		}
+		if uint32(v) > m.zthresh[j] {
 			last = n
 			break
 		}
@@ -224,25 +239,31 @@ func trellisQuantize(
 	}
 
 	// "Skip all" baseline: cost of emitting EOB at the start (all-zero block).
-	// = VP8BitCost(0, probs[firstBand][ctx0][0]) * lambda
+	// costs.eob[band][ctx] = VP8BitCost(0, probs[band][ctx][0]) — precomputed at
+	// segment setup time, so no cold 4D-array access here.
 	firstBand := int(vp8EncBands[first])
-	lastProba := int(probs[firstBand][ctx0][0])
-	skipCost := int64(vp8BitCost(0, lastProba)) * int64(lambda)
+	skipCost := int64(costs.eob[firstBand][ctx0]) * int64(lambda)
 	bestScore := skipCost
 
 	// Initialize source nodes.
 	// ss[cur][m].costs = cost table for position `first` with context ctx0.
 	// In libwebp: rate = (ctx0 == 0) ? VP8BitCost(1, last_proba) : 0
 	// because for ctx0==0 the "non-zero" flag is not part of the level cost table.
-	initTable := &costs[firstBand][ctx0]
+	initTable := &costs.level[firstBand][ctx0]
 	initRate := int64(0)
 	if ctx0 == 0 {
+		// eob[band][ctx] = VP8BitCost(0, p[0]); the non-zero flag is
+		// VP8BitCost(1, p[0]) = vp8EntropyCost[255 - p[0]].
+		// We compute it from the eob cost using the identity:
+		//   VP8BitCost(1, p) = vp8EntropyCost[255-p]
+		// but it's simpler to keep a direct lookup.
+		lastProba := int(probs[firstBand][ctx0][0])
 		initRate = int64(vp8BitCost(1, lastProba)) * int64(lambda)
 	}
-	for m2 := 0; m2 < numNodes; m2++ {
-		ss[curIdx][m2].score = initRate
-		ss[curIdx][m2].costs = initTable
-	}
+	ss[curIdx][0].score = initRate
+	ss[curIdx][0].costs = initTable
+	ss[curIdx][1].score = initRate
+	ss[curIdx][1].costs = initTable
 
 	// bestPath[0]=best end pos, [1]=best node idx, [2]=best prev idx
 	bestPath := [3]int{-1, -1, -1}
@@ -252,8 +273,8 @@ func trellisQuantize(
 	// independently and avoids redundant field loads inside the inner loop.
 	const neutralBias = uint32(0)
 	biasHalf := uint32(0x80) << (qfix - 8) // BIAS(0x80)
-	var lvl0 [16]int    // floor level (no rounding bias)
-	var lvlMax [16]int  // threshold level (0.5 bias; candidates pruned above this)
+	var lvl0 [16]int   // floor level (no rounding bias)
+	var lvlMax [16]int // threshold level (0.5 bias; candidates pruned above this)
 	for n := first; n <= last; n++ {
 		j := int(kZigzag[n])
 		iQ := uint32(m.iq[j])
@@ -277,6 +298,8 @@ func trellisQuantize(
 		lvlMax[n] = lMax
 	}
 
+	iLambda := int64(lambda)
+
 	for n := first; n <= last; n++ {
 		j := int(kZigzag[n])
 		Q := int32(m.q[j])
@@ -297,75 +320,134 @@ func trellisQuantize(
 		level0 := lvl0[n]
 		threshLevel := lvlMax[n]
 
+		// Precompute nextBand for this position — same for both m2 nodes.
+		nextBand := int(vp8EncBands[n+1]) // sentinel at 16 is 0, harmless
+
 		// Swap cur ↔ prev.
 		curIdx, prevIdx = prevIdx, curIdx
 
-		for m2 := 0; m2 < numNodes; m2++ {
-			level := level0 + m2
+		// Hoist values shared by both m2=0 and m2=1 bodies.
+		wt := int64(kWeightTrellis[j])
+		coeff0sq := int64(coeff0) * int64(coeff0)
+		notLast := n < 15 // whether an EOB flag is needed after this position
+		prev0 := &ss[prevIdx][0]
+		prev1 := &ss[prevIdx][1]
 
-			// Prune dead candidates.
-			if level < 0 || level > threshLevel {
-				ss[curIdx][m2].score = maxCost
-				ss[curIdx][m2].costs = nil
-				continue
-			}
+		// ── m2 = 0: level = level0 ────────────────────────────────────────────
+		{
+			level := level0
+			if level >= 0 && level <= threshLevel {
+				ctx := level
+				if ctx > 2 {
+					ctx = 2
+				}
+				var nextCosts *[maxVariableLevel + 1]int16
+				if notLast {
+					nextCosts = &costs.level[nextBand][ctx]
+				} else {
+					nextCosts = &zeroCostTable
+				}
+				ss[curIdx][0].costs = nextCosts
 
-			// Context produced by this level for the next position.
-			ctx := level
-			if ctx > 2 {
-				ctx = 2
-			}
-			nextBand := int(vp8EncBands[n+1]) // sentinel at 16 is 0, harmless
-			if n+1 < 16 {
-				ss[curIdx][m2].costs = &costs[nextBand][ctx]
+				newErr := coeff0 - int32(level)*Q
+				baseScore := wt*(int64(newErr)*int64(newErr)-coeff0sq)*rdDistoMult
+
+				bestCurScore := maxCost
+				bestPrev := 0
+				if prev0.score < maxCost {
+					s := prev0.score + int64(levelCostFromTable(prev0.costs, level))*iLambda
+					if s < bestCurScore {
+						bestCurScore = s
+					}
+				}
+				if prev1.score < maxCost {
+					s := prev1.score + int64(levelCostFromTable(prev1.costs, level))*iLambda
+					if s < bestCurScore {
+						bestCurScore = s
+						bestPrev = 1
+					}
+				}
+				bestCurScore += baseScore
+
+				nodes[n][0].sign = sign
+				nodes[n][0].level = int16(level)
+				nodes[n][0].prev = int8(bestPrev)
+				ss[curIdx][0].score = bestCurScore
+
+				if level != 0 && bestCurScore < maxCost {
+					eobLC := int64(0)
+					if notLast {
+						eobLC = int64(costs.eob[nextBand][ctx]) * iLambda
+					}
+					if tot := bestCurScore + eobLC; tot < bestScore {
+						bestScore = tot
+						bestPath[0] = n
+						bestPath[1] = 0
+						bestPath[2] = bestPrev
+					}
+				}
 			} else {
-				ss[curIdx][m2].costs = nil
+				ss[curIdx][0].score = maxCost
+				ss[curIdx][0].costs = &zeroCostTable
 			}
+		}
 
-			// Distortion: kWeightTrellis[j] * ((coeff0 - level*Q)^2 - coeff0^2).
-			newErr := coeff0 - int32(level)*Q
-			deltaError := int64(kWeightTrellis[j]) * (int64(newErr)*int64(newErr) - int64(coeff0)*int64(coeff0))
-			baseScore := deltaError * rdDistoMult
+		// ── m2 = 1: level = level0 + 1 ───────────────────────────────────────
+		{
+			level := level0 + 1
+			if level >= 0 && level <= threshLevel {
+				ctx := level
+				if ctx > 2 {
+					ctx = 2
+				}
+				var nextCosts *[maxVariableLevel + 1]int16
+				if notLast {
+					nextCosts = &costs.level[nextBand][ctx]
+				} else {
+					nextCosts = &zeroCostTable
+				}
+				ss[curIdx][1].costs = nextCosts
 
-			// Find best predecessor: iterate over prev nodes, look up the cost
-			// of emitting `level` using ss_prev[p].costs (= cost table for position n).
-			bestCurScore := maxCost
-			bestPrev := 0
-			for p2 := 0; p2 < numNodes; p2++ {
-				prev := &ss[prevIdx][p2]
-				if prev.score >= maxCost || prev.costs == nil {
-					continue
-				}
-				cost := levelCostFromTable(prev.costs, level)
-				score := prev.score + int64(cost)*int64(lambda)
-				if score < bestCurScore {
-					bestCurScore = score
-					bestPrev = p2
-				}
-			}
-			bestCurScore += baseScore
+				newErr := coeff0 - int32(level)*Q
+				baseScore := wt*(int64(newErr)*int64(newErr)-coeff0sq)*rdDistoMult
 
-			nodes[n][m2].sign = sign
-			nodes[n][m2].level = int16(level)
-			nodes[n][m2].prev = int8(bestPrev)
-			ss[curIdx][m2].score = bestCurScore
+				bestCurScore := maxCost
+				bestPrev := 0
+				if prev0.score < maxCost {
+					s := prev0.score + int64(levelCostFromTable(prev0.costs, level))*iLambda
+					if s < bestCurScore {
+						bestCurScore = s
+					}
+				}
+				if prev1.score < maxCost {
+					s := prev1.score + int64(levelCostFromTable(prev1.costs, level))*iLambda
+					if s < bestCurScore {
+						bestCurScore = s
+						bestPrev = 1
+					}
+				}
+				bestCurScore += baseScore
 
-			// Check if this is a better terminal state (this position is last non-zero).
-			if level != 0 && bestCurScore < maxCost {
-				// Cost of EOB after position n: VP8BitCost(0, probs[nextBand][ctx][0]).
-				var lastPosCost int64
-				if n < 15 {
-					nextBand := int(vp8EncBands[n+1])
-					eobProba := int(probs[nextBand][ctx][0])
-					lastPosCost = int64(vp8BitCost(0, eobProba)) * int64(lambda)
+				nodes[n][1].sign = sign
+				nodes[n][1].level = int16(level)
+				nodes[n][1].prev = int8(bestPrev)
+				ss[curIdx][1].score = bestCurScore
+
+				if level != 0 && bestCurScore < maxCost {
+					eobLC := int64(0)
+					if notLast {
+						eobLC = int64(costs.eob[nextBand][ctx]) * iLambda
+					}
+					if tot := bestCurScore + eobLC; tot < bestScore {
+						bestScore = tot
+						bestPath[0] = n
+						bestPath[1] = 1
+						bestPath[2] = bestPrev
+					}
 				}
-				totalScore := bestCurScore + lastPosCost
-				if totalScore < bestScore {
-					bestScore = totalScore
-					bestPath[0] = n
-					bestPath[1] = m2
-					bestPath[2] = bestPrev
-				}
+			} else {
+				ss[curIdx][1].score = maxCost
+				ss[curIdx][1].costs = &zeroCostTable
 			}
 		}
 	}

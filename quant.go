@@ -220,6 +220,10 @@ func quantizeBlock(in []int16, out []int16, m *quantMatrix, first int) bool {
 			sign = 1
 			v = -v
 		}
+		if uint32(v) <= m.zthresh[j] {
+			out[n] = 0
+			continue
+		}
 		qv := (uint32(v)*m.iq[j] + m.bias[j]) >> qfix
 		if sign != 0 {
 			out[n] = -int16(qv)
