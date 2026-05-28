@@ -243,15 +243,18 @@ func quantizeBlockWHT(in []int16, out []int16, m *quantMatrix) bool {
 	return quantizeBlock(in, out, m, 0)
 }
 
-// FLATNESS_LIMIT_I4 / FLATNESS_PENALTY: constants from libwebp/src/enc/quant_enc.c.
-// A 4×4 block is considered "flat" if it has at most flatnessLimitI4 non-zero
-// AC coefficients (DC is excluded). PickBestIntra4 adds a rate-penalty equal to
-// `flatnessPenalty * kNumBlocks` (kNumBlocks=1 for I4) to all non-DC predictions
-// whose quantized output is flat, biasing the choice toward DC_PRED in flat
-// regions.  Penalty is added to the rate term R; final score contribution is
-// `lambda * flatnessPenalty * kNumBlocks` (cf. SetRDScore in quant_enc.c).
+// FLATNESS_LIMIT_I4 / FLATNESS_LIMIT_UV / FLATNESS_PENALTY: constants from
+// libwebp/src/enc/quant_enc.c. A 4×4 block is considered "flat" if it has at
+// most flatnessLimitI4 (I4) or flatnessLimitUV (UV) non-zero AC coefficients
+// (DC is excluded). PickBestIntra4 / PickBestUV add a rate-penalty equal to
+// `flatnessPenalty * kNumBlocks` (kNumBlocks=1 for I4, 8 for UV) to all non-DC
+// predictions whose quantized output is flat, biasing the choice toward
+// DC_PRED in flat regions. Penalty is added to the rate term R; final score
+// contribution is `lambda * flatnessPenalty * kNumBlocks` (cf. SetRDScore in
+// quant_enc.c).
 const (
 	flatnessLimitI4 = 3
+	flatnessLimitUV = 2
 	flatnessPenalty = 140
 )
 
@@ -266,6 +269,25 @@ func isFlatI4Levels(levels []int16) bool {
 			score++
 			if score > flatnessLimitI4 {
 				return false
+			}
+		}
+	}
+	return true
+}
+
+// isFlatUVLevels returns true iff the 8 UV blocks (each [16]int16, levels[1..15]
+// AC) together contain at most flatnessLimitUV non-zero entries. Faithful port of
+// IsFlat() from libwebp/src/dsp/quant.h with num_blocks=8 and thresh=FLATNESS_LIMIT_UV.
+// Used by PickBestUV's flatness penalty (mirrors quant_enc.c line 1173).
+func isFlatUVLevels(uvLevels *[8][16]int16) bool {
+	score := 0
+	for blk := 0; blk < 8; blk++ {
+		for i := 1; i < 16; i++ {
+			if uvLevels[blk][i] != 0 {
+				score++
+				if score > flatnessLimitUV {
+					return false
+				}
 			}
 		}
 	}

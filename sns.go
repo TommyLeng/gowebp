@@ -37,6 +37,11 @@ const numMBSegments = 4
 // Mirrors libwebp's default behavior at method=4.
 const snsSmallImageThreshold = 500
 
+// snsStrength is the libwebp default `sns_strength` value (config->sns_strength),
+// used both for SNS power-law quantizer mapping and for tlambda computation.
+// At method ≥ 4 libwebp sets tlambda_scale = sns_strength; otherwise 0.
+const snsStrength = 50
+
 // computeMBAlphaLibwebp computes the per-MB luma alpha activity metric matching
 // libwebp's MBAnalyzeBestIntra16Mode + MBAnalyzeBestUVMode + MBAnalyze in
 // analysis_enc.c.
@@ -479,8 +484,7 @@ func computeSNS(yuv *yuvImage, mbW, mbH, baseQ int) snsResult {
 	}
 
 	const snsToDQ = 0.9
-	const snsStrength = 50.0
-	amp := snsToDQ * snsStrength / 100.0 / 128.0
+	amp := snsToDQ * float64(snsStrength) / 100.0 / 128.0
 
 	// segQKmeans[n] = quantizer index for K-means cluster n.
 	var segQKmeans [numMBSegments]int
@@ -570,6 +574,10 @@ func makeSegmentParamsFromQ(q int) segmentParams {
 	if lambdaI16 < 1 {
 		lambdaI16 = 1
 	}
+	lambdaUV := (3 * qUV * qUV) >> 6
+	if lambdaUV < 1 {
+		lambdaUV = 1
+	}
 	lambdaMode := (1 * qI4 * qI4) >> 7
 	if lambdaMode < 1 {
 		lambdaMode = 1
@@ -586,15 +594,22 @@ func makeSegmentParamsFromQ(q int) segmentParams {
 	if lambdaTrellisUV < 1 {
 		lambdaTrellisUV = 1
 	}
+	// tlambda: per-MB Hadamard texture activity weighting (libwebp method≥4 default).
+	tlambda := (snsStrength * qI4) >> 5
+	if tlambda < 1 {
+		tlambda = 1
+	}
 	return segmentParams{
 		qm:               qm,
 		baseQ:            q,
 		lambdaI4:         lambdaI4,
 		lambdaI16:        lambdaI16,
+		lambdaUV:         lambdaUV,
 		lambdaMode:       lambdaMode,
 		lambdaTrellisI4:  lambdaTrellisI4,
 		lambdaTrellisI16: lambdaTrellisI16,
 		lambdaTrellisUV:  lambdaTrellisUV,
+		tlambda:          tlambda,
 		trellisI4Costs:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])),
 		trellisI16Costs:  buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])),
 		trellisUVCosts:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])),

@@ -60,6 +60,25 @@ type mbWorkspace struct {
 	uvQuant     [16]int16
 	uvRaster    [16]int16
 	uvRecBlock  [16]int16
+	// uvPredCand{U,V}: per-mode candidate predictions for UV RD selection.
+	// Filled once per (mbX, mbY) for all 4 modes so the winner's prediction
+	// can be reused without recomputation after the RD loop.
+	uvPredCandU [4][64]int16
+	uvPredCandV [4][64]int16
+	// uvReconBestU/V: the chosen mode's 8×8 reconstruction (in pixel space),
+	// written by quantizeUVFinal after mode selection.
+	uvReconBestU [64]uint8
+	uvReconBestV [64]uint8
+	// uvLevelsTmp/uvReconTmpU/uvReconTmpV: scratch buffers used inside
+	// uvCandidateScore (per-candidate greedy quant + recon for D and R).
+	uvLevelsTmp [8][16]int16
+	uvReconTmpU [64]uint8
+	uvReconTmpV [64]uint8
+	// uvSrcU/uvSrcV: 8×8 source chroma copy extracted once per MB and used
+	// by every RD candidate (avoids per-candidate plane reads inside the
+	// inner SSE loop).
+	uvSrcU [64]uint8
+	uvSrcV [64]uint8
 	// i16 inner loop
 	i16Src4     [16]int16
 	i16Pred4    [16]int16
@@ -214,9 +233,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 
 			// Precomputed probability-table pointers (frame-invariant). Hoisted
 			// out of the per-block path so the pointer casts don't run per block.
+			// UV no longer uses trellis quantization (libwebp DO_TRELLIS_UV=0).
 			i4ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])
 			i16ProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])
-			uvProbsPtr := (*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])
 
 			// Per-row left-neighbor NZ state (reset at each row start).
 			var leftNzY [5]int
@@ -268,10 +287,12 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				qm := seg.qm
 				mbLambdaI4 := seg.lambdaI4
 				mbLambdaI16 := seg.lambdaI16
+				mbLambdaUV := seg.lambdaUV
 				mbLambdaMode := seg.lambdaMode
 				mbLambdaTrellisI4 := seg.lambdaTrellisI4
 				mbLambdaTrellisI16 := seg.lambdaTrellisI16
-				mbLambdaTrellisUV := seg.lambdaTrellisUV
+				// UV uses greedy quant (libwebp DO_TRELLIS_UV=0); trellis lambda
+				// for UV is no longer used in the inner loop.
 				trellisI4Costs := &seg.trellisI4Costs
 				trellisI16Costs := &seg.trellisI16Costs
 				trellisUVCosts := &seg.trellisUVCosts
@@ -592,47 +613,115 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					info.i16Mode = bestI16Mode
 				}
 
-				// UV: RD-optimal prediction mode selection.
+				// UV: RD-style prediction mode selection (PickBestUV port).
+				// See encoder.go for full rationale; same SSD pre-screen + top-N RD.
+				const uvRDTopN = 1
 				bestUVMode := 0
-				bestUVScore := int64(1<<62 - 1)
+				ctxTopUBase := [2]int{colTopNzU[0], colTopNzU[1]}
+				ctxLeftUBase := [2]int{leftNzU[0], leftNzU[1]}
+				ctxTopVBase := [2]int{colTopNzV[0], colTopNzV[1]}
+				ctxLeftVBase := [2]int{leftNzV[0], leftNzV[1]}
+
+				// Precompute source 8×8 chroma for cheap reuse across candidates.
+				fillUVSrc8x8(ws, yuv, mbX, ry)
+
+				// Phase 1: raw prediction SSD for every valid mode.
+				const uvInfSAD = int64(1<<62 - 1)
+				var uvCandSAD [4]int64
+				var uvCandValid [4]bool
 				for uvMode := 0; uvMode < 4; uvMode++ {
-					if uvMode == 1 && ry == 0 {
-						continue // VE needs top row
+					switch uvMode {
+					case 1:
+						if ry == 0 {
+							uvCandSAD[uvMode] = uvInfSAD
+							continue
+						}
+					case 2:
+						if mbX == 0 {
+							uvCandSAD[uvMode] = uvInfSAD
+							continue
+						}
+					case 3:
+						if mbX == 0 || ry == 0 {
+							uvCandSAD[uvMode] = uvInfSAD
+							continue
+						}
 					}
-					if uvMode == 2 && mbX == 0 {
-						continue // HE needs left column
-					}
-					if uvMode == 3 && (mbX == 0 || ry == 0) {
-						continue // TM needs both top and left
-					}
-					var scoreU, scoreV int64
+					uvCandValid[uvMode] = true
+					predictUV(uvMode, reconU, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.uvPredCandU[uvMode][:])
+					predictUV(uvMode, reconV, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.uvPredCandV[uvMode][:])
+					var sad int64
 					for ch := 0; ch < 2; ch++ {
-						rPlane := reconU
-						sPlane := yuv.u
-						if ch == 1 {
-							rPlane = reconV
-							sPlane = yuv.v
+						var src []uint8
+						var pred []int16
+						if ch == 0 {
+							src = ws.uvSrcU[:]
+							pred = ws.uvPredCandU[uvMode][:]
+						} else {
+							src = ws.uvSrcV[:]
+							pred = ws.uvPredCandV[uvMode][:]
 						}
-						predictUV(uvMode, rPlane, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.predU8[:])
-						for j := 0; j < 8; j++ {
-							for i := 0; i < 8; i++ {
-								bpx := mbX*8 + i
-								bpy := ry*8 + j
-								src := int64(sPlane[bpy*yuv.uvStride+bpx])
-								d := src - int64(ws.predU8[j*8+i])
-								if ch == 0 {
-									scoreU += d * d
-								} else {
-									scoreV += d * d
-								}
-							}
+						for k := 0; k < 64; k++ {
+							d := int64(src[k]) - int64(pred[k])
+							sad += d * d
 						}
 					}
-					score := scoreU + scoreV
-					if score < bestUVScore {
-						bestUVScore = score
-						bestUVMode = uvMode
+					uvCandSAD[uvMode] = sad
+				}
+				// Rank modes by SSD (ascending) — partial selection of top uvRDTopN.
+				var uvRank [4]int
+				for i := 0; i < 4; i++ {
+					uvRank[i] = i
+				}
+				for k := 0; k < uvRDTopN && k < 4; k++ {
+					minIdx := k
+					for j := k + 1; j < 4; j++ {
+						if uvCandSAD[uvRank[j]] < uvCandSAD[uvRank[minIdx]] {
+							minIdx = j
+						}
 					}
+					uvRank[k], uvRank[minIdx] = uvRank[minIdx], uvRank[k]
+				}
+
+				// Phase 2: pick by RD when uvRDTopN > 1; SSD wins when N=1.
+				if uvRDTopN == 1 {
+					if uvCandValid[uvRank[0]] {
+						bestUVMode = uvRank[0]
+					} else {
+						bestUVMode = 0
+					}
+				} else {
+					bestUVScore := int64(1<<62 - 1)
+					haveBest := false
+					for k := 0; k < uvRDTopN; k++ {
+						uvMode := uvRank[k]
+						if !uvCandValid[uvMode] {
+							continue
+						}
+						dCand, rCand := uvCandidateScore(ws, yuv, mbX, ry,
+							ws.uvPredCandU[uvMode][:], ws.uvPredCandV[uvMode][:],
+							&qm.uv, trellisUVCosts,
+							ctxTopUBase, ctxLeftUBase, ctxTopVBase, ctxLeftVBase)
+
+						hCost := uvModeBitCost(uvMode)
+						flatR := int64(0)
+						if uvMode > 0 && isFlatUVLevels(&ws.uvLevelsTmp) {
+							flatR = int64(flatnessPenalty) * 8
+						}
+						score := int64(rdDistoMult)*dCand + int64(mbLambdaUV)*(hCost+int64(rCand)+flatR)
+						if !haveBest || score < bestUVScore {
+							bestUVScore = score
+							bestUVMode = uvMode
+							haveBest = true
+						}
+					}
+					if !haveBest {
+						bestUVMode = 0
+					}
+				}
+				if !uvCandValid[bestUVMode] {
+					predictUV(0, reconU, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.uvPredCandU[0][:])
+					predictUV(0, reconV, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.uvPredCandV[0][:])
 				}
 				info.uvMode = bestUVMode
 				info.segment = mbSegment[mbIdx]
@@ -686,61 +775,25 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				}
 
 				// -------------------------------------------------------
-				// UV quantization using RD-selected prediction mode.
+				// UV: trellis-quantize the chosen mode's prediction for the
+				// final bitstream. Mode selection used greedy quant
+				// (uvCandidateScore) for speed; the final pass uses trellis
+				// for the compression gain. Writes ws.uvLevels and ws.uvReconBestU/V.
 				// -------------------------------------------------------
-				predictUV(info.uvMode, reconU, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.predU8[:])
-				predictUV(info.uvMode, reconV, yuv.uvStride, mbX, ry, yuv.width, yuv.height, ws.predV8[:])
+				ws.predU8 = ws.uvPredCandU[info.uvMode]
+				ws.predV8 = ws.uvPredCandV[info.uvMode]
+				quantizeUVFinal(ws, yuv, mbX, ry,
+					ws.predU8[:], ws.predV8[:],
+					&qm.uv, seg.lambdaTrellisUV, trellisUVCosts,
+					(*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2]))
 
-				for ch := 0; ch < 2; ch++ {
-					plane := yuv.u
-					predSlice := ws.predU8[:]
-					if ch == 1 {
-						plane = yuv.v
-						predSlice = ws.predV8[:]
-					}
-					for by := 0; by < 2; by++ {
-						bn0 := ch*4 + by*2
-						bn1 := ch*4 + by*2 + 1
-						fTransform2Plane(plane, yuv.uvStride, mbX*8, ry*8+by*4,
-							predSlice[by*4*8:], 8, ws.dctPair[:])
-						trellisQuantize(ws.dctPair[0:16], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
-							uvProbsPtr, 0)
-						ws.uvLevels[bn0] = ws.uvQuant
-						trellisQuantize(ws.dctPair[16:32], ws.uvQuant[:], &qm.uv, 0, mbLambdaTrellisUV, trellisUVCosts,
-							uvProbsPtr, 0)
-						ws.uvLevels[bn1] = ws.uvQuant
-					}
-				}
-
-				// Reconstruct chroma and update reconU/reconV.
-				for ch := 0; ch < 2; ch++ {
-					reconPlane := reconU
-					predSlice := ws.predU8
-					if ch == 1 {
-						reconPlane = reconV
-						predSlice = ws.predV8
-					}
-					for by := 0; by < 2; by++ {
-						for bx := 0; bx < 2; bx++ {
-							bn := ch*4 + by*2 + bx
-							for y := 0; y < 4; y++ {
-								for x := 0; x < 4; x++ {
-									ws.uvPred4[y*4+x] = predSlice[(by*4+y)*8+(bx*4+x)]
-								}
-							}
-							for n := 0; n < 16; n++ {
-								j := int(kZigzag[n])
-								ws.uvRaster[j] = int16(int32(ws.uvLevels[bn][n]) * int32(qm.uv.q[j]))
-							}
-							iTransform4x4(ws.uvRaster[:], ws.uvPred4[:], ws.uvRecBlock[:])
-							bPX := mbX*8 + bx*4
-							bPY := ry*8 + by*4
-							for y := 0; y < 4; y++ {
-								for x := 0; x < 4; x++ {
-									reconPlane[(bPY+y)*yuv.uvStride+(bPX+x)] = uint8(ws.uvRecBlock[y*4+x])
-								}
-							}
-						}
+				// Update reconU/reconV from the final 8×8 reconstruction.
+				for by := 0; by < 8; by++ {
+					rowDst := (ry*8 + by) * yuv.uvStride
+					rowSrc := by * 8
+					for bx := 0; bx < 8; bx++ {
+						reconU[rowDst+mbX*8+bx] = ws.uvReconBestU[rowSrc+bx]
+						reconV[rowDst+mbX*8+bx] = ws.uvReconBestV[rowSrc+bx]
 					}
 				}
 

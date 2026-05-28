@@ -116,3 +116,13 @@ var vp8FixedCostsI4 = [numI4Modes][numI4Modes][numI4Modes]uint16{
 		{768, 724, 1058, 636, 991, 1075, 1319, 1324, 616, 825},
 		{305, 1167, 1358, 899, 1587, 1587, 987, 1988, 1332, 501}},
 }
+
+// vp8FixedCostsUV[mode] = exact bit cost (in millibits × 1024) for encoding
+// an intra-UV chroma mode in the bitstream. Ported from
+// libwebp/src/enc/cost_enc.c — VP8FixedCostsUV[4]. Modes: DC=0, VE=1, HE=2, TM=3.
+var vp8FixedCostsUV = [4]uint16{302, 984, 439, 642}
+
+// uvModeBitCost returns the exact entropy bit cost for encoding a UV mode.
+func uvModeBitCost(mode int) int64 {
+	return int64(vp8FixedCostsUV[mode])
+}
