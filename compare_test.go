@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -293,7 +294,7 @@ func TestCompareWithCwebp(t *testing.T) {
 			r.alphaTransPct))
 	}
 	ts := time.Now().Format("20060102-150405")
-	mdPath := fmt.Sprintf("test_data/compare_results-%s.md", ts)
+	mdPath := fmt.Sprintf("test_data/compare_results-%s-p%d.md", ts, runtime.GOMAXPROCS(0))
 	os.WriteFile(mdPath, []byte(md.String()), 0644)
 	t.Logf("results saved to %s", mdPath)
 }

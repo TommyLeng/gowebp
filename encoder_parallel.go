@@ -504,22 +504,36 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 									distortion := ssd4x4(src4[:], ws.recBlock[:])
 									modeBits := i4ModeBitCost(mode, topPred, leftPred)
 
-									// Phase-1 early-out: D-only score (no coefficient rate).
-									// This is a lower bound on the true RD score, so if it already
-									// loses to the best, the full score will too. Skip coeffBitCost.
-									if bestBlkScore < int64(1<<62-1) {
-										earlyScore := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*modeBits
-										if earlyScore >= bestBlkScore {
+									// Phase-1 early-out, stage A: D-only lower bound (no flat
+									// penalty, no coefficient rate). Cheapest possible test, run
+									// before the flatness scan so the common path pays nothing
+									// extra. score >= 256*D + λ*modeBits always, so a loss here is
+									// a guaranteed loss.
+									dScore := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*modeBits
+									if bestBlkScore < int64(1<<62-1) && dScore >= bestBlkScore {
+										continue
+									}
+
+									// Flatness penalty (also needed for the final score below).
+									flatBitsR := int64(0)
+									if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
+										flatBitsR = flatnessPenalty
+									}
+
+									// Phase-1 early-out, stage B: tighten the bound with the flat
+									// penalty (rCost >= 0, so this is still a valid lower bound).
+									// Matches libwebp's early-out, which folds the flat penalty into
+									// R before VP8GetCostLuma4. Only fires in the narrow window where
+									// the flat penalty alone flips the decision, so coeffBitCost is
+									// skipped in those cases too.
+									if flatBitsR != 0 && bestBlkScore < int64(1<<62-1) {
+										if dScore+int64(mbLambdaI4)*flatBitsR >= bestBlkScore {
 											continue
 										}
 									}
 
 									rCost := coeffBitCost(trellisCtx0, ws.acQ[:], 0, trellisI4Costs)
-									flatBitsR := int64(0)
-									if mode > 0 && isFlatI4Levels(ws.acQ[:]) {
-										flatBitsR = flatnessPenalty
-									}
-									score := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*(modeBits+int64(rCost)+flatBitsR)
+									score := dScore + int64(mbLambdaI4)*(int64(rCost)+flatBitsR)
 									if score < bestBlkScore {
 										bestBlkScore = score
 										bestBlkOldScore = distortion + int64(mbLambdaI4)*modeBits

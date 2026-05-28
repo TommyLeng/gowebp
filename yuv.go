@@ -96,6 +96,52 @@ func rgbaToYUV420(img image.Image, arena *frameArena) *yuvImage {
 			i := (oy+y-m.Rect.Min.Y)*m.Stride + (ox+x-m.Rect.Min.X)*4
 			return int(m.Pix[i]), int(m.Pix[i+1]), int(m.Pix[i+2])
 		}
+	case *image.YCbCr:
+		// JPEG decoder output. The generic path here is the dominant CPU cost
+		// (image.(*YCbCr).At -> color.YCbCr -> convTnoptr heap box per pixel).
+		// We index Y/Cb/Cr directly via YOffset/COffset (both handle every
+		// subsampling ratio internally) and inline the BT.601 YCbCr->RGB math
+		// from image/color.YCbCrToRGB.
+		//
+		// Bit-exactness vs the generic path is proven exhaustively over all
+		// 16,777,216 (Y,Cb,Cr) triples: color.YCbCr.RGBA() yields the 16-bit
+		// form (val>>8 then clamp to [0,0xffff]); the caller does an extra >>8.
+		// (clamp_u16(v>>8))>>8 == clamp_u8(v>>16) for every int32 v here, so the
+		// 8-bit inlined form below is identical to the generic result.
+		getPixel = func(x, y int) (r, g, b int) {
+			yi := m.YOffset(ox+x, oy+y)
+			ci := m.COffset(ox+x, oy+y)
+			yy := int(m.Y[yi]) * 0x10101
+			cb1 := int(m.Cb[ci]) - 128
+			cr1 := int(m.Cr[ci]) - 128
+			r32 := (yy + 91881*cr1) >> 16
+			g32 := (yy - 22554*cb1 - 46802*cr1) >> 16
+			b32 := (yy + 116130*cb1) >> 16
+			if r32 < 0 {
+				r32 = 0
+			} else if r32 > 255 {
+				r32 = 255
+			}
+			if g32 < 0 {
+				g32 = 0
+			} else if g32 > 255 {
+				g32 = 255
+			}
+			if b32 < 0 {
+				b32 = 0
+			} else if b32 > 255 {
+				b32 = 255
+			}
+			return r32, g32, b32
+		}
+	case *image.Gray:
+		// Grayscale: one byte per pixel. color.Gray.RGBA() returns v*0x101 on
+		// all three channels; the caller's >>8 recovers v exactly, so r=g=b=v.
+		getPixel = func(x, y int) (r, g, b int) {
+			i := (oy+y-m.Rect.Min.Y)*m.Stride + (ox + x - m.Rect.Min.X)
+			v := int(m.Pix[i])
+			return v, v, v
+		}
 	default:
 		// Generic path: RGBA() returns 16-bit values; shift right to 8-bit.
 		getPixel = func(x, y int) (r, g, b int) {

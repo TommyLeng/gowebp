@@ -119,6 +119,12 @@ Kodak suite average: −9.2% vs cwebp -m 4.
    eliminating 4 redundant `intra4Predict` calls per block (29% fewer prediction calls).
 10. ✅ **Trellis precompute** — `level0`/`threshLevel` separated from Viterbi DP loop into a
     precompute pass, allowing the compiler to optimise both phases independently.
+11. ✅ **Two-phase i4 early-out** — phase B tightens the pre-trellis bound with `flatnessPenalty`
+    when the block is flat, skipping coeffBitCost for modes that can't beat the current best.
+    Mirrors libwebp's `PickBestIntra4` cheap-score logic.
+12. ✅ **`*image.YCbCr` fast path** — direct Pix[] indexing via `m.YOffset`/`m.COffset` + inlined
+    BT.601 math bypasses the `color.Color` interface boxing (`convTnoptr` + `mallocgc`) that was
+    28% of CPU on JPEG inputs. Bit-exact over all 16M (Y,Cb,Cr) triples.
 
 **Remaining known gaps:**
 - `tlambda_` per-MB lambda scaling (local texture complexity): not implemented; libwebp
@@ -158,6 +164,7 @@ no longer needed. The ones worth keeping:
 5. ~~**Fix quality remapping**~~ ✅ done: quality-4 hack removed; quality=90 now honest
 6. ~~**Reduce size gap vs libwebp** — trellis quantization, entropy cost, RD scoring~~ ✅ done: gowebp is slightly smaller than `cwebp -m 4` on most images (−5% to −20%)
 7. ~~**Speed optimisation** — i4 flat block early exit, intra4Predict cache, trellis precompute~~ ✅ done: −27% P=1 serial on 300×300 (15ms→11ms), −33% P=1 on 1536×2048 (604ms→407ms)
+10. ~~**Speed optimisation** — two-phase i4 early-out + `*image.YCbCr` fast path~~ ✅ done: −15% P=1 on 300×300 NRGBA (11ms→9.4ms), −32% P=1 on 1536×2048 JPEG (407ms→277ms)
 8. **EncodeAll / animation** — lossless subpackage has it; lossy does not
 9. **Decode support** — currently only encode; could wrap `golang.org/x/image/webp`
 
@@ -171,9 +178,9 @@ GOMAXPROCS=10 (wave-front parallel):
 | 768×512 (Kodak) | ~138kb / ~50ms | **~131kb / ~30ms** | wave-front parallel encoding |
 | 1536×2048 | ~304kb / ~250ms | **~287kb / ~102ms** | 2.5× faster than cwebp |
 
-GOMAXPROCS=1 (serial, benchmarked 2026-05-14):
+GOMAXPROCS=1 (serial, benchmarked 2026-05-27):
 
-| Image | Before optimisations | After (current) | Speedup |
-|---|---|---|---|
-| 300×300 photo | 15.2 ms | **11.1 ms** | −27% |
-| 1536×2048 | 604 ms | **407 ms** | −33% |
+| Image | Initial | After i4+cache+trellis | After two-phase+YCbCr | Total speedup |
+|---|---|---|---|---|
+| 300×300 NRGBA | 15.2 ms | 11.1 ms | **9.4 ms** | −38% |
+| 1536×2048 JPEG | 604 ms | 407 ms | **277 ms** | −54% |
