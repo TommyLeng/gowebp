@@ -1,2 +1,15 @@
 test_data/
 .DS_Store
+
+# profiling artifacts
+*.prof
+
+# build artifacts
+*.test
+*.bak
+
+# scratch files
+PERF_PLAN.md
+instr_tmp.go
+instr_test.go
+.claude/
