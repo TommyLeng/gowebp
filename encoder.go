@@ -97,6 +97,19 @@ func makeSegmentParams(quality int) segmentParams {
 	}
 }
 
+// debugMBStats, when non-nil, is populated by encodeFrame with the mode
+// decisions for every MB. Used only by diagnostic tests; production code
+// must leave it nil.
+var debugMBStats *[]mbInfo
+
+// debugReconCapture, when non-nil, is called by the encoder once the final
+// Y-plane recon buffer is filled. Diagnostic only.
+var debugReconCapture func(reconY []uint8, stride, height int)
+
+// debugDisableLoopFilter forces filter_level=0 in the bitstream header so the
+// decoder's loop filter is bypassed (recon-vs-decoder comparisons match).
+var debugDisableLoopFilter bool
+
 // encodeFrame encodes a YUV image into a VP8 bitstream.
 // Returns the raw VP8 bytes (frame header + partition0 + token partition).
 // Phase 2: per-MB RD selection between intra16 (4 modes) and intra4 (10 modes).
@@ -312,14 +325,17 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 			}
 
 			// MB-level RD decision: compare i4 vs i16.
-			// i16Score uses lambdaI16 (large) which inflates the bit-cost term,
-			// biasing the comparison toward i4. This matches libwebp's intent:
-			// at high quality, i4 wins whenever its distortion is comparable to
-			// i16, resulting in better compression for natural images.
+			// NOTE: this uses lambdaI16 (large) for i16 rate; lambdaI4 (small)
+			// for i4 rate; lambdaMode (smallest) for i4 header. This is a
+			// known-imperfect approximation — libwebp PickBestIntra16/
+			// PickBestIntra4 instead re-score winners with lambda_mode for the
+			// cross-category comparison (quant_enc.c:1029, 1121). A 2026-05-29
+			// attempt to switch this to lambda_mode produced the correct mode
+			// distribution (47/53 i4/i16 on face frames) but collapsed PSNR
+			// from 24 dB → 10 dB; the i16 reconstruction path has a latent bug
+			// exposed when i16 is hot. See SESSION_NOTES_VP8_QUALITY.md.
 			i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
 			// i4HeaderCost: fixed overhead for signalling i4 mode in partition 0.
-			// Defined here so it is available both in the per-block early-out and
-			// in the final i4-vs-i16 comparison below.
 			i4HeaderCost := int64(mbLambdaMode) * 211
 
 			// -------------------------------------------------------
@@ -397,10 +413,8 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						// Try all relevant I4 modes; track the best.
 						bestBlkMode := B_DC_PRED
 						bestBlkScore := int64(1<<62 - 1)
-						// `bestBlkOldScore` tracks the winner using the original
-						// 1×-distortion scale, so the MB-level i4-vs-i16 comparison
-						// (which is intentionally NOT scaled by RD_DISTO_MULT — see
-						// note below the i4 block) sees the same magnitude as before.
+						// bestBlkOldScore: accumulator value at original (no RD_DISTO_MULT)
+						// scale, used for MB-level i4-vs-i16 comparison.
 						bestBlkOldScore := int64(1<<62 - 1)
 
 						// trellisCtx0 is a loop-invariant for this block.
@@ -860,6 +874,16 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				}
 			}
 		}
+	}
+
+	// Snapshot mbInfos for diagnostic tests if requested.
+	if debugMBStats != nil {
+		snap := make([]mbInfo, mbW*mbH)
+		copy(snap, mbInfos[:mbW*mbH])
+		*debugMBStats = snap
+	}
+	if debugReconCapture != nil {
+		debugReconCapture(recon, reconStride, mbH*16)
 	}
 
 	// --- Two-pass coefficient probability adaptation ---

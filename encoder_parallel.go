@@ -901,6 +901,16 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 
 	wg.Wait()
 
+	// Snapshot mbInfos for diagnostic tests if requested.
+	if debugMBStats != nil {
+		snap := make([]mbInfo, mbW*mbH)
+		copy(snap, mbInfos[:mbW*mbH])
+		*debugMBStats = snap
+	}
+	if debugReconCapture != nil {
+		debugReconCapture(recon, reconStride, mbH*16)
+	}
+
 	// --- Two-pass coefficient probability adaptation (sequential) ---
 	var stats coeffStats
 	collectCoeffStats(mbCoeffs, mbW, mbH, &stats)

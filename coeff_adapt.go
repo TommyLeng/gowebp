@@ -810,6 +810,9 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH int, segQs [4]int, numS
 		if filterLevel > 63 {
 			filterLevel = 63
 		}
+		if debugDisableLoopFilter {
+			filterLevel = 0
+		}
 		bw.putBitUniform(0)                    // filter_type = 0 (simple)
 		bw.putBits(uint32(filterLevel), 6)     // filter_level
 		bw.putBits(0, 3)                       // filter_sharpness = 0
