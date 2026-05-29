@@ -278,27 +278,18 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 		} else if allDisposalBg {
 			markAlphaFromGIFFrame(sub, frame, dirty)
 		} else {
-			// Block-level similarity flattening (FlattenSimilarBlocks, ported
-			// from libwebp mux/anim_encode.c).
+			// Per-pixel fuzzy delta: pixels whose per-channel diff vs the
+			// previous canvas is ≤ maxDiff are marked transparent (inherit
+			// from the WebP decoder's canvas). Pixels that changed by more
+			// than maxDiff are re-encoded fresh (opaque).
 			//
-			// Start from all-opaque (copyRectNRGBA gave A=255 from the fully-
-			// opaque compositing canvas). Interior aligned 8×8 blocks where
-			// every pixel's per-channel diff ≤ maxDiff are forced fully
-			// transparent (inherit from the WebP decoder's canvas). Edge bands
-			// (first/last 8 rows and columns) stay all-opaque — matching
-			// libwebp's behaviour exactly.
-			//
-			// This produces macroblock-aligned, contiguous opaque/transparent
-			// regions rather than scattered per-pixel flags. VP8L compresses
-			// the resulting alpha far better, and the block-aligned boundaries
-			// eliminate the scattered alpha flickering that per-pixel decisions
-			// cause within VP8 macroblocks.
-			//
-			// Periodic keyframes (every kmax frames) keep the inherited canvas
-			// values fresh: transparent blocks inherit from a canvas that is
-			// at most kmax delta-frames old, preventing the "ghost" residual
-			// content that accumulated in earlier versions without keyframes.
-			flattenSimilarBlocks(sub, prevCanvas, dirty, maxDiff)
+			// Block-level approaches (FlattenSimilarBlocks) produce more
+			// compressible alpha masks but create visible 8×8 grid artifacts
+			// in frames where some blocks change and adjacent blocks inherit
+			// a stale/noisy keyframe value. Per-pixel decisions follow the
+			// actual change boundary at pixel resolution — no block-aligned
+			// artifacts.
+			markUnchangedTransparent(sub, prevCanvas, dirty, maxDiff)
 		}
 		images = append(images, sub)
 
