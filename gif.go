@@ -11,6 +11,7 @@ import (
 	"image/draw"
 	"image/gif"
 	"io"
+	"math"
 )
 
 // ConvertGIF encodes an animated GIF as a lossy WebP animation.
@@ -19,22 +20,33 @@ import (
 // maintains an internal canvas the size of g.Config (or, if zero-valued,
 // the bounds of g.Image[0]) and composites every GIF frame onto it,
 // honouring GIF disposal methods (DoNotDispose, RestoreBackground,
-// RestorePrevious). For each frame it then computes the *dirty bounding
-// rectangle* of pixels that changed between the previous composited
-// canvas and the current one, and emits an ANMF chunk that covers only
-// that sub-rectangle. Pixels outside the dirty rect are inherited from
-// the previously-decoded WebP frame (WebP per-frame disposal = keep / 0)
-// so they are not re-encoded — which avoids per-frame VP8 quantisation
-// noise on otherwise-static regions (the visible "flicker" you would
-// otherwise see in nominally-static areas).
+// RestorePrevious).
+//
+// For GIFs where every frame uses DisposalBackground, ConvertGIF takes a
+// specialised path that maps the GIF frame's own palette transparency
+// directly to the ANMF alpha channel and sets the WebP per-frame disposal
+// to 1 (clear-to-background). This mirrors the GIF compositor exactly:
+//
+//   - Opaque GIF pixels → alpha=255 in the ANMF (freshly VP8-encoded).
+//   - Transparent GIF pixels → alpha=0 (inherit the bgcol-cleared canvas).
+//
+// The result is a compact, contiguous alpha bitmap whose shape matches the
+// animation region rather than the pixel-level diff between composite
+// canvases. VP8L compresses it far more efficiently, and the uniform alpha
+// boundary eliminates the edge-flickering that arises when scattered
+// transparent/opaque boundaries cut through VP8 macroblocks.
+//
+// For all other disposal methods the function falls back to the generic
+// path: compute the dirty bounding rectangle of changed pixels, mark
+// identical pixels as transparent (alpha=0) so the WebP decoder inherits
+// the previously-decoded value, and use WebP per-frame disposal=0 (keep).
 //
 // The canvas is initialised to an opaque background colour derived from
 // g.BackgroundIndex + the first frame's palette; if the indexed entry is
 // transparent (or out of range) the canvas is filled with opaque black.
 // This keeps the composited canvas fully opaque at all times — alpha
 // channels in the emitted ANMF frames are used only as a transparency
-// mask carrying the dirty-pixel bitmap, never to encode partial
-// translucency.
+// mask, never to encode partial translucency.
 //
 // Per-frame durations are converted from GIF (1/100 s) to WebP (1 ms) by
 // multiplying by 10. The loop count is preserved (gif's -1 "show once"
@@ -48,6 +60,16 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 	if len(g.Image) == 0 {
 		return errors.New("gowebp: gif has no frames")
 	}
+
+	// Encoding quality — needed for qualityToMaxDiff.
+	quality := 90
+	if o != nil && o.Quality > 0 {
+		quality = o.Quality
+	}
+	// maxDiff is the per-channel RGB tolerance below which a pixel change is
+	// considered "similar enough to inherit" rather than re-encode. A value of
+	// 0 disables block-level flattening (lossless or very high quality).
+	maxDiff := qualityToMaxDiff(quality)
 
 	// Canvas size: prefer g.Config; if zero-valued, fall back to first
 	// frame's Bounds.Max as documented by image/gif.
@@ -120,6 +142,19 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 	durations := make([]uint, 0, len(g.Image))
 	disposals := make([]uint, 0, len(g.Image))
 
+	// Detect whether every GIF frame uses DisposalBackground. If so we can
+	// use the faster, flicker-free GIF-transparency-as-alpha path (see the
+	// doc comment above).
+	allDisposalBg := g.Disposal != nil && len(g.Disposal) == len(g.Image)
+	if allDisposalBg {
+		for _, d := range g.Disposal {
+			if d != gif.DisposalBackground {
+				allDisposalBg = false
+				break
+			}
+		}
+	}
+
 	// Track the previous GIF frame's disposal so we know how to prepare
 	// the canvas before drawing the current frame. We also track the
 	// bounds of the previously-drawn frame for DisposalBackground.
@@ -163,53 +198,71 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 			draw.Draw(canvas, dst, frame, fb.Min, draw.Over)
 		}
 
-		// 4. Compute the dirty bounding rectangle of pixels that changed
-		// vs prevCanvas. For the first frame we always emit the full
-		// canvas (the keyframe) so the WebP decoder has a known initial
-		// state for every pixel.
+		// 4. Compute the dirty bounding rectangle.
+		// Frame 0 always covers the full canvas (keyframe). For subsequent
+		// frames, the dirty rect depends on the disposal path:
+		//   - DisposalBackground path: bounding box of this frame's opaque
+		//     GIF pixels (the animation region that needs fresh encoding).
+		//   - Generic path: bounding box of pixels that changed vs prevCanvas.
 		var dirty image.Rectangle
 		if !havePrev {
 			dirty = canvasRect
+		} else if allDisposalBg {
+			dirty = computeGIFDirtyRect(frame, canvasRect)
 		} else {
 			dirty = computeDirtyRect(prevCanvas, canvas)
 		}
-		// Even an empty dirty rect needs a non-empty ANMF chunk — every
-		// GIF frame must contribute one output frame to preserve frame
-		// count and duration. Pad to a minimum 2×2 sub-rect (the WebP
-		// spec stores x/y offsets in units of 2 px).
+		// Every GIF frame must produce one ANMF chunk to preserve frame
+		// count and timing. Align to even offsets (WebP stores x/y ÷ 2)
+		// and pad to at least 2×2.
 		dirty = alignAndPadDirty(dirty, canvasRect)
 
-		// 5. Extract the dirty sub-rect into a fresh NRGBA snapshot.
-		// Within the bounding box, mark pixels that are *identical* to
-		// the previous canvas as fully transparent (alpha = 0). The
-		// WebP decoder applies alpha blending (ANMF flags bit 1 = 0)
-		// so transparent pixels let the previously-decoded canvas pixel
-		// show through unchanged — that is what eliminates VP8
-		// quantisation flicker on otherwise-static regions.
+		// 5. Extract the dirty sub-rect into a fresh NRGBA snapshot and
+		// set per-pixel alpha.
 		//
-		// Pixels that changed keep alpha = 255 (opaque) so the decoder
-		// replaces them with the freshly-encoded VP8 RGB value.
+		// DisposalBackground path (allDisposalBg):
+		//   Alpha is taken directly from the GIF frame's palette
+		//   transparency. Opaque GIF pixels → alpha=255 (VP8-encode fresh);
+		//   transparent GIF pixels → alpha=0 (inherit bgcol from the
+		//   WebP canvas cleared by the previous frame's Dispose=1).
+		//   This maps the GIF compositor's "clear then draw" semantics into
+		//   WebP with no per-canvas diffing — the result is a compact,
+		//   contiguous alpha bitmap that VP8L compresses far better than
+		//   the scattered pixel-diff mask.
 		//
-		// For the very first frame (no previous canvas yet) every pixel
-		// is treated as "changed" so the keyframe is fully opaque.
+		// Generic path:
+		//   Mark pixels identical to the previous canvas as transparent so
+		//   the WebP decoder inherits the previously-decoded value, avoiding
+		//   VP8 quantisation noise on static regions.
+		//
+		// Frame 0 (no previous): all pixels are forced opaque (keyframe).
 		sub := image.NewNRGBA(dirty)
 		copyRectNRGBA(sub, canvas, dirty)
-		if havePrev {
-			markUnchangedTransparent(sub, prevCanvas, dirty)
-		} else {
-			// Belt-and-braces: ensure every pixel is opaque, even if
-			// the compositing canvas somehow contained alpha < 255
-			// (e.g. the BackgroundIndex resolved to a transparent
-			// palette entry).
+		if !havePrev {
 			forceOpaqueNRGBA(sub, bgCol)
+		} else if allDisposalBg {
+			markAlphaFromGIFFrame(sub, frame, dirty)
+		} else {
+			// Generic delta path: start from all-opaque (copyRectNRGBA gave
+			// alpha=255 for every pixel from the fully-opaque compositor
+			// canvas) and apply block-level similarity flattening.
+			//
+			// This mirrors libwebp's FlattenSimilarBlocks: process only
+			// interior aligned 8×8 blocks; skip the edge band so those rows
+			// and columns always stay opaque. Interior blocks where every
+			// pixel's channel diff ≤ maxDiff are made fully transparent
+			// (inherit from the previously-decoded WebP canvas). The result is
+			// a macroblock-aligned alpha mask with large contiguous regions
+			// that VP8L compresses far better than the scattered per-pixel
+			// diff mask, and the clean block boundaries eliminate the
+			// edge-flickering that occurs when a jagged alpha boundary
+			// bisects VP8 macroblocks.
+			flattenSimilarBlocks(sub, prevCanvas, dirty, maxDiff)
 		}
 		images = append(images, sub)
 
-		// 6. Save the *current* canvas as prevCanvas for next iteration's
-		// diff. Use a full copy of canvas.Pix — small frames may dirty
-		// only a sub-rect but pixels outside that rect must still match
-		// the previous canvas (they're unchanged), so a full copy is
-		// the simplest invariant.
+		// 6. Save the current canvas for the next iteration's diff
+		// (used by the generic path; harmless for the DisposalBackground path).
 		copy(prevCanvas.Pix, canvas.Pix)
 		havePrev = true
 
@@ -223,10 +276,17 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 		}
 		durations = append(durations, uint(d)*10)
 
-		// 8. Per-frame WebP disposal: pixels outside the dirty rect must
-		// remain visible from the previously-decoded frame, so use
-		// "keep" (disposal 0).
-		disposals = append(disposals, 0)
+		// 8. Per-frame WebP disposal.
+		// DisposalBackground path: Dispose=1 clears the WebP canvas to bgcol
+		// after each frame, mirroring the GIF compositor. The next frame's
+		// alpha=0 pixels inherit bgcol exactly as intended.
+		// Generic path: Dispose=0 (keep) — pixels outside the dirty rect
+		// remain visible from the previously-decoded frame.
+		if allDisposalBg {
+			disposals = append(disposals, 1)
+		} else {
+			disposals = append(disposals, 0)
+		}
 
 		prevDisposal = thisDisposal
 		prevBounds = fb
@@ -492,6 +552,171 @@ func markUnchangedTransparent(sub *image.NRGBA, prev *image.NRGBA, r image.Recta
 				sub.Pix[si+1] == prev.Pix[pi+1] &&
 				sub.Pix[si+2] == prev.Pix[pi+2] {
 				// Mark transparent; keep RGB as-is for encoder smoothness.
+				sub.Pix[si+3] = 0
+			} else {
+				sub.Pix[si+3] = 255
+			}
+		}
+	}
+}
+
+// qualityToMaxDiff maps the encoding quality (0–100) to a per-channel RGB
+// tolerance used for "similar enough to inherit from previous frame" decisions.
+// Ported directly from libwebp's QualityToMaxDiff in mux/anim_encode.c:
+//
+//	val = sqrt(quality / 100)
+//	maxDiff = round(31*(1-val) + val)
+//
+// At quality=90 → maxDiff=3; quality=75 → 5; quality=50 → 10; quality=0 → 31.
+func qualityToMaxDiff(quality int) int {
+	val := math.Sqrt(float64(quality) / 100.0)
+	return int(31*(1-val) + val + 0.5)
+}
+
+// flattenSimilarBlocks refines the per-pixel alpha mask produced by
+// markUnchangedTransparent by applying block-level decisions. For each
+// aligned 8×8 block entirely within r: if every pixel in the block
+// satisfies abs(sub.R-prev.R) ≤ maxDiff && abs(sub.G-prev.G) ≤ maxDiff &&
+// abs(sub.B-prev.B) ≤ maxDiff (i.e. the visible change is within VP8
+// quantisation tolerance), the entire block is forced to alpha=0
+// (transparent / inherit-from-canvas). Partial blocks at the boundary of r
+// are left untouched (the per-pixel step already handles them).
+//
+// This is a port of libwebp's FlattenSimilarBlocks in mux/anim_encode.c.
+// The block-aligned result compresses far better with VP8L (contiguous opaque
+// and transparent regions replace scattered per-pixel flags) and eliminates
+// the edge-flickering that occurs when a jagged alpha boundary bisects VP8
+// macroblocks.
+func flattenSimilarBlocks(sub *image.NRGBA, prev *image.NRGBA, r image.Rectangle, maxDiff int) {
+	if maxDiff <= 0 {
+		return
+	}
+	const bs = 8
+	// Process only complete 8×8 blocks, starting from the second block
+	// boundary inside r (matching libwebp's skip of the first partial block).
+	startY := (r.Min.Y + bs) &^ (bs - 1)
+	startX := (r.Min.X + bs) &^ (bs - 1)
+	endY := r.Max.Y &^ (bs - 1)
+	endX := r.Max.X &^ (bs - 1)
+
+	for by := startY; by < endY; by += bs {
+		for bx := startX; bx < endX; bx += bs {
+			// Check whether every pixel in the block is within maxDiff.
+			ok := true
+		outer:
+			for dy := 0; dy < bs; dy++ {
+				si := (by+dy-sub.Rect.Min.Y)*sub.Stride + (bx-sub.Rect.Min.X)*4
+				pi := (by+dy)*prev.Stride + bx*4
+				for dx := 0; dx < bs; dx++ {
+					dr := int(sub.Pix[si]) - int(prev.Pix[pi])
+					if dr < 0 {
+						dr = -dr
+					}
+					if dr > maxDiff {
+						ok = false
+						break outer
+					}
+					dg := int(sub.Pix[si+1]) - int(prev.Pix[pi+1])
+					if dg < 0 {
+						dg = -dg
+					}
+					if dg > maxDiff {
+						ok = false
+						break outer
+					}
+					db := int(sub.Pix[si+2]) - int(prev.Pix[pi+2])
+					if db < 0 {
+						db = -db
+					}
+					if db > maxDiff {
+						ok = false
+						break outer
+					}
+					si += 4
+					pi += 4
+				}
+			}
+			if ok {
+				for dy := 0; dy < bs; dy++ {
+					si := (by+dy-sub.Rect.Min.Y)*sub.Stride + (bx-sub.Rect.Min.X)*4
+					for dx := 0; dx < bs; dx++ {
+						sub.Pix[si+3] = 0
+						si += 4
+					}
+				}
+			}
+		}
+	}
+}
+
+// gifTransparentIndex returns the palette index of the transparent colour
+// entry, or -1 if none exists.
+func gifTransparentIndex(frame *image.Paletted) int {
+	for i, c := range frame.Palette {
+		if _, _, _, a := c.RGBA(); a == 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+// computeGIFDirtyRect returns the smallest rectangle that contains every
+// non-transparent pixel in frame, clipped to canvasRect. Used by the
+// DisposalBackground path to find the ANMF sub-rect that needs encoding
+// (only the animation content, not the background the WebP decoder inherits).
+func computeGIFDirtyRect(frame *image.Paletted, canvasRect image.Rectangle) image.Rectangle {
+	transpIdx := gifTransparentIndex(frame)
+	fb := frame.Bounds().Intersect(canvasRect)
+	if fb.Empty() {
+		return image.Rectangle{}
+	}
+	bfb := frame.Bounds() // unclipped, for Pix offset arithmetic
+
+	minX, minY := fb.Max.X, fb.Max.Y
+	maxX, maxY := fb.Min.X-1, fb.Min.Y-1
+	for y := fb.Min.Y; y < fb.Max.Y; y++ {
+		row := frame.Pix[(y-bfb.Min.Y)*frame.Stride:]
+		for x := fb.Min.X; x < fb.Max.X; x++ {
+			if int(row[x-bfb.Min.X]) != transpIdx {
+				if x < minX {
+					minX = x
+				}
+				if x > maxX {
+					maxX = x
+				}
+				if y < minY {
+					minY = y
+				}
+				if y > maxY {
+					maxY = y
+				}
+			}
+		}
+	}
+	if maxX < minX || maxY < minY {
+		return image.Rectangle{}
+	}
+	return image.Rect(minX, minY, maxX+1, maxY+1)
+}
+
+// markAlphaFromGIFFrame sets the alpha channel of sub using the GIF frame's
+// own palette transparency within r. Opaque GIF pixels → alpha=255 (VP8 will
+// encode fresh colour values); transparent GIF pixels → alpha=0 (the WebP
+// decoder inherits bgcol from the canvas cleared by the previous ANMF's
+// Dispose=1). Pixels in r that lie outside the GIF frame bounds are treated
+// as transparent (they contain bgcol from the disposal step).
+func markAlphaFromGIFFrame(sub *image.NRGBA, frame *image.Paletted, r image.Rectangle) {
+	transpIdx := gifTransparentIndex(frame)
+	fb := frame.Bounds()
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		subRowOff := (y - sub.Rect.Min.Y) * sub.Stride
+		for x := r.Min.X; x < r.Max.X; x++ {
+			si := subRowOff + (x-sub.Rect.Min.X)*4
+			if x < fb.Min.X || x >= fb.Max.X || y < fb.Min.Y || y >= fb.Max.Y {
+				sub.Pix[si+3] = 0
+				continue
+			}
+			if int(frame.Pix[(y-fb.Min.Y)*frame.Stride+(x-fb.Min.X)]) == transpIdx {
 				sub.Pix[si+3] = 0
 			} else {
 				sub.Pix[si+3] = 255
