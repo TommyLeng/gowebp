@@ -757,9 +757,27 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH int, segQs [4]int, numS
 		}
 
 		// Filter strength absolute values for 4 segments (6-bit signed).
-		// All 0: loop filtering is disabled.
+		// Compute per-segment filter level from each segment's quantizer,
+		// matching libwebp's SetupFilterStrength formula:
+		//   qstep = kAcTable[seg_q] >> 2
+		//   filter_level = qstep * 300 / 256  (level0=300, beta=0, sharpness=0)
 		for s := 0; s < 4; s++ {
-			bw.putSignedBits(0, 6)
+			sidx := s
+			if sidx >= numSegs {
+				sidx = numSegs - 1
+			}
+			sq := segQs[sidx]
+			if sq < 0 {
+				sq = 0
+			} else if sq > 127 {
+				sq = 127
+			}
+			sqstep := int(kAcTable[sq]) >> 2
+			sf := sqstep * 300 / 256
+			if sf > 63 {
+				sf = 63
+			}
+			bw.putSignedBits(sf, 6)
 		}
 
 		// Segment map probability updates (only when update_map=1).
