@@ -772,11 +772,31 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH int, segQs [4]int, numS
 		bw.putBitUniform(0) // update_mb_segmentation = 0
 	}
 
-	// Filter header
-	bw.putBitUniform(0) // filter_type = 0 (simple)
-	bw.putBits(0, 6)    // filter_level = 0
-	bw.putBits(0, 3)    // filter_sharpness = 0
-	bw.putBitUniform(0) // loop_filter_adj_enable = 0
+	// Filter header.
+	// Compute filter_level from the base-segment quantizer, matching
+	// libwebp's SetupFilterStrength:
+	//   qstep = kAcTable[quant] >> 2
+	//   base_strength = kLevelsFromDelta[sharpness=0][qstep]  (= qstep for sharpness=0)
+	//   filter_level  = base_strength * level0 / (256 + beta)
+	// with level0 = 5 * filter_strength (default=60) = 300, beta = 0.
+	// For sharpness=0 the table is linear so kLevelsFromDelta[0][n] = n.
+	{
+		q0 := segQs[0]
+		if q0 < 0 {
+			q0 = 0
+		} else if q0 > 127 {
+			q0 = 127
+		}
+		qstep := int(kAcTable[q0]) >> 2
+		filterLevel := qstep * 300 / 256 // level0=300, beta=0
+		if filterLevel > 63 {
+			filterLevel = 63
+		}
+		bw.putBitUniform(0)                    // filter_type = 0 (simple)
+		bw.putBits(uint32(filterLevel), 6)     // filter_level
+		bw.putBits(0, 3)                       // filter_sharpness = 0
+		bw.putBitUniform(0)                    // loop_filter_adj_enable = 0
+	}
 
 	// Number of DCT partitions: log2(1) = 0
 	bw.putBits(0, 2)
