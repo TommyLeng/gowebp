@@ -29,6 +29,11 @@ type Options struct {
 //   - Images: frames to be displayed in sequence (must be non-empty).
 //   - Durations: per-frame display time in milliseconds (must match Images length).
 //   - Disposals: per-frame disposal method after display: 0 = keep, 1 = clear to background.
+//   - Blends: per-frame blend method. Optional; if nil or empty all frames are
+//     treated as 0 = alpha-blend (the WebP decoder composites a frame's pixels
+//     over the existing canvas honouring per-pixel alpha). A value of 1 means
+//     "no blending" — the frame's pixels overwrite the canvas regardless of
+//     alpha. Keyframes use Blends=1. Length, when non-nil, must match Images.
 //   - LoopCount: number of times the animation repeats; 0 = infinite.
 //   - BackgroundColor: canvas background colour in BGRA byte order, used when a
 //     frame's disposal == 1. Stored as a little-endian uint32 in the ANIM chunk.
@@ -36,6 +41,7 @@ type Animation struct {
 	Images          []image.Image
 	Durations       []uint
 	Disposals       []uint
+	Blends          []uint
 	LoopCount       uint16
 	BackgroundColor uint32
 }
@@ -124,6 +130,10 @@ func EncodeAll(w io.Writer, ani *Animation, o *Options) error {
 	if len(ani.Images) != len(ani.Disposals) {
 		return errors.New("gowebp: mismatched image and disposals lengths")
 	}
+	// Blends is optional. When provided, its length must match Images.
+	if ani.Blends != nil && len(ani.Blends) != len(ani.Images) {
+		return errors.New("gowebp: mismatched image and blends lengths")
+	}
 
 	quality := 90
 	if o != nil && o.Quality > 0 {
@@ -203,6 +213,13 @@ func EncodeAll(w io.Writer, ani *Animation, o *Options) error {
 		if disp > 1 {
 			disp = 1
 		}
+		var blend uint
+		if ani.Blends != nil {
+			blend = uint(ani.Blends[i])
+			if blend > 1 {
+				blend = 1
+			}
+		}
 
 		// ANMF payload = 16 bytes of frame params + inner chunks.
 		anmfPayloadSize := uint32(16 + len(innerChunk))
@@ -225,13 +242,16 @@ func EncodeAll(w io.Writer, ani *Animation, o *Options) error {
 		//     what we want for delta-encoded frames where unchanged
 		//     pixels carry alpha=0.
 		//   - bit 1 = 1: do not blend (overwrite canvas pixel regardless
-		//     of frame alpha).
-		// We always select alpha blending so transparent pixels pass
-		// through to previous frame — even for fully-opaque frames this
-		// is equivalent to overwrite.
+		//     of frame alpha). Used for keyframes (full-canvas refresh
+		//     that resets accumulated VP8 quantisation noise).
+		// Default is alpha blending; the caller can request no-blend on a
+		// per-frame basis via Animation.Blends.
 		var flags byte
 		if disp == 1 {
 			flags |= 1 << 0
+		}
+		if blend == 1 {
+			flags |= 1 << 1
 		}
 		frames.WriteByte(flags)
 

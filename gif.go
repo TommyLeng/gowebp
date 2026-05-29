@@ -141,6 +141,18 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 	images := make([]image.Image, 0, len(g.Image))
 	durations := make([]uint, 0, len(g.Image))
 	disposals := make([]uint, 0, len(g.Image))
+	blends := make([]uint, 0, len(g.Image))
+
+	// Keyframe parameters. Matching libwebp's gif2webp defaults for lossy
+	// (-kmin 3 -kmax 5): a keyframe is inserted no later than every kmax
+	// frames. Keyframes overwrite the entire canvas (Blend=1, no ALPH chunk)
+	// which resets accumulated VP8 quantisation noise that would otherwise
+	// "ghost" into pixels that flip between opaque-fresh and transparent-inherited
+	// across the delta chain.
+	const (
+		kmax = 5
+	)
+	countSinceKeyframe := 0
 
 	// Detect whether every GIF frame uses DisposalBackground. If so we can
 	// use the faster, flicker-free GIF-transparency-as-alpha path (see the
@@ -198,14 +210,33 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 			draw.Draw(canvas, dst, frame, fb.Min, draw.Over)
 		}
 
-		// 4. Compute the dirty bounding rectangle.
-		// Frame 0 always covers the full canvas (keyframe). For subsequent
-		// frames, the dirty rect depends on the disposal path:
+		// 4. Decide whether this frame is a keyframe or a delta frame.
+		//
+		// Frame 0 is always a keyframe (forced). For subsequent frames,
+		// libwebp's gif2webp inserts a keyframe at least every kmax frames
+		// (default 5 for lossy). A keyframe overwrites the whole canvas
+		// with no alpha and is decoded into the WebP canvas as a single
+		// fresh VP8 reference — this breaks the cumulative VP8 quantisation
+		// chain that otherwise builds up across long sequences of delta
+		// frames and causes "ghosting" / residual content in regions that
+		// flip between opaque (freshly encoded) and transparent (inherited).
+		//
+		// The DisposalBackground path doesn't suffer from the inheritance
+		// chain (it resets to bgcol every frame), so keyframes are
+		// suppressed there to keep its output compact.
+		isKeyframe := !havePrev
+		if havePrev && !allDisposalBg && countSinceKeyframe >= kmax {
+			isKeyframe = true
+		}
+
+		// 5. Compute the dirty bounding rectangle.
+		// Keyframes always cover the full canvas. For delta frames the
+		// dirty rect depends on the disposal path:
 		//   - DisposalBackground path: bounding box of this frame's opaque
 		//     GIF pixels (the animation region that needs fresh encoding).
 		//   - Generic path: bounding box of pixels that changed vs prevCanvas.
 		var dirty image.Rectangle
-		if !havePrev {
+		if isKeyframe {
 			dirty = canvasRect
 		} else if allDisposalBg {
 			dirty = computeGIFDirtyRect(frame, canvasRect)
@@ -217,8 +248,14 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 		// and pad to at least 2×2.
 		dirty = alignAndPadDirty(dirty, canvasRect)
 
-		// 5. Extract the dirty sub-rect into a fresh NRGBA snapshot and
+		// 6. Extract the dirty sub-rect into a fresh NRGBA snapshot and
 		// set per-pixel alpha.
+		//
+		// Keyframe path:
+		//   All pixels are forced opaque so the WebP encoder skips ALPH and
+		//   emits plain VP8. Combined with Blend=1 on the ANMF flags, this
+		//   overwrites the entire decoder canvas with a clean VP8 image,
+		//   resetting accumulated quantisation noise.
 		//
 		// DisposalBackground path (allDisposalBg):
 		//   Alpha is taken directly from the GIF frame's palette
@@ -230,15 +267,13 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 		//   contiguous alpha bitmap that VP8L compresses far better than
 		//   the scattered pixel-diff mask.
 		//
-		// Generic path:
+		// Generic delta path:
 		//   Mark pixels identical to the previous canvas as transparent so
 		//   the WebP decoder inherits the previously-decoded value, avoiding
 		//   VP8 quantisation noise on static regions.
-		//
-		// Frame 0 (no previous): all pixels are forced opaque (keyframe).
 		sub := image.NewNRGBA(dirty)
 		copyRectNRGBA(sub, canvas, dirty)
-		if !havePrev {
+		if isKeyframe {
 			forceOpaqueNRGBA(sub, bgCol)
 		} else if allDisposalBg {
 			markAlphaFromGIFFrame(sub, frame, dirty)
@@ -256,12 +291,20 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 		}
 		images = append(images, sub)
 
-		// 6. Save the current canvas for the next iteration's diff
+		// 7. Save the current canvas for the next iteration's diff
 		// (used by the generic path; harmless for the DisposalBackground path).
 		copy(prevCanvas.Pix, canvas.Pix)
 		havePrev = true
 
-		// 7. Duration: 100ths of a second → milliseconds.
+		// Reset / advance the keyframe counter. A keyframe resets the chain;
+		// a delta frame extends it.
+		if isKeyframe {
+			countSinceKeyframe = 0
+		} else {
+			countSinceKeyframe++
+		}
+
+		// 8. Duration: 100ths of a second → milliseconds.
 		var d int
 		if i < len(g.Delay) {
 			d = g.Delay[i]
@@ -271,16 +314,25 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 		}
 		durations = append(durations, uint(d)*10)
 
-		// 8. Per-frame WebP disposal.
+		// 9. Per-frame WebP disposal and blend.
 		// DisposalBackground path: Dispose=1 clears the WebP canvas to bgcol
 		// after each frame, mirroring the GIF compositor. The next frame's
 		// alpha=0 pixels inherit bgcol exactly as intended.
-		// Generic path: Dispose=0 (keep) — pixels outside the dirty rect
-		// remain visible from the previously-decoded frame.
+		// Generic / keyframe path: Dispose=0 (keep) — pixels outside the
+		// dirty rect remain visible from the previously-decoded frame.
+		//
+		// Blend=1 (no alpha blending) on keyframes overwrites the canvas
+		// outright; Blend=0 on delta frames lets alpha=0 pixels pass through
+		// to the previously decoded canvas value.
 		if allDisposalBg {
 			disposals = append(disposals, 1)
 		} else {
 			disposals = append(disposals, 0)
+		}
+		if isKeyframe {
+			blends = append(blends, 1)
+		} else {
+			blends = append(blends, 0)
 		}
 
 		prevDisposal = thisDisposal
@@ -304,6 +356,7 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 		Images:    images,
 		Durations: durations,
 		Disposals: disposals,
+		Blends:    blends,
 		LoopCount: loopCount,
 		// BackgroundColor in WebP ANIM is BGRA. Pack bgCol into a uint32.
 		BackgroundColor: uint32(bgCol.B) |
