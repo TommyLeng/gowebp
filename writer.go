@@ -157,11 +157,16 @@ func EncodeAll(w io.Writer, ani *Animation, o *Options) error {
 	// emitting the outer RIFF header (which carries the total payload size).
 	frames := &bytes.Buffer{}
 	const maxU24 = uint(1<<24 - 1)
+	// anyAlpha is set to true if any frame ends up encoded with an ALPH
+	// chunk; we need to reflect that in the top-level VP8X flags.
+	anyAlpha := false
 	for i, img := range ani.Images {
-		// Encode this frame via the standard lossy pipeline, then strip the
-		// outer RIFF/WEBP wrapper. After stripping, frameBuf starts at the
-		// inner "VP8 " chunk (tag + size + payload), which is exactly what
-		// ANMF expects to embed.
+		// Encode this frame via the standard lossy pipeline (which itself
+		// chooses plain VP8 vs VP8X+ALPH+VP8 based on alpha content), then
+		// strip the RIFF/WEBP wrapper and extract the chunks suitable for
+		// ANMF embedding. ANMF embeds either "VP8 " alone or "ALPH" + "VP8 "
+		// — never "VP8X" (the per-canvas VP8X header lives at the top of
+		// the WebP container).
 		var frameBuf bytes.Buffer
 		if err := encodeLossy(&frameBuf, img, quality); err != nil {
 			return err
@@ -173,15 +178,21 @@ func EncodeAll(w io.Writer, ani *Animation, o *Options) error {
 			string(frameBytes[8:12]) != "WEBP" {
 			return errors.New("gowebp: unexpected frame container layout")
 		}
-		// The inner chunk starts at byte 12. For plain lossy (no alpha,
-		// no VP8X) the first inner chunk is "VP8 "; if the frame contained
-		// alpha then encodeLossy emits an Extended container (VP8X + VP8 +
-		// ALPH) which we cannot embed directly into ANMF. Reject that here
-		// — alpha support is explicitly out of scope.
-		if string(frameBytes[12:16]) != "VP8 " {
-			return errors.New("gowebp: lossy animation does not support alpha frames")
+		// Parse the inner chunks. For plain lossy we expect:
+		//   "VP8 "(4) + size(4) + data + pad
+		// For lossy + alpha we expect:
+		//   "VP8X"(4) + size(4) + 10-byte VP8X payload
+		//   "ALPH"(4) + size(4) + alpha payload + pad
+		//   "VP8 "(4) + size(4) + data + pad
+		// We need to capture the ALPH chunk (if present) and the VP8 chunk
+		// and concatenate them for ANMF embedding (without the outer VP8X).
+		innerChunk, frameHasAlpha, err := extractANMFInner(frameBytes[12:])
+		if err != nil {
+			return err
 		}
-		innerChunk := frameBytes[12:] // "VP8 " + size + data (+ pad)
+		if frameHasAlpha {
+			anyAlpha = true
+		}
 
 		b := img.Bounds()
 		dur := uint(ani.Durations[i])
@@ -193,13 +204,14 @@ func EncodeAll(w io.Writer, ani *Animation, o *Options) error {
 			disp = 1
 		}
 
-		// ANMF payload = 16 bytes of frame params + inner VP8 chunk.
+		// ANMF payload = 16 bytes of frame params + inner chunks.
 		anmfPayloadSize := uint32(16 + len(innerChunk))
 
 		frames.Write([]byte("ANMF"))
 		_ = binary.Write(frames, binary.LittleEndian, anmfPayloadSize)
 
-		// Frame x/y offset: 24-bit LE, must be even (spec divides by 2).
+		// Frame x/y offset: 24-bit LE, stored as value/2 (the spec divides
+		// by 2). Callers passing odd offsets is a bug — round-down here.
 		writeU24LE(frames, uint32(b.Min.X/2))
 		writeU24LE(frames, uint32(b.Min.Y/2))
 		// Frame width-1 / height-1: 24-bit LE.
@@ -207,15 +219,23 @@ func EncodeAll(w io.Writer, ani *Animation, o *Options) error {
 		writeU24LE(frames, uint32(b.Dy()-1))
 		// Duration: 24-bit LE milliseconds.
 		writeU24LE(frames, uint32(dur))
-		// Flags byte: bit 0 = disposal, bit 1 = blending (0 = use alpha
-		// blending; we have no alpha so the bit is irrelevant, leave 0).
+		// Flags byte: bit 0 = disposal, bit 1 = blending.
+		//   - bit 1 = 0: use alpha blending (the previous canvas pixel
+		//     shows through transparent areas of this frame). This is
+		//     what we want for delta-encoded frames where unchanged
+		//     pixels carry alpha=0.
+		//   - bit 1 = 1: do not blend (overwrite canvas pixel regardless
+		//     of frame alpha).
+		// We always select alpha blending so transparent pixels pass
+		// through to previous frame — even for fully-opaque frames this
+		// is equivalent to overwrite.
 		var flags byte
 		if disp == 1 {
 			flags |= 1 << 0
 		}
 		frames.WriteByte(flags)
 
-		// Inner VP8 chunk (tag + size + data + optional pad byte).
+		// Inner chunks (ALPH + VP8 or just VP8). Pre-padded.
 		frames.Write(innerChunk)
 
 		// Pad ANMF payload to even length (RIFF alignment).
@@ -226,7 +246,7 @@ func EncodeAll(w io.Writer, ani *Animation, o *Options) error {
 
 	// Build the inner-payload buffer (everything after "WEBP").
 	body := &bytes.Buffer{}
-	writeAnimVP8XChunk(body, canvas.Dx(), canvas.Dy())
+	writeAnimVP8XChunk(body, canvas.Dx(), canvas.Dy(), anyAlpha)
 
 	body.Write([]byte("ANIM"))
 	_ = binary.Write(body, binary.LittleEndian, uint32(6))
@@ -251,15 +271,74 @@ func EncodeAll(w io.Writer, ani *Animation, o *Options) error {
 	return nil
 }
 
-// writeAnimVP8XChunk writes a VP8X chunk for an animated WebP with the
-// animation flag set, alpha flag clear, canvas width-1 / height-1 in 24-bit LE.
-func writeAnimVP8XChunk(buf *bytes.Buffer, width, height int) {
+// extractANMFInner scans the chunks of a WebP container's inner body
+// (the bytes after "WEBP") and returns the bytes that should be embedded
+// inside an ANMF chunk: either "VP8 "(...) alone (no alpha), or
+// "ALPH"(...) + "VP8 "(...) (lossy frame carrying alpha). The
+// per-canvas VP8X chunk (if present) is stripped — ANMF must not embed
+// it. hasAlpha reports whether an ALPH chunk was present.
+//
+// Each returned chunk includes its 4-byte tag, 4-byte little-endian
+// size, payload, and the optional 1-byte odd-size pad — exactly the
+// on-disk format ANMF expects.
+func extractANMFInner(inner []byte) (out []byte, hasAlpha bool, err error) {
+	var alphChunk, vp8Chunk []byte
+	for off := 0; off+8 <= len(inner); {
+		tag := string(inner[off : off+4])
+		size := uint32(inner[off+4]) |
+			uint32(inner[off+5])<<8 |
+			uint32(inner[off+6])<<16 |
+			uint32(inner[off+7])<<24
+		// Chunks are padded to even length on disk.
+		end := off + 8 + int(size)
+		padded := end
+		if size&1 == 1 {
+			padded++
+		}
+		if padded > len(inner) {
+			return nil, false, errors.New("gowebp: malformed inner chunk size")
+		}
+		chunk := inner[off:padded] // includes tag+size+payload(+pad)
+		switch tag {
+		case "VP8X":
+			// Top-level VP8X — never embedded in ANMF.
+		case "ALPH":
+			alphChunk = chunk
+		case "VP8 ":
+			vp8Chunk = chunk
+		default:
+			// Unknown chunk: ignore (forward-compatible with future
+			// chunks emitted by encodeLossy variants).
+		}
+		off = padded
+	}
+	if vp8Chunk == nil {
+		return nil, false, errors.New("gowebp: encoded frame missing VP8 chunk")
+	}
+	if alphChunk == nil {
+		return vp8Chunk, false, nil
+	}
+	// ANMF embedded order: ALPH must precede VP8 (spec, Sec. Animation).
+	combined := make([]byte, 0, len(alphChunk)+len(vp8Chunk))
+	combined = append(combined, alphChunk...)
+	combined = append(combined, vp8Chunk...)
+	return combined, true, nil
+}
+
+// writeAnimVP8XChunk writes a VP8X chunk for an animated WebP. The
+// animation flag is always set; the alpha flag is set iff any frame in
+// the animation carries an ALPH chunk (so decoders know to look for
+// per-frame transparency).
+func writeAnimVP8XChunk(buf *bytes.Buffer, width, height int, hasAlpha bool) {
 	buf.Write([]byte("VP8X"))
 	_ = binary.Write(buf, binary.LittleEndian, uint32(10))
 
-	// Flags byte: bit 1 = animation, bit 4 = alpha (cleared).
+	// Flags byte: bit 1 = animation, bit 4 = alpha.
 	var flags byte
 	flags |= 1 << 1
+	if hasAlpha {
+		flags |= 1 << 4
+	}
 	buf.WriteByte(flags)
 	// 3 reserved bytes.
 	buf.Write([]byte{0x00, 0x00, 0x00})
