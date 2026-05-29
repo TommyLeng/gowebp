@@ -278,16 +278,27 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 		} else if allDisposalBg {
 			markAlphaFromGIFFrame(sub, frame, dirty)
 		} else {
-			// Per-pixel fuzzy comparison: pixels with per-channel diff ≤
-			// maxDiff are marked transparent (inherit from previous canvas).
-			// Using maxDiff = qualityToMaxDiff(quality) means pixels whose
-			// change falls within VP8 quantisation tolerance are treated as
-			// stable — they would produce the same lossy output anyway, so
-			// re-encoding them only adds VP8 noise. This reduces unnecessary
-			// flicker on "barely-changed" pixels without introducing the
-			// block-level grid artifacts that a coarser block-aligned decision
-			// would cause.
-			markUnchangedTransparent(sub, prevCanvas, dirty, maxDiff)
+			// Block-level similarity flattening (FlattenSimilarBlocks, ported
+			// from libwebp mux/anim_encode.c).
+			//
+			// Start from all-opaque (copyRectNRGBA gave A=255 from the fully-
+			// opaque compositing canvas). Interior aligned 8×8 blocks where
+			// every pixel's per-channel diff ≤ maxDiff are forced fully
+			// transparent (inherit from the WebP decoder's canvas). Edge bands
+			// (first/last 8 rows and columns) stay all-opaque — matching
+			// libwebp's behaviour exactly.
+			//
+			// This produces macroblock-aligned, contiguous opaque/transparent
+			// regions rather than scattered per-pixel flags. VP8L compresses
+			// the resulting alpha far better, and the block-aligned boundaries
+			// eliminate the scattered alpha flickering that per-pixel decisions
+			// cause within VP8 macroblocks.
+			//
+			// Periodic keyframes (every kmax frames) keep the inherited canvas
+			// values fresh: transparent blocks inherit from a canvas that is
+			// at most kmax delta-frames old, preventing the "ghost" residual
+			// content that accumulated in earlier versions without keyframes.
+			flattenSimilarBlocks(sub, prevCanvas, dirty, maxDiff)
 		}
 		images = append(images, sub)
 
