@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
+	"image/gif"
 	_ "image/jpeg"
 	_ "image/png"
 	"math"
@@ -277,6 +278,128 @@ func TestCompareWithCwebp(t *testing.T) {
 	}
 	fmt.Println()
 
+	// --- Animated GIF → WebP comparison ---
+	type gifRow struct {
+		name        string
+		gifKB       float64
+		frames      int
+		durationMs  int
+		gowebpKB    string
+		gowebpMs    string
+		gif2webpKB  string
+		gif2webpMs  string
+	}
+	var gifRows []gifRow
+
+	_, gif2webpErr := exec.LookPath("gif2webp")
+	hasGif2webp := gif2webpErr == nil
+
+	// Top-level GIFs only (non-recursive — top entries we listed earlier).
+	var gifFiles []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.ToLower(filepath.Ext(e.Name())) == ".gif" {
+			gifFiles = append(gifFiles, e.Name())
+		}
+	}
+
+	gowebpAnimDir := filepath.Join("test_data", "gowebp", "anim")
+	libwebpAnimDir := filepath.Join("test_data", "libwebp", "anim")
+	os.MkdirAll(gowebpAnimDir, 0755)
+	os.MkdirAll(libwebpAnimDir, 0755)
+
+	for _, name := range gifFiles {
+		srcPath := filepath.Join(originalDir, name)
+		stem := strings.TrimSuffix(name, filepath.Ext(name))
+
+		srcInfo, statErr := os.Stat(srcPath)
+		if statErr != nil {
+			t.Errorf("stat %s: %v", name, statErr)
+			continue
+		}
+		gifKB := float64(srcInfo.Size()) / 1024
+
+		f, err := os.Open(srcPath)
+		if err != nil {
+			t.Errorf("open %s: %v", name, err)
+			continue
+		}
+		g, err := gif.DecodeAll(f)
+		f.Close()
+		if err != nil {
+			t.Errorf("gif.DecodeAll %s: %v", name, err)
+			continue
+		}
+		nFrames := len(g.Image)
+		totalDur := 0
+		for _, d := range g.Delay {
+			totalDur += d
+		}
+		// totalDur is in 100ths of a second; convert to ms.
+		durationMs := totalDur * 10
+
+		// --- gowebp ConvertGIF ---
+		gowebpKBStr, gowebpMsStr := "err", "err"
+		var anim bytes.Buffer
+		t0 := time.Now()
+		if encErr := ConvertGIF(&anim, g, &Options{Quality: 75}); encErr != nil {
+			t.Errorf("ConvertGIF %s: %v", name, encErr)
+		} else {
+			elapsed := time.Since(t0)
+			outPath := filepath.Join(gowebpAnimDir, stem+".webp")
+			os.WriteFile(outPath, anim.Bytes(), 0644)
+			gowebpKBStr = fmt.Sprintf("%.1f kb", float64(anim.Len())/1024)
+			gowebpMsStr = fmt.Sprintf("%.0f ms", float64(elapsed.Milliseconds()))
+		}
+
+		// --- gif2webp (libwebp companion tool) ---
+		// Use -lossy for a fair comparison with gowebp's VP8 lossy output.
+		// (gif2webp defaults to lossless, which produces much larger files
+		// than the lossy VP8 encoder we use here.)
+		gif2webpKBStr, gif2webpMsStr := "-", "-"
+		if hasGif2webp {
+			outPath := filepath.Join(libwebpAnimDir, stem+".webp")
+			cmd := exec.Command("gif2webp", "-lossy", "-q", "75", srcPath, "-o", outPath)
+			cmd.Stderr = nil
+			t0 := time.Now()
+			if cmd.Run() == nil {
+				elapsed := time.Since(t0)
+				if fi, fiErr := os.Stat(outPath); fiErr == nil {
+					gif2webpKBStr = fmt.Sprintf("%.1f kb", float64(fi.Size())/1024)
+					gif2webpMsStr = fmt.Sprintf("%.0f ms", float64(elapsed.Milliseconds()))
+				}
+			}
+		}
+
+		gifRows = append(gifRows, gifRow{
+			name:       name,
+			gifKB:      gifKB,
+			frames:     nFrames,
+			durationMs: durationMs,
+			gowebpKB:   gowebpKBStr,
+			gowebpMs:   gowebpMsStr,
+			gif2webpKB: gif2webpKBStr,
+			gif2webpMs: gif2webpMsStr,
+		})
+	}
+
+	// Print GIF results to console.
+	if len(gifRows) > 0 {
+		fmt.Printf("\n%-45s %9s %7s %9s | %12s %9s | %12s %9s\n",
+			"GIF File", "Original", "Frames", "Duration",
+			"gowebp", "go time", "gif2webp", "g2w time")
+		fmt.Println(strings.Repeat("-", 130))
+		for _, r := range gifRows {
+			fmt.Printf("%-45s %8.1fkb %7d %7dms | %12s %9s | %12s %9s\n",
+				r.name, r.gifKB, r.frames, r.durationMs,
+				r.gowebpKB, r.gowebpMs,
+				r.gif2webpKB, r.gif2webpMs)
+		}
+		fmt.Println()
+	}
+
 	// write markdown
 	var md strings.Builder
 	md.WriteString("# WebP Conversion Comparison\n\n")
@@ -293,6 +416,20 @@ func TestCompareWithCwebp(t *testing.T) {
 			r.goLosslessKB, r.goLosslessMs,
 			r.alphaTransPct))
 	}
+
+	if len(gifRows) > 0 {
+		md.WriteString("\n## Animated GIF → WebP\n\n")
+		md.WriteString("Parameters: quality=75. Per-frame gowebp uses VP8 lossy; gif2webp uses lossy mode for fair comparison.\n\n")
+		md.WriteString("| File | GIF size | Frames | Duration | gowebp size | gowebp time | gif2webp size | gif2webp time |\n")
+		md.WriteString("|---|---|---|---|---|---|---|---|\n")
+		for _, r := range gifRows {
+			md.WriteString(fmt.Sprintf("| %s | %.1f kb | %d | %d ms | %s | %s | %s | %s |\n",
+				r.name, r.gifKB, r.frames, r.durationMs,
+				r.gowebpKB, r.gowebpMs,
+				r.gif2webpKB, r.gif2webpMs))
+		}
+	}
+
 	ts := time.Now().Format("20060102-150405")
 	mdPath := fmt.Sprintf("test_data/compare_results-%s-p%d.md", ts, runtime.GOMAXPROCS(0))
 	os.WriteFile(mdPath, []byte(md.String()), 0644)
