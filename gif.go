@@ -243,21 +243,16 @@ func ConvertGIF(w io.Writer, g *gif.GIF, o *Options) error {
 		} else if allDisposalBg {
 			markAlphaFromGIFFrame(sub, frame, dirty)
 		} else {
-			// Generic delta path: start from all-opaque (copyRectNRGBA gave
-			// alpha=255 for every pixel from the fully-opaque compositor
-			// canvas) and apply block-level similarity flattening.
-			//
-			// This mirrors libwebp's FlattenSimilarBlocks: process only
-			// interior aligned 8×8 blocks; skip the edge band so those rows
-			// and columns always stay opaque. Interior blocks where every
-			// pixel's channel diff ≤ maxDiff are made fully transparent
-			// (inherit from the previously-decoded WebP canvas). The result is
-			// a macroblock-aligned alpha mask with large contiguous regions
-			// that VP8L compresses far better than the scattered per-pixel
-			// diff mask, and the clean block boundaries eliminate the
-			// edge-flickering that occurs when a jagged alpha boundary
-			// bisects VP8 macroblocks.
-			flattenSimilarBlocks(sub, prevCanvas, dirty, maxDiff)
+			// Per-pixel fuzzy comparison: pixels with per-channel diff ≤
+			// maxDiff are marked transparent (inherit from previous canvas).
+			// Using maxDiff = qualityToMaxDiff(quality) means pixels whose
+			// change falls within VP8 quantisation tolerance are treated as
+			// stable — they would produce the same lossy output anyway, so
+			// re-encoding them only adds VP8 noise. This reduces unnecessary
+			// flicker on "barely-changed" pixels without introducing the
+			// block-level grid artifacts that a coarser block-aligned decision
+			// would cause.
+			markUnchangedTransparent(sub, prevCanvas, dirty, maxDiff)
 		}
 		images = append(images, sub)
 
@@ -522,9 +517,17 @@ func copyRectNRGBA(dst, src *image.NRGBA, r image.Rectangle) {
 
 // markUnchangedTransparent compares each pixel in sub (which holds the
 // current canvas sub-rect at sub.Rect) against the same canvas location
-// in prev. Pixels whose RGB matches the previous canvas have their
-// alpha set to 0 so the WebP decoder leaves the previous frame's pixel
-// in place during alpha blending. Pixels that differ keep alpha = 255.
+// in prev. Pixels whose per-channel RGB difference is at most maxDiff in
+// all three channels have their alpha set to 0 so the WebP decoder leaves
+// the previous frame's pixel in place during alpha blending. Pixels that
+// differ by more than maxDiff in any channel keep alpha = 255.
+//
+// maxDiff = 0 means exact comparison (only identical pixels are transparent).
+// For lossy encoding pass qualityToMaxDiff(quality) so that "barely changed"
+// pixels within VP8 quantisation tolerance are treated as unchanged —
+// this eliminates flicker on pixels whose change is too small to survive
+// lossy compression anyway. This is a per-pixel decision, so no block-level
+// grid artifacts are introduced.
 //
 // The RGB component of an alpha-0 pixel is irrelevant on decode (the
 // blend formula multiplies it by alpha/255 = 0), but it *does* affect
@@ -538,20 +541,28 @@ func copyRectNRGBA(dst, src *image.NRGBA, r image.Rectangle) {
 //
 // sub must be aligned: sub.Rect equals the dirty rectangle r passed to
 // copyRectNRGBA, and prev is a full-canvas NRGBA with Rect.Min == (0,0).
-func markUnchangedTransparent(sub *image.NRGBA, prev *image.NRGBA, r image.Rectangle) {
+func markUnchangedTransparent(sub *image.NRGBA, prev *image.NRGBA, r image.Rectangle, maxDiff int) {
 	for y := r.Min.Y; y < r.Max.Y; y++ {
 		subRowOff := (y - sub.Rect.Min.Y) * sub.Stride
 		prevRowOff := y * prev.Stride
 		for x := r.Min.X; x < r.Max.X; x++ {
 			si := subRowOff + (x-sub.Rect.Min.X)*4
 			pi := prevRowOff + x*4
-			// Compare only the RGB bytes — alpha differences are
-			// irrelevant for delta detection (we want to know whether
-			// the *visible* colour changed).
-			if sub.Pix[si] == prev.Pix[pi] &&
-				sub.Pix[si+1] == prev.Pix[pi+1] &&
-				sub.Pix[si+2] == prev.Pix[pi+2] {
-				// Mark transparent; keep RGB as-is for encoder smoothness.
+			// Compare only the RGB bytes with per-channel tolerance.
+			dr := int(sub.Pix[si]) - int(prev.Pix[pi])
+			if dr < 0 {
+				dr = -dr
+			}
+			dg := int(sub.Pix[si+1]) - int(prev.Pix[pi+1])
+			if dg < 0 {
+				dg = -dg
+			}
+			db := int(sub.Pix[si+2]) - int(prev.Pix[pi+2])
+			if db < 0 {
+				db = -db
+			}
+			if dr <= maxDiff && dg <= maxDiff && db <= maxDiff {
+				// Within tolerance — mark transparent; keep RGB as-is.
 				sub.Pix[si+3] = 0
 			} else {
 				sub.Pix[si+3] = 255
