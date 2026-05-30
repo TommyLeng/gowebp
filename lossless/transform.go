@@ -48,10 +48,20 @@ func applyPredictTransform(pixels []color.NRGBA, width, height int) (int, int, i
         histos[i] = make([]int, len(accum[i]))
     }
 
+    // Residuals for one tile row, reused across modes/rows. The predictor
+    // search runs row-by-row (rather than the old column-major per-pixel loop)
+    // so the interior of each row is a contiguous run that a NEON kernel can
+    // process; histogram counts and written deltas are order-independent, so
+    // the bitstream is byte-identical to the per-pixel version.
+    rowBuf := make([]color.NRGBA, tileSize)
+
     for y := 0; y < bh; y++ {
         for x := 0; x < bw; x++ {
+            sx := x << tileBits
+            sy := y << tileBits
             mx := min((x + 1) << tileBits, width)
             my := min((y + 1) << tileBits, height)
+            n := mx - sx
 
             var best int
             var bestEntropy float64
@@ -60,15 +70,13 @@ func applyPredictTransform(pixels []color.NRGBA, width, height int) (int, int, i
                     copy(histos[j], accum[j])
                 }
 
-                for tx := x << tileBits; tx < mx; tx++ {
-                    for ty := y << tileBits; ty < my; ty++ {
-                        d := applyFilter(pixels, width, tx, ty, i)
-
-                        off := ty * width + tx
-                        histos[0][int(uint8(pixels[off].R - d.R))]++
-                        histos[1][int(uint8(pixels[off].G - d.G))]++
-                        histos[2][int(uint8(pixels[off].B - d.B))]++
-                        histos[3][int(uint8(pixels[off].A - d.A))]++
+                for ty := sy; ty < my; ty++ {
+                    predictResidualsRow(pixels, width, i, sx, mx, ty, rowBuf)
+                    for k := 0; k < n; k++ {
+                        histos[0][rowBuf[k].R]++
+                        histos[1][rowBuf[k].G]++
+                        histos[2][rowBuf[k].B]++
+                        histos[3][rowBuf[k].A]++
                     }
                 }
 
@@ -76,17 +84,17 @@ func applyPredictTransform(pixels []color.NRGBA, width, height int) (int, int, i
                 for _, histo := range histos {
                     sum := 0
                     sumSquares := 0
-                
+
                     for _, count := range histo {
                         sum += count
                         sumSquares += count * count
                     }
-                
+
                     if sum == 0 {
                         continue
                     }
-                
-                    total += 1.0 - float64(sumSquares) / (float64(sum) * float64(sum))    
+
+                    total += 1.0 - float64(sumSquares) / (float64(sum) * float64(sum))
                 }
 
                 if i == 0 || total < bestEntropy {
@@ -95,32 +103,46 @@ func applyPredictTransform(pixels []color.NRGBA, width, height int) (int, int, i
                 }
             }
 
-            for tx := x << tileBits; tx < mx; tx++ {
-                for ty := y << tileBits; ty < my; ty++ {
-                    d := applyFilter(pixels, width, tx, ty, best)
-                    
-                    off := ty * width + tx
-                    deltas[off] = color.NRGBA{
-                        R: uint8(pixels[off].R - d.R),
-                        G: uint8(pixels[off].G - d.G),
-                        B: uint8(pixels[off].B - d.B),
-                        A: uint8(pixels[off].A - d.A),
-                    }
-
-                    accum[0][int(uint8(pixels[off].R - d.R))]++
-                    accum[1][int(uint8(pixels[off].G - d.G))]++
-                    accum[2][int(uint8(pixels[off].B - d.B))]++
-                    accum[3][int(uint8(pixels[off].A - d.A))]++
+            for ty := sy; ty < my; ty++ {
+                predictResidualsRow(pixels, width, best, sx, mx, ty, rowBuf)
+                base := ty * width + sx
+                for k := 0; k < n; k++ {
+                    deltas[base + k] = rowBuf[k]
+                    accum[0][rowBuf[k].R]++
+                    accum[1][rowBuf[k].G]++
+                    accum[2][rowBuf[k].B]++
+                    accum[3][rowBuf[k].A]++
                 }
             }
 
             blocks[y * bw + x] = color.NRGBA{0, byte(best), 0, 255}
         }
     }
-    
+
     copy(pixels, deltas)
-    
+
     return tileBits, bw, bh, blocks
+}
+
+// predictResidualsRowScalar computes residual = current − predictor(mode) for
+// each pixel in row y, columns [xStart, xEnd), writing the result to
+// out[0:xEnd-xStart]. The per-pixel output is identical to applyFilter (same
+// x==0 / y==0 boundary handling), so it leaves the bitstream unchanged. It is
+// the portable reference: predictResidualsRow is this on non-arm64 builds, and
+// the boundary / tail / not-yet-vectorised fallback for the arm64 NEON path
+// (see predictrow_arm64.{go,s}).
+func predictResidualsRowScalar(pixels []color.NRGBA, width, mode, xStart, xEnd, y int, out []color.NRGBA) {
+    base := y * width
+    for x := xStart; x < xEnd; x++ {
+        d := applyFilter(pixels, width, x, y, mode)
+        p := pixels[base + x]
+        out[x - xStart] = color.NRGBA{
+            R: p.R - d.R,
+            G: p.G - d.G,
+            B: p.B - d.B,
+            A: p.A - d.A,
+        }
+    }
 }
 
 // average2 returns the per-channel arithmetic mean of two pixels.
