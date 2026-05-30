@@ -124,15 +124,18 @@ func buildPred4Context(yuv *yuvImage, recon []uint8, reconStride int, bpx, bpy i
 		}
 	}
 
-	// top-left corner
+	// top-left corner. VP8 border conventions: x<0 → 129, y<0 → 127.
 	if hasTop && hasLeft {
 		ctx.topLeft = get(bpx-1, bpy-1)
 	} else if hasTop {
-		ctx.topLeft = 127
-	} else if hasLeft {
+		// bpx=0, bpy>0 → topLeft at (-1, bpy-1) → x<0 → 129
 		ctx.topLeft = 129
+	} else if hasLeft {
+		// bpx>0, bpy=0 → topLeft at (bpx-1, -1) → y<0 → 127
+		ctx.topLeft = 127
 	} else {
-		ctx.topLeft = 128
+		// bpx=0, bpy=0 → corner. libwebp uses 127 for mbY=0.
+		ctx.topLeft = 127
 	}
 
 	// top row[0..3]
@@ -476,9 +479,17 @@ func intra16PredictFromRecon(mode int, recon []uint8, reconStride, mbX, mbY, rec
 		}
 
 	case I16_TM_PRED:
-		topLeft := 128
-		if hasTop && hasLeft {
+		// TM_PRED uses the top-left corner pixel. libwebp's iterator_enc.c:27
+		// sets y_left[-1] = (mbY > 0) ? 129 : 127. So the fallback is NOT 128:
+		// it's 127 when no top neighbor (mbY=0) and 129 when no left (mbY>0).
+		var topLeft int
+		switch {
+		case hasTop && hasLeft:
 			topLeft = getR(px-1, py-1)
+		case hasTop: // mbY>0, mbX=0
+			topLeft = 129
+		default: // !hasTop  →  mbY=0
+			topLeft = 127
 		}
 		for y := 0; y < 16; y++ {
 			leftV := 129
@@ -549,10 +560,16 @@ func intra16Predict(mode int, yuv *yuvImage, mbX, mbY int, pred []int16) {
 		}
 
 	case I16_TM_PRED:
-		// TrueMotion: pred[x,y] = clip(top[x] + left[y] - topLeft)
-		topLeft := 128
-		if hasTop && hasLeft {
+		// TrueMotion: pred[x,y] = clip(top[x] + left[y] - topLeft).
+		// libwebp iterator_enc.c:27 sets y_left[-1] = (mbY>0) ? 129 : 127.
+		var topLeft int
+		switch {
+		case hasTop && hasLeft:
 			topLeft = getY(px-1, py-1)
+		case hasTop: // mbY>0, mbX=0
+			topLeft = 129
+		default: // !hasTop  →  mbY=0
+			topLeft = 127
 		}
 		for y := 0; y < 16; y++ {
 			leftV := 129

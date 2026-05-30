@@ -324,6 +324,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						copy(ws.pred16Best[:], ws.pred16[:])
 					}
 				}
+				if debugForceI16Mode >= 0 && debugForceI16Mode < numI16Modes {
+					bestI16Mode = debugForceI16Mode
+				}
 				_ = ws.pred16Best
 
 				// -------------------------------------------------------
@@ -333,6 +336,11 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				// buffer (neighbor MBs), unaffected by the i4 loop below.
 				// -------------------------------------------------------
 				intra16PredictFromRecon(bestI16Mode, recon, reconStride, mbX, ry, yuv.mbW, yuv.mbH, ws.mbI16Pred[:])
+				if debugDumpI16Capture != nil && mbX == 0 && ry == 0 {
+					d := &debugI16Dump{pred: ws.mbI16Pred}
+					d.dcLevels[15] = int16(bestI16Mode) // hack: stash mode at [15]
+					(*debugDumpI16Capture)[[2]int{-1, -1}] = d
+				}
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx += 2 {
 						n0, n1 := by*4+bx, by*4+bx+1
@@ -378,15 +386,12 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				}
 
 				i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
-				// i4HeaderCost: fixed overhead for signalling i4 mode in partition 0.
-				// Defined here so it is available both in the per-block early-out and
-				// in the final i4-vs-i16 comparison below.
 				i4HeaderCost := int64(mbLambdaMode) * 211
 
 				// -------------------------------------------------------
 				// Try intra4
 				// -------------------------------------------------------
-				var bestI4Score int64 // set inside block below; value valid after i4EarlyOut label
+				var bestI4Score int64
 
 				{
 					var topBlkMode [4]int
@@ -449,8 +454,6 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 
 							bestBlkMode := B_DC_PRED
 							bestBlkScore := int64(1<<62 - 1)
-							// Old-scale score for the MB-level i4-vs-i16 comparison.
-							// See encoder.go for rationale.
 							bestBlkOldScore := int64(1<<62 - 1)
 
 							// trellisCtx0 is a loop-invariant for this block.
@@ -572,10 +575,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							ws.localI4DcLevels[blkIdx] = 0
 							i4TotalScore += bestBlkOldScore
 
-							// Per-block early-out: if accumulated i4 cost already exceeds i16,
-							// remaining sub-blocks cannot recover — bail out and use i16.
-							// Port of libwebp's PickBestIntra4 check (quant_enc.c:1121):
-							//   if (rd_best.score >= rd_i16->score) return 0;
+							// Per-block early-out: bail if accumulated i4 already exceeds i16.
 							if i4TotalScore+i4HeaderCost >= i16Score {
 								goto i4EarlyOut
 							}
@@ -752,6 +752,21 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 								}
 							}
 						}
+					}
+					if debugDumpI16Capture != nil {
+						d := &debugI16Dump{}
+						d.pred = ws.mbI16Pred
+						d.dcLevels = ws.mbI16DcQuantLevels
+						d.dcBlockCoeff = ws.dcBlockCoeffs16
+						d.acLevels = ws.mbI16AcLevels
+						d.yDcRaw = ws.yDcRaw16
+						d.whtOut = ws.whtOut16
+						for y := 0; y < 16; y++ {
+							for x := 0; x < 16; x++ {
+								d.recon[y*16+x] = recon[(py+y)*reconStride+(px+x)]
+							}
+						}
+						(*debugDumpI16Capture)[[2]int{mbX, ry}] = d
 					}
 				}
 

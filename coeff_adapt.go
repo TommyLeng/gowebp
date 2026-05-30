@@ -777,6 +777,9 @@ func encodePartition0WithProbs(bw *boolEncoder, mbW, mbH int, segQs [4]int, numS
 			if sf > 63 {
 				sf = 63
 			}
+			if debugDisableLoopFilter {
+				sf = 0
+			}
 			bw.putSignedBits(sf, 6)
 		}
 

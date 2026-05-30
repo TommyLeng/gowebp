@@ -110,6 +110,29 @@ var debugReconCapture func(reconY []uint8, stride, height int)
 // decoder's loop filter is bypassed (recon-vs-decoder comparisons match).
 var debugDisableLoopFilter bool
 
+// debugForceSingleSegment, when true, forces SNS to use only 1 segment so the
+// per-MB segment quantizer override path is bypassed.
+var debugForceSingleSegment bool
+
+// debugForceI16Mode, when >= 0, forces every i16-selected MB to use this mode
+// (0=DC, 1=VE, 2=HE, 3=TM). Negative = no override. Diagnostic only.
+var debugForceI16Mode = -1
+
+// debugDumpI16 captures per-MB i16 internal state for diagnostic.
+type debugI16Dump struct {
+	pred         [256]int16
+	dcLevels     [16]int16  // WHT-quantized DC levels (zigzag)
+	dcBlockCoeff [16]int16  // per-block DC after iWHT
+	acLevels     [16][16]int16 // AC levels per block (zigzag)
+	recon        [256]uint8
+	yDcRaw       [16]int16 // raw DCs going into WHT
+	whtOut       [16]int16 // WHT output before quantize
+	y2q0         uint16    // y2 dequant table position 0 (= 2*qDC)
+	segQ         int       // signaled quantizer for this MB's segment
+}
+
+var debugDumpI16Capture *map[[2]int]*debugI16Dump // keyed by (mbX, mbY)
+
 // encodeFrame encodes a YUV image into a VP8 bitstream.
 // Returns the raw VP8 bytes (frame header + partition0 + token partition).
 // Phase 2: per-MB RD selection between intra16 (4 modes) and intra4 (10 modes).
@@ -266,6 +289,9 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					copy(ws.pred16Best[:], ws.pred16[:])
 				}
 			}
+			if debugForceI16Mode >= 0 && debugForceI16Mode < numI16Modes {
+				bestI16Mode = debugForceI16Mode
+			}
 			_ = ws.pred16Best
 
 			// -------------------------------------------------------
@@ -325,26 +351,18 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 			}
 
 			// MB-level RD decision: compare i4 vs i16.
-			// NOTE: this uses lambdaI16 (large) for i16 rate; lambdaI4 (small)
-			// for i4 rate; lambdaMode (smallest) for i4 header. This is a
-			// known-imperfect approximation — libwebp PickBestIntra16/
-			// PickBestIntra4 instead re-score winners with lambda_mode for the
-			// cross-category comparison (quant_enc.c:1029, 1121). A 2026-05-29
-			// attempt to switch this to lambda_mode produced the correct mode
-			// distribution (47/53 i4/i16 on face frames) but collapsed PSNR
-			// from 24 dB → 10 dB; the i16 reconstruction path has a latent bug
-			// exposed when i16 is hot. See SESSION_NOTES_VP8_QUALITY.md.
+			// Known-imperfect approximation: uses lambdaI16 for i16 rate;
+			// libwebp re-scores with lambda_mode (quant_enc.c:1029, 1121).
+			// Switching to lambda_mode gives correct mode distribution but
+			// exposes a separate bug in mixed-mode i16 reconstruction.
+			// See SESSION_NOTES_VP8_QUALITY.md for full details.
 			i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
-			// i4HeaderCost: fixed overhead for signalling i4 mode in partition 0.
 			i4HeaderCost := int64(mbLambdaMode) * 211
 
 			// -------------------------------------------------------
 			// Try intra4: for each of 16 4x4 blocks pick best mode
 			// -------------------------------------------------------
-			// We process blocks in raster order and update mbRecon with the
-			// actual reconstructed pixels (pred + dequantized residual)
-			// so subsequent blocks get correct intra4 prediction contexts.
-			var bestI4Score int64 // set inside block below; value valid after i4EarlyOut label
+			var bestI4Score int64
 
 			{
 				// Track per-block top/left mode context
@@ -413,8 +431,6 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						// Try all relevant I4 modes; track the best.
 						bestBlkMode := B_DC_PRED
 						bestBlkScore := int64(1<<62 - 1)
-						// bestBlkOldScore: accumulator value at original (no RD_DISTO_MULT)
-						// scale, used for MB-level i4-vs-i16 comparison.
 						bestBlkOldScore := int64(1<<62 - 1)
 
 						// trellisCtx0 is a loop-invariant for this block.
@@ -541,10 +557,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						ws.localI4DcLevels[blkIdx] = 0 // i4 has no WHT DC
 						i4TotalScore += bestBlkOldScore
 
-						// Per-block early-out: if accumulated i4 cost already exceeds i16,
-						// remaining sub-blocks cannot recover — bail out and use i16.
-						// Port of libwebp's PickBestIntra4 check (quant_enc.c:1121):
-						//   if (rd_best.score >= rd_i16->score) return 0;
+						// Per-block early-out: bail if accumulated i4 already exceeds i16.
 						if i4TotalScore+i4HeaderCost >= i16Score {
 							goto i4EarlyOut
 						}
@@ -742,6 +755,23 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							}
 						}
 					}
+				}
+				if debugDumpI16Capture != nil {
+					d := &debugI16Dump{}
+					d.pred = ws.mbI16Pred
+					d.dcLevels = ws.mbI16DcQuantLevels
+					d.dcBlockCoeff = ws.dcBlockCoeffs16
+					d.acLevels = ws.mbI16AcLevels
+					d.yDcRaw = ws.yDcRaw16
+					d.whtOut = ws.whtOut16
+					d.y2q0 = qm.y2.q[0]
+					d.segQ = sns.segQs[mbSegment[mbIdx]]
+					for y := 0; y < 16; y++ {
+						for x := 0; x < 16; x++ {
+							d.recon[y*16+x] = recon[(py+y)*reconStride+(px+x)]
+						}
+					}
+					(*debugDumpI16Capture)[[2]int{mbX, mbY}] = d
 				}
 			}
 
@@ -1024,21 +1054,15 @@ func buildPred4ContextFromPatch(patch *[37]uint8, mbRecon []uint8,
 			ctx.topLeft = int(mbRecon[(by*4-1)*16+(bx*4-1)])
 		}
 	} else if hasTop {
-		ctx.topLeft = 127
+		// hasTop only → bpx=0, bpy>0. topLeft at (-1, bpy-1) = LEFT border = 129.
+		ctx.topLeft = 129
 	} else if hasLeft {
-		// hasLeft && !hasTop
-		if mbPY == 0 {
-			ctx.topLeft = 127
-		} else {
-			ctx.topLeft = 129
-		}
+		// hasLeft only → bpx>0, bpy=0. topLeft at (bpx-1, -1) = TOP border = 127.
+		ctx.topLeft = 127
 	} else {
-		// corner of image
-		if mbPY == 0 {
-			ctx.topLeft = 127
-		} else {
-			ctx.topLeft = 129
-		}
+		// Corner of image (bpx=0, bpy=0) — only MB(0,0)'s top-left block.
+		// libwebp y_left[-1] for mbY=0 = 127.
+		ctx.topLeft = 127
 	}
 
 	// --- top row: get(bpx+i, bpy-1) for i=0..3 ---

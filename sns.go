@@ -516,6 +516,14 @@ func computeSNS(yuv *yuvImage, mbW, mbH, baseQ int) snsResult {
 		mbSegment[i] = 3 - kmCluster
 	}
 
+	if debugForceSingleSegment {
+		// Collapse everything to segment 0 with baseQ quantizer.
+		for i := range mbSegment {
+			mbSegment[i] = 0
+		}
+		segQs[0] = baseQ
+		return snsResult{mbSegment: mbSegment, segQs: segQs, numSegs: 1}
+	}
 	return snsResult{
 		mbSegment: mbSegment,
 		segQs:     segQs,
