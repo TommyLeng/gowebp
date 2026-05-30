@@ -290,6 +290,15 @@ func writeBitStreamData(w *bitWriter, img image.Image, colorCacheBits int, trans
     width := img.Bounds().Dx()
     height := img.Bounds().Dy()
 
+    // Subtract-green decorrelates R/B from G — a win for RGB photos but a loss
+    // for single-channel data (e.g. alpha stored in the green channel with
+    // R=B=0, where it turns two constant channels into copies of G). Only apply
+    // it when it actually reduces the R+B entropy, mirroring libwebp's transform
+    // analysis in AnalyzeAndInit.
+    if transforms[transformSubGreen] && !useSubtractGreen(pixels) {
+        transforms[transformSubGreen] = false
+    }
+
     if transforms[transformColorIndexing] {
         w.writeBits(1, 1)
         w.writeBits(3, 2)

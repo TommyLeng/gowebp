@@ -269,6 +269,43 @@ func applySubtractGreenTransform(pixels []color.NRGBA) {
     }
 }
 
+// useSubtractGreen reports whether the subtract-green transform would reduce the
+// combined Shannon entropy of the R and B channels. It is a win for RGB photos
+// (R/B correlate with G) but a loss for single-channel data such as an alpha
+// plane carried in the green channel with R=B=0, where R-G/B-G become copies of
+// the alpha signal. Mirrors the transform analysis in libwebp's AnalyzeAndInit.
+func useSubtractGreen(pixels []color.NRGBA) bool {
+    var hR, hB, hRG, hBG [256]int
+    for _, p := range pixels {
+        hR[p.R]++
+        hB[p.B]++
+        hRG[uint8(p.R-p.G)]++
+        hBG[uint8(p.B-p.G)]++
+    }
+    n := len(pixels)
+    before := histogramEntropy(hR[:], n) + histogramEntropy(hB[:], n)
+    after := histogramEntropy(hRG[:], n) + histogramEntropy(hBG[:], n)
+    return after < before
+}
+
+// histogramEntropy returns the Shannon entropy (in bits) of a symbol histogram
+// with the given total count.
+func histogramEntropy(hist []int, total int) float64 {
+    if total == 0 {
+        return 0
+    }
+    inv := 1.0 / float64(total)
+    var e float64
+    for _, c := range hist {
+        if c == 0 {
+            continue
+        }
+        p := float64(c) * inv
+        e -= p * math.Log2(p)
+    }
+    return e
+}
+
 func applyPaletteTransform(pixels *[]color.NRGBA, width, height int) ([]color.NRGBA, int, error) {
     var pal []color.NRGBA
     for _, p := range (*pixels) {
