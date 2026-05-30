@@ -350,53 +350,117 @@ func writeBitStreamData(w *bitWriter, img image.Image, colorCacheBits int, trans
 func writeImageData(w *bitWriter, pixels []color.NRGBA, width, height int, isRecursive bool, colorCacheBits int) {
     if colorCacheBits > 0 {
         w.writeBits(1, 1)
-        w.writeBits(uint64(colorCacheBits), 4) 
+        w.writeBits(uint64(colorCacheBits), 4)
     } else {
         w.writeBits(0, 1)
     }
 
-    if isRecursive {
-        w.writeBits(0, 1)
+    encoded, tokenStart := encodeImageData(pixels, width, height, colorCacheBits)
+
+    if !isRecursive {
+        // Sub-image (transform / entropy data): single Huffman group, no
+        // meta-Huffman bit (the decoder only reads it for the top-level image).
+        writeSingleGroup(w, encoded, colorCacheBits)
+        return
     }
 
-    encoded := encodeImageData(pixels, width, height, colorCacheBits)
-    histos := computeHistograms(encoded, colorCacheBits)
+    // Top-level image: choose the smaller of a single Huffman group vs
+    // meta-Huffman by encoding both to scratch buffers. The exact-size
+    // comparison guarantees meta-Huffman can never regress the output.
+    single := newTempWriter()
+    single.writeBits(0, 1) // use_meta_huffman = 0
+    writeSingleGroup(single, encoded, colorCacheBits)
 
-    var codes [][]huffmanCode
-    for i := 0; i < 5; i++ {
-        // WebP specs requires Huffman codes with maximum depth of 15
-        c := buildhuffmanCodes(histos[i], 15)
-        codes = append(codes, c)
-
-        writehuffmanCodes(w, c)
-    }
-
-    for i := 0; i < len(encoded); i ++ {
-        w.writeCode(codes[0][encoded[i + 0]])
-        if encoded[i + 0] < 256 {
-            w.writeCode(codes[1][encoded[i + 1]])
-            w.writeCode(codes[2][encoded[i + 2]])
-            w.writeCode(codes[3][encoded[i + 3]])
-            i += 3
-        } else if encoded[i + 0] < 256 + 24 {
-            cnt := prefixEncodeBits(int(encoded[i + 0]) - 256)
-            w.writeBits(uint64(encoded[i + 1]), cnt);
-
-            w.writeCode(codes[4][encoded[i + 2]])
-
-            cnt = prefixEncodeBits(int(encoded[i + 2]))
-            w.writeBits(uint64(encoded[i + 3]), cnt);
-            i += 3
+    if plan := planMetaHuffman(encoded, tokenStart, width, height, colorCacheBits); plan != nil {
+        meta := newTempWriter()
+        meta.writeBits(1, 1) // use_meta_huffman = 1
+        meta.writeBits(uint64(plan.hBits-2), 3)
+        writeImageData(meta, buildEntropyImage(plan), plan.bw, plan.bh, false, 0)
+        writeMetaGroups(meta, encoded, tokenStart, plan, width, colorCacheBits)
+        if meta.bitLen() < single.bitLen() {
+            appendBits(w, meta)
+            return
         }
+    }
+    appendBits(w, single)
+}
+
+// writeSingleGroup builds one Huffman group (5 codes) for the whole token stream
+// and emits the code tables followed by the entropy-coded tokens.
+func writeSingleGroup(w *bitWriter, encoded []int, colorCacheBits int) {
+    histos := computeHistograms(encoded, colorCacheBits)
+    codes := make([][]huffmanCode, 5)
+    for s := 0; s < 5; s++ {
+        // WebP requires Huffman codes with a maximum depth of 15.
+        codes[s] = buildhuffmanCodes(histos[s], 15)
+        writehuffmanCodes(w, codes[s])
+    }
+    for i := 0; i < len(encoded); {
+        i += writeTokenCodes(w, encoded, i, codes)
     }
 }
 
-func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) []int {
+// writeMetaGroups builds one Huffman group per cluster, emits all group code
+// tables, then emits each token using the code group of the tile its starting
+// pixel falls in.
+func writeMetaGroups(w *bitWriter, encoded, tokenStart []int, plan *metaPlan, width, colorCacheBits int) {
+    cacheSize := 0
+    if colorCacheBits > 0 {
+        cacheSize = 1 << colorCacheBits
+    }
+    groupHistos := make([][][]int, plan.numGroups)
+    for g := range groupHistos {
+        groupHistos[g] = newHistoSet(cacheSize)
+    }
+    for k, i := 0, 0; i < len(encoded); k++ {
+        i += addToken(groupHistos[plan.groupOf(tokenStart[k], width)], encoded, i)
+    }
+
+    allCodes := make([][][]huffmanCode, plan.numGroups)
+    for g := 0; g < plan.numGroups; g++ {
+        codes := make([][]huffmanCode, 5)
+        for s := 0; s < 5; s++ {
+            codes[s] = buildhuffmanCodes(groupHistos[g][s], 15)
+            writehuffmanCodes(w, codes[s])
+        }
+        allCodes[g] = codes
+    }
+
+    for k, i := 0, 0; i < len(encoded); k++ {
+        i += writeTokenCodes(w, encoded, i, allCodes[plan.groupOf(tokenStart[k], width)])
+    }
+}
+
+// writeTokenCodes emits one token (literal / LZ77 copy / color-cache reference)
+// with the given Huffman group and returns the number of ints it consumed.
+func writeTokenCodes(w *bitWriter, encoded []int, i int, codes [][]huffmanCode) int {
+    sym := encoded[i]
+    w.writeCode(codes[0][sym])
+    if sym < 256 {
+        w.writeCode(codes[1][encoded[i+1]])
+        w.writeCode(codes[2][encoded[i+2]])
+        w.writeCode(codes[3][encoded[i+3]])
+        return 4
+    } else if sym < 256+24 {
+        w.writeBits(uint64(encoded[i+1]), prefixEncodeBits(sym-256))
+        w.writeCode(codes[4][encoded[i+2]])
+        w.writeBits(uint64(encoded[i+3]), prefixEncodeBits(int(encoded[i+2])))
+        return 4
+    }
+    return 1
+}
+
+// encodeImageData LZ77+color-cache codes the pixels. It returns the flat symbol
+// stream (encoded) and, parallel to the token sequence, tokenStart[k] = the
+// pixel index at which token k begins. tokenStart is needed by meta-Huffman to
+// map each token to its image tile (and hence its Huffman group).
+func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) ([]int, []int) {
     head := make([]int, 1 << 14)
     prev := make([]int, len(pixels))
     cache := make([]color.NRGBA, 1 << colorCacheBits)
 
     encoded := make([]int, len(pixels) * 4)
+    tokenStart := make([]int, 0, len(pixels))
     cnt := 0
 
     var distances = []int {
@@ -449,6 +513,7 @@ func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) []
 
             // Only use the match if it is at least 3 pixels long per WebP specs.
             if streak >= 3 {
+                tokenStart = append(tokenStart, i)
                 for j := 0; j < streak; j++ {
                     h := hash(pixels[i + j], colorCacheBits)
                     cache[h] = pixels[i + j]
@@ -483,6 +548,7 @@ func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) []
             hash := hash(p, colorCacheBits)
 
             if i > 0 && cache[hash] == p {
+                tokenStart = append(tokenStart, i)
                 encoded[cnt] = int(hash + 256 + 24)
                 cnt++
                 continue
@@ -491,6 +557,7 @@ func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) []
             cache[hash] = p
         }
 
+        tokenStart = append(tokenStart, i)
         encoded[cnt+0] = int(p.G)
         encoded[cnt+1] = int(p.R)
         encoded[cnt+2] = int(p.B)
@@ -498,7 +565,7 @@ func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) []
         cnt += 4
     }
 
-    return encoded[:cnt]
+    return encoded[:cnt], tokenStart
 }
 
 func prefixEncodeCode(n int) (int, int) {
