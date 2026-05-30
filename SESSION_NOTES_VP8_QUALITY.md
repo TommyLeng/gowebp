@@ -1,5 +1,17 @@
 # VP8 Quality Investigation — 2026-05-29/30 Session Notes
 
+## Lossless VP8L side-quest (2026-05-30) — see memory project-lossless-vp8l
+
+Digging into why i1-a looked "strictly dominated" by cwebp revealed it was the
+**alpha plane (lossless VP8L), not the VP8 lossy color** — gowebp's VP8 color
+actually beats cwebp. Landed three lossless fixes (all round-trip bit-exact via
+`TestLosslessRoundTrip`): subtract-green entropy analysis (efbfd3c, alpha −23%),
+meta-Huffman per-region code groups (6e2f7e6, regional −4%, exact-size guard so
+never regresses), and LZ77 covered-position hash insertion (0f2340b, alpha
+−6.9% / heidi −2.4%). i1-a alpha gap to cwebp: +44% → +34%. Next lever is
+cost-based / lazy LZ77 (gowebp uses greedy longest-match); general VP8L gap is
+only ~7%.
+
 ## RESOLVED (2026-05-30) — mixed i4/i16 mode enabled (lambda_mode + R)
 
 Re-applied the `lambda_mode` cross-category RD fix. It immediately collapsed
