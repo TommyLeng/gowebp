@@ -476,10 +476,7 @@ func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) ([
 
     for i := 0; i < len(pixels); i++ {
         if i + 2 < len(pixels) {
-            h := hash(pixels[i + 0], 14)
-            h ^= hash(pixels[i + 1], 14) * 0x9e3779b9
-            h ^= hash(pixels[i + 2], 14) * 0x85ebca6b
-            h = h % (1 << 14)
+            h := hash3(pixels, i)
 
             cur := head[h] - 1
             prev[i] = head[h]
@@ -518,7 +515,19 @@ func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) ([
                     h := hash(pixels[i + j], colorCacheBits)
                     cache[h] = pixels[i + j]
                 }
-                
+                // Insert the positions covered by this match into the LZ77 hash
+                // chain (position i was already inserted during the search) so
+                // later matches can reference them. Skipping covered positions
+                // loses matches on repetitive data such as alpha masks.
+                for j := 1; j < streak; j++ {
+                    p := i + j
+                    if p+2 < len(pixels) {
+                        hh := hash3(pixels, p)
+                        prev[p] = head[hh]
+                        head[hh] = p + 1
+                    }
+                }
+
                 y := dis / width
                 x := dis - y * width
             
@@ -599,6 +608,15 @@ func hash(c color.NRGBA, shifts int) uint32 {
     //hash formula including magic number 0x1e35a7bd comes directly from WebP specs!
     x := uint32(c.A) << 24 | uint32(c.R) << 16 | uint32(c.G) << 8 | uint32(c.B)
     return (x * 0x1e35a7bd) >> (32 - min(shifts, 32))
+}
+
+// hash3 hashes the 3-pixel sequence starting at i into a 14-bit LZ77 chain
+// bucket. Callers must ensure i+2 < len(pixels).
+func hash3(pixels []color.NRGBA, i int) uint32 {
+    h := hash(pixels[i+0], 14)
+    h ^= hash(pixels[i+1], 14) * 0x9e3779b9
+    h ^= hash(pixels[i+2], 14) * 0x85ebca6b
+    return h % (1 << 14)
 }
 
 func computeHistograms(pixels []int, colorCacheBits int) [][]int {
