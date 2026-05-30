@@ -455,6 +455,35 @@ func writeTokenCodes(w *bitWriter, encoded []int, i int, codes [][]huffmanCode) 
 // pixel index at which token k begins. tokenStart is needed by meta-Huffman to
 // map each token to its image tile (and hence its Huffman group).
 func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) ([]int, []int) {
+    // Pass 1: greedy longest-match parse. Always valid on its own and used both
+    // as a fallback and to seed the cost model for the optimal parse.
+    encG, tsG := encodeImageDataGreedy(pixels, width, height, colorCacheBits)
+    histoG := computeHistograms(encG, colorCacheBits)
+
+    // Pass 2: cost-based optimal parse. The model is derived from the greedy
+    // token statistics, so the optimal parse sees realistic per-symbol bit
+    // costs (crucially including distance-code cost, which greedy ignores).
+    matchLen, matchOff := fillMatches(pixels, width)
+    model := buildCostModel(histoG)
+    encO, tsO := encodeImageDataOptimal(pixels, width, colorCacheBits, model, matchLen, matchOff)
+
+    // Keep whichever parse has the lower estimated cost. The estimate MUST
+    // include the raw length/distance extra bits (streamExtraBits) — the
+    // optimal parse trades many large-distance copies for cheap literals/cache,
+    // which raises symbol entropy but slashes the un-Huffman'd distance extra
+    // bits, so an entropy-only comparison would wrongly keep greedy. Both parses
+    // produce identical pixels, so the choice only affects size, never output.
+    costG := dataCostBits(histoG) + streamExtraBits(encG)
+    costO := dataCostBits(computeHistograms(encO, colorCacheBits)) + streamExtraBits(encO)
+    if costO < costG {
+        return encO, tsO
+    }
+    return encG, tsG
+}
+
+// encodeImageDataGreedy is the original greedy longest-match LZ77 + color-cache
+// parser. It returns the flat symbol stream and the per-token start positions.
+func encodeImageDataGreedy(pixels []color.NRGBA, width, height, colorCacheBits int) ([]int, []int) {
     head := make([]int, 1 << 14)
     prev := make([]int, len(pixels))
     cache := make([]color.NRGBA, 1 << colorCacheBits)
@@ -462,17 +491,6 @@ func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) ([
     encoded := make([]int, len(pixels) * 4)
     tokenStart := make([]int, 0, len(pixels))
     cnt := 0
-
-    var distances = []int {
-        96,   73,  55,  39,  23,  13,   5,  1,  255, 255, 255, 255, 255, 255, 255, 255,
-        101,  78,  58,  42,  26,  16,   8,  2,    0,   3,  9,   17,  27,  43,  59,  79,
-        102,  86,  62,  46,  32,  20,  10,  6,    4,   7,  11,  21,  33,  47,  63,  87,
-        105,  90,  70,  52,  37,  28,  18,  14,  12,  15,  19,  29,  38,  53,  71,  91,
-        110,  99,  82,  66,  48,  35,  30,  24,  22,  25,  31,  36,  49,  67,  83, 100,
-        115, 108,  94,  76,  64,  50,  44,  40,  34,  41,  45,  51,  65,  77,  95, 109,
-        118, 113, 103,  92,  80,  68,  60,  56,  54,  57,  61,  69,  81,  93, 104, 114,
-        119, 116, 111, 106,  97,  88,  84,  74,  72,  75,  85,  89,  98, 107, 112, 117,
-    }
 
     for i := 0; i < len(pixels); i++ {
         if i + 2 < len(pixels) {
@@ -528,15 +546,7 @@ func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) ([
                     }
                 }
 
-                y := dis / width
-                x := dis - y * width
-            
-                code := dis + 120
-                if x <= 8 && y < 8 {
-                    code = distances[y * 16 + 8 - x] + 1
-                } else if x > width - 8 && y < 7 {
-                    code = distances[(y + 1) * 16 + 8 + (width - x)] + 1
-                }
+                code := distancePlaneCode(dis, width)
 
                 s, l := prefixEncodeCode(streak)
                 encoded[cnt + 0] = int(s + 256)

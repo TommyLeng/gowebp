@@ -14,9 +14,10 @@ import (
 // inflate the stream — and KEPT for correlated RGB photos where it roughly
 // halves the size.
 func TestAlphaSubtractGreenRegression(t *testing.T) {
-	// (1) i1-a carries a real alpha channel. Its ALPH (lossless VP8L) chunk used
-	// to balloon to ~46 KB because subtract-green was forced on the single-channel
-	// alpha; with the analysis it is ~36 KB.
+	// (1) i1-a carries a real alpha channel. Its ALPH (lossless VP8L) chunk was
+	// ~46 KB when subtract-green was forced on the single-channel alpha, ~33 KB
+	// after the transform analysis, and ~28 KB after the cost-based LZ77 parse
+	// (cost_lz77.go) replaced the distance-cost-blind greedy match selection.
 	if orig, err := loadPNG("test_data/original/i1-a.png"); err == nil {
 		var buf bytes.Buffer
 		if err := Encode(&buf, orig, &Options{Quality: 75}); err != nil {
@@ -24,8 +25,8 @@ func TestAlphaSubtractGreenRegression(t *testing.T) {
 		}
 		alph := webpChunkSize(buf.Bytes(), "ALPH")
 		t.Logf("i1-a ALPH chunk: %d bytes", alph)
-		if alph > 40000 {
-			t.Errorf("ALPH chunk %d bytes — subtract-green analysis regressed (want <40000)", alph)
+		if alph > 29000 {
+			t.Errorf("ALPH chunk %d bytes — cost-based LZ77 / subtract-green regressed (want <29000)", alph)
 		}
 	}
 
