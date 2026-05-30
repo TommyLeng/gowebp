@@ -1,5 +1,53 @@
 # VP8 Quality Investigation — 2026-05-29/30 Session Notes
 
+## RESOLVED (2026-05-30) — mixed i4/i16 mode enabled (lambda_mode + R)
+
+Re-applied the `lambda_mode` cross-category RD fix. It immediately collapsed
+PSNR (~9 dB) / produced undecodable streams — the long-feared "mixed-mode
+collapse". Root-caused with `TestEncoderReconVsDecoder` (GOMAXPROCS=1,
+`debugDisableLoopFilter=true`): first diverging MB was MB(8,0), an i16
+DC_PRED MB whose Y2-DC arithmetic-coding context differed from the decoder.
+
+### Root cause: i16 Y2-DC NZ-context reset on i4 MBs
+libwebp `ParseResiduals` (vp8_dec.c:549-566) leaves `nz_dc` **unchanged** for
+i4 MBs (they have no Y2 block). gowebp's emission (`encodeTokenPartition`) and
+stats pass (`collectCoeffStats`) RESET `topNzDC[mbX]`/`leftNzY[4]` to 0 for i4
+MBs. When an i16 MB followed an i4 neighbour, the Y2-DC context diverged from
+the decoder → bool-decoder desync from that MB onward. Invisible while the
+encoder was 100% i4 (Y2 plane never used). **Fix: don't touch the DC context
+on i4 MBs** (coeff_adapt.go). Verified bit-exact: `TestEncoderReconVsDecoder`
+0/79524 mismatch.
+
+### lambda_mode + R cross-category scoring (follows libwebp exactly)
+Both i16 and i4 cross-category scores now use SetRDScore's form
+`RD_DISTO_MULT*D + lambda_mode*(H + R)`:
+- i16 R = port of `VP8GetCostLuma16` (Y2 type-1 + 16 luma-AC type-0 blocks),
+  using the same NZ contexts the emission/decoder use. Needed a new
+  `trellisY2Costs` table (coeff type 1).
+- i4 R = accumulated per-block `coeffBitCost` + flatness penalty of the
+  winning mode (`VP8GetCostLuma4`).
+Omitting R (first attempt) over-selected i16 and bloated files (+16% on
+frame27). With R, i16 is picked only when RD-beneficial.
+
+### Results (vs old 100%-i4; via C dwebp)
+| Image | old 100% i4 | mixed + R | libwebp |
+|---|---|---|---|
+| i1-a.png | 40.47 dB / 84772 B | 40.48 dB / 82482 B (−2.7%) | 42.12 dB / 62494 B |
+| heidi | 35.16 dB / 228302 B | 35.18 dB / 226248 B (−0.9%) | 35.69 dB / 231394 B |
+| frame27 modes | 100% i4 | 20% i16 | (~50% i16) |
+
+Net: smaller files + tiny PSNR gain; cannot RD-regress (i16 only chosen when
+its score wins). serial==parallel bit-exact. Also added: serial fallback when
+`debugDumpI16Capture != nil` (parallel raced on the shared map), and
+`TestI16MixedModeDecodes` regression guard.
+
+### Still open — the bulk of the ~1 dB gap remains
+PSNR only moved +0.01–0.02 dB. gowebp picks far less i16 than libwebp
+(20% vs ~50% on frame27). Prime suspect: **i16 per-mode selection still uses
+pre-quant prediction SSD** (`intra16Predict` source-based), while libwebp uses
+full `ReconstructIntra16` (post-quant recon SSE + R) per mode. That is the next
+libwebp-parity step.
+
 ## Goal
 Close the 11 dB PSNR gap: gowebp 24.5 dB vs cwebp 35.5 dB at quality 75
 on natural images (face frames from `baf1a2d038ad43b4bbe8b13799c0987d.gif`).
@@ -111,18 +159,21 @@ All hooks are inert in production (nil/false by default).
 
 ## Next-session plan
 
-1. **Re-attempt the lambda_mode fix** for cross-category i4-vs-i16
-   comparison. Now that boundary bugs are fixed, mixed-mode encoding
-   should produce correct output. Expected: closes the remaining
-   ~1 dB gap to libwebp.
+1. ~~**Re-attempt the lambda_mode fix**~~ ✅ done 2026-05-30 (see top section):
+   mixed mode enabled, Y2-DC NZ-context desync fixed, R term added. RD
+   improved but the bulk of the ~1 dB gap remains.
 
-2. **Further libwebp parity items** (lower priority):
-   - i16 per-mode selection uses pre-quant SSE from source-based pred;
-     libwebp uses post-quant SSE from recon-based pred via
-     `ReconstructIntra16`. Small effect at high quality.
-   - i16 final score is missing `R` (coefficient rate) and `SD`
-     (Hadamard texture distortion); libwebp includes both.
-   - `tlambda_` per-MB texture activity weighting: not implemented.
+2. **i16 per-mode selection via recon (highest remaining priority).**
+   gowebp picks the i16 mode by pre-quant SSD of the source-based
+   prediction (`intra16Predict`); libwebp's `PickBestIntra16` reconstructs
+   each mode (`ReconstructIntra16`: quant+dequant+iDCT) and scores
+   post-recon `D + lambda_i16*(H+R)`. This likely explains why gowebp
+   selects ~20% i16 vs libwebp's ~50% and leaves PSNR on the table.
+
+3. **Further libwebp parity items** (lower priority):
+   - `SD` (Hadamard texture distortion) + `tlambda_` per-MB texture
+     weighting: not implemented (SD=0 in both i16 and i4 scores). libwebp
+     also doubles D/SD for flat i16 blocks (`IsFlat` refinement).
 
 ## Quick reproduction
 

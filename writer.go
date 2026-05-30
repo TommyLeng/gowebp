@@ -89,7 +89,9 @@ func encodeLossy(w io.Writer, img image.Image, quality int) error {
 	// Encode the VP8 frame — use wave-front parallel encoding for large images.
 	mbCount := (yuv.mbW / 16) * (yuv.mbH / 16)
 	var vp8Data []byte
-	if mbCount > parallelThreshold && runtime.GOMAXPROCS(0) > 1 {
+	// debugDumpI16Capture writes a shared map per-MB; the parallel encoder would
+	// race on it. Force the serial path when that debug hook is active.
+	if mbCount > parallelThreshold && runtime.GOMAXPROCS(0) > 1 && debugDumpI16Capture == nil {
 		vp8Data = encodeFrameParallel(yuv, baseQ, arena)
 	} else {
 		vp8Data = encodeFrame(yuv, baseQ, arena)

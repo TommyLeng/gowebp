@@ -28,6 +28,7 @@ type segmentParams struct {
 	trellisI4Costs  trellisCostTables
 	trellisI16Costs trellisCostTables
 	trellisUVCosts  trellisCostTables
+	trellisY2Costs  trellisCostTables // Y2/WHT-DC plane (coeff type 1), for i16 R cost
 }
 
 // makeSegmentParams builds a segmentParams for a given quality level.
@@ -94,6 +95,7 @@ func makeSegmentParams(quality int) segmentParams {
 		trellisI4Costs:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[3])),
 		trellisI16Costs:  buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[0])),
 		trellisUVCosts:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[2])),
+		trellisY2Costs:   buildTrellisCostTables((*[numBands][numCtx][numProbas]uint8)(&defaultCoeffProbs[1])),
 	}
 }
 
@@ -350,19 +352,54 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				}
 			}
 
-			// MB-level RD decision: compare i4 vs i16.
-			// Known-imperfect approximation: uses lambdaI16 for i16 rate;
-			// libwebp re-scores with lambda_mode (quant_enc.c:1029, 1121).
-			// Switching to lambda_mode gives correct mode distribution but
-			// exposes a separate bug in mixed-mode i16 reconstruction.
-			// See SESSION_NOTES_VP8_QUALITY.md for full details.
-			i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
+			// i16 coefficient rate R (port of VP8GetCostLuma16, quant_enc.c:1008):
+			// cost of the Y2/WHT-DC block (coeff type 1) plus the 16 luma AC blocks
+			// (coeff type 0, first=1). Uses the same NZ contexts the decoder and the
+			// token-partition emission will use for this MB, so the rate estimate
+			// matches the actual bitstream cost.
+			var i16R int64
+			{
+				dcCtx := topNzDC[mbX] + leftNzY[4]
+				i16R = int64(coeffBitCost(dcCtx, ws.mbI16DcQuantLevels[:], 0, &seg.trellisY2Costs))
+				var topNzAC, leftNzAC [4]int
+				for bx := 0; bx < 4; bx++ {
+					topNzAC[bx] = topNzY[mbX*4+bx]
+				}
+				for by := 0; by < 4; by++ {
+					leftNzAC[by] = leftNzY[by]
+				}
+				for by := 0; by < 4; by++ {
+					for bx := 0; bx < 4; bx++ {
+						n := by*4 + bx
+						acCtx := topNzAC[bx] + leftNzAC[by]
+						i16R += int64(coeffBitCost(acCtx, ws.mbI16AcLevels[n][:], 1, trellisI16Costs))
+						nz := 0
+						if findLast(ws.mbI16AcLevels[n][:], 1) >= 1 {
+							nz = 1
+						}
+						topNzAC[bx] = nz
+						leftNzAC[by] = nz
+					}
+				}
+			}
+
+			// MB-level RD decision: compare i4 vs i16 on a common scale.
+			// libwebp uses lambda_i16/lambda_i4 only for *within-category* mode
+			// selection, then re-scores the winner of each category with
+			// lambda_mode for the *cross-category* comparison (quant_enc.c:1029,
+			// 1121). We mirror SetRDScore's form for both:
+			//   score = RD_DISTO_MULT*D + lambda_mode*(H + R)
+			// (SD/tlambda texture term not yet implemented, so SD=0). Previously
+			// this used lambdaI16 (= 3*qI16², far larger than lambda_mode) for the
+			// rate term and omitted R, which over-penalised the i16 header yet
+			// under-counted its coefficients and forced 100% i4 on natural images.
+			i16Score := int64(rdDistoMult)*i16PostQuantDistortion + int64(mbLambdaMode)*(i16ModeBitCost(bestI16Mode)+i16R)
 			i4HeaderCost := int64(mbLambdaMode) * 211
 
 			// -------------------------------------------------------
 			// Try intra4: for each of 16 4x4 blocks pick best mode
 			// -------------------------------------------------------
-			var bestI4Score int64
+			var i4Score int64
 
 			{
 				// Track per-block top/left mode context
@@ -387,7 +424,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				fillI4Patch(&ws.i4Patch, recon, reconStride, px, py, yuv.mbW, yuv.mbH)
 				mbHasTop := mbY > 0
 
-				var i4TotalScore int64
+				var i4TotalD, i4TotalH, i4TotalR int64
 
 				for by := 0; by < 4; by++ {
 					for bx := 0; bx < 4; bx++ {
@@ -431,7 +468,7 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						// Try all relevant I4 modes; track the best.
 						bestBlkMode := B_DC_PRED
 						bestBlkScore := int64(1<<62 - 1)
-						bestBlkOldScore := int64(1<<62 - 1)
+						var bestBlkD, bestBlkH, bestBlkR int64
 
 						// trellisCtx0 is a loop-invariant for this block.
 						trellisCtx0 := topNzI4[bx] + leftNzI4[by]
@@ -457,7 +494,9 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							score := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*(modeBits+int64(rCost))
 							if score < bestBlkScore {
 								bestBlkScore = score
-								bestBlkOldScore = distortion + int64(mbLambdaI4)*modeBits
+								bestBlkD = distortion
+								bestBlkH = modeBits
+								bestBlkR = int64(rCost)
 								bestBlkMode = mode
 								copy(ws.bestBlkAcLevels[:], ws.acQ[:])
 								for i := 0; i < 16; i++ {
@@ -542,7 +581,9 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 								score := dScore + int64(mbLambdaI4)*(int64(rCost)+flatBitsR)
 								if score < bestBlkScore {
 									bestBlkScore = score
-									bestBlkOldScore = distortion + int64(mbLambdaI4)*modeBits
+									bestBlkD = distortion
+									bestBlkH = modeBits
+									bestBlkR = int64(rCost) + flatBitsR
 									bestBlkMode = mode
 									copy(ws.bestBlkAcLevels[:], ws.acQ[:])
 									for i := 0; i < 16; i++ {
@@ -555,10 +596,14 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 						ws.localI4Modes[blkIdx] = bestBlkMode
 						ws.localI4AcLevels[blkIdx] = ws.bestBlkAcLevels
 						ws.localI4DcLevels[blkIdx] = 0 // i4 has no WHT DC
-						i4TotalScore += bestBlkOldScore
+						i4TotalD += bestBlkD
+						i4TotalH += bestBlkH
+						i4TotalR += bestBlkR
 
-						// Per-block early-out: bail if accumulated i4 already exceeds i16.
-						if i4TotalScore+i4HeaderCost >= i16Score {
+						// Per-block early-out: bail if accumulated i4 already exceeds
+						// i16. Same lambda_mode-scaled form as the final score below;
+						// D, H and R only grow, so this is a safe monotone lower bound.
+						if int64(rdDistoMult)*i4TotalD+int64(mbLambdaMode)*(i4TotalH+i4TotalR)+i4HeaderCost >= i16Score {
 							goto i4EarlyOut
 						}
 
@@ -585,10 +630,9 @@ func encodeFrame(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 				}
 
 			i4EarlyOut:
-				bestI4Score = i4TotalScore
+				i4Score = int64(rdDistoMult)*i4TotalD + int64(mbLambdaMode)*(i4TotalH+i4TotalR) + i4HeaderCost
 			}
 
-			i4Score := bestI4Score + i4HeaderCost
 			info := &mbInfos[mbIdx]
 			if i4Score < i16Score {
 				info.isI4 = true

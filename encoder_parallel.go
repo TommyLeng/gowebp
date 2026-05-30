@@ -385,13 +385,45 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					}
 				}
 
-				i16Score := i16PostQuantDistortion + int64(mbLambdaI16)*i16ModeBitCost(bestI16Mode)
+				// i16 coefficient rate R (port of VP8GetCostLuma16): Y2/WHT-DC block
+				// (coeff type 1) + 16 luma AC blocks (type 0, first=1), using the same
+				// NZ contexts the emission/decoder use. Mirrors encoder.go.
+				var i16R int64
+				{
+					dcCtx := colTopNzDC + leftNzY[4]
+					i16R = int64(coeffBitCost(dcCtx, ws.mbI16DcQuantLevels[:], 0, &seg.trellisY2Costs))
+					var topNzAC, leftNzAC [4]int
+					for bx := 0; bx < 4; bx++ {
+						topNzAC[bx] = colTopNzY[bx]
+					}
+					for by := 0; by < 4; by++ {
+						leftNzAC[by] = leftNzY[by]
+					}
+					for by := 0; by < 4; by++ {
+						for bx := 0; bx < 4; bx++ {
+							n := by*4 + bx
+							acCtx := topNzAC[bx] + leftNzAC[by]
+							i16R += int64(coeffBitCost(acCtx, ws.mbI16AcLevels[n][:], 1, trellisI16Costs))
+							nz := 0
+							if findLast(ws.mbI16AcLevels[n][:], 1) >= 1 {
+								nz = 1
+							}
+							topNzAC[bx] = nz
+							leftNzAC[by] = nz
+						}
+					}
+				}
+
+				// MB-level RD decision: compare i4 vs i16 on a common scale. Both use
+				// SetRDScore's form  score = RD_DISTO_MULT*D + lambda_mode*(H + R)
+				// (SD/tlambda not implemented). Mirrors encoder.go.
+				i16Score := int64(rdDistoMult)*i16PostQuantDistortion + int64(mbLambdaMode)*(i16ModeBitCost(bestI16Mode)+i16R)
 				i4HeaderCost := int64(mbLambdaMode) * 211
 
 				// -------------------------------------------------------
 				// Try intra4
 				// -------------------------------------------------------
-				var bestI4Score int64
+				var i4Score int64
 
 				{
 					var topBlkMode [4]int
@@ -414,7 +446,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					fillI4Patch(&ws.i4Patch, recon, reconStride, px, py, yuv.mbW, yuv.mbH)
 					mbHasTop := ry > 0
 
-					var i4TotalScore int64
+					var i4TotalD, i4TotalH, i4TotalR int64
 
 					for by := 0; by < 4; by++ {
 						for bx := 0; bx < 4; bx++ {
@@ -454,7 +486,7 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 
 							bestBlkMode := B_DC_PRED
 							bestBlkScore := int64(1<<62 - 1)
-							bestBlkOldScore := int64(1<<62 - 1)
+							var bestBlkD, bestBlkH, bestBlkR int64
 
 							// trellisCtx0 is a loop-invariant for this block.
 							trellisCtx0 := topNzI4[bx] + leftNzI4[by]
@@ -478,7 +510,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 								score := int64(rdDistoMult)*distortion + int64(mbLambdaI4)*(modeBits+int64(rCost))
 								if score < bestBlkScore {
 									bestBlkScore = score
-									bestBlkOldScore = distortion + int64(mbLambdaI4)*modeBits
+									bestBlkD = distortion
+									bestBlkH = modeBits
+									bestBlkR = int64(rCost)
 									bestBlkMode = mode
 									copy(ws.bestBlkAcLevels[:], ws.acQ[:])
 									for i := 0; i < 16; i++ {
@@ -560,7 +594,9 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 									score := dScore + int64(mbLambdaI4)*(int64(rCost)+flatBitsR)
 									if score < bestBlkScore {
 										bestBlkScore = score
-										bestBlkOldScore = distortion + int64(mbLambdaI4)*modeBits
+										bestBlkD = distortion
+										bestBlkH = modeBits
+										bestBlkR = int64(rCost) + flatBitsR
 										bestBlkMode = mode
 										copy(ws.bestBlkAcLevels[:], ws.acQ[:])
 										for i := 0; i < 16; i++ {
@@ -573,10 +609,14 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 							ws.localI4Modes[blkIdx] = bestBlkMode
 							ws.localI4AcLevels[blkIdx] = ws.bestBlkAcLevels
 							ws.localI4DcLevels[blkIdx] = 0
-							i4TotalScore += bestBlkOldScore
+							i4TotalD += bestBlkD
+							i4TotalH += bestBlkH
+							i4TotalR += bestBlkR
 
-							// Per-block early-out: bail if accumulated i4 already exceeds i16.
-							if i4TotalScore+i4HeaderCost >= i16Score {
+							// Per-block early-out: bail if accumulated i4 already exceeds
+							// i16. Same lambda_mode-scaled form as the final score below;
+							// D, H and R only grow, so this is a safe monotone lower bound.
+							if int64(rdDistoMult)*i4TotalD+int64(mbLambdaMode)*(i4TotalH+i4TotalR)+i4HeaderCost >= i16Score {
 								goto i4EarlyOut
 							}
 
@@ -599,10 +639,8 @@ func encodeFrameParallel(yuv *yuvImage, baseQ int, arena *frameArena) []byte {
 					}
 
 				i4EarlyOut:
-					bestI4Score = i4TotalScore
+					i4Score = int64(rdDistoMult)*i4TotalD + int64(mbLambdaMode)*(i4TotalH+i4TotalR) + i4HeaderCost
 				}
-
-				i4Score := bestI4Score + i4HeaderCost
 
 				info := &mbInfos[mbIdx]
 				if i4Score < i16Score {

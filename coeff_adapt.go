@@ -525,8 +525,12 @@ func collectCoeffStats(mbCoeffs []mbCoeffData, mbW, mbH int, stats *coeffStats) 
 						leftNzY[by] = nz
 					}
 				}
-				topNzDC[mbX] = 0
-				leftNzY[4] = 0
+				// i4 MBs have no Y2 block. The VP8 decoder (ParseResiduals in
+				// vp8_dec.c) leaves nz_dc UNCHANGED for i4 MBs — it does NOT reset
+				// it to 0. So we must not touch topNzDC[mbX]/leftNzY[4] here, or the
+				// Y2 DC context of a following i16 MB diverges from the decoder's,
+				// desyncing the bool decoder. (leftNzY[4] is already reset per-row at
+				// scanline start, matching the decoder's VP8InitScanline.)
 			} else {
 				dcCtx := topNzDC[mbX] + leftNzY[4]
 				lastDC := int(cd.i16DCLast)
@@ -619,8 +623,12 @@ func encodeTokenPartition(bw *boolEncoder, mbCoeffs []mbCoeffData, mbW, mbH int,
 						leftNzY[by] = nz
 					}
 				}
-				topNzDC[mbX] = 0
-				leftNzY[4] = 0
+				// i4 MBs have no Y2 block. The VP8 decoder (ParseResiduals in
+				// vp8_dec.c) leaves nz_dc UNCHANGED for i4 MBs — it does NOT reset
+				// it to 0. So we must not touch topNzDC[mbX]/leftNzY[4] here, or the
+				// Y2 DC context of a following i16 MB diverges from the decoder's,
+				// desyncing the bool decoder. (leftNzY[4] is already reset per-row at
+				// scanline start, matching the decoder's VP8InitScanline.)
 			} else {
 				dcCtx := topNzDC[mbX] + leftNzY[4]
 				lastDC := int(cd.i16DCLast)

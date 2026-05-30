@@ -193,7 +193,8 @@ func encodeLossyWithAlpha(out io.Writer, img image.Image, quality int) error {
 	baseQ := qualityToLevel(quality)
 	mbCount := (yuv.mbW / 16) * (yuv.mbH / 16)
 	var vp8Data []byte
-	if mbCount > parallelThreshold && runtime.GOMAXPROCS(0) > 1 {
+	// debugDumpI16Capture writes a shared map per-MB; force serial when active.
+	if mbCount > parallelThreshold && runtime.GOMAXPROCS(0) > 1 && debugDumpI16Capture == nil {
 		vp8Data = encodeFrameParallel(yuv, baseQ, arena)
 	} else {
 		vp8Data = encodeFrame(yuv, baseQ, arena)
