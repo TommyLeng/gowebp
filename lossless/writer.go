@@ -229,6 +229,33 @@ func writeFrames(ani *Animation) (*bytes.Buffer, bool, error) {
     return buf, hasAlpha, nil
 }
 
+// countColors returns the number of distinct RGBA colours in m, capped at 257
+// (it stops scanning and returns 257 once a 257th colour is seen). Only the
+// thresholds matter to the transform choice, not the exact count past them:
+//   - <=16  : the color-indexing transform packs the index to <=4 bit/px
+//             (libwebp xbits 1/2/3), so it dominates every other transform.
+//   - 17..256: a palette is still possible but the index is a full byte, so it
+//             only competes with the predictor path.
+//   - >256  : a palette is impossible (libwebp's MAX_PALETTE_SIZE), predictor
+//             only.
+func countColors(m *image.NRGBA) int {
+    seen := make(map[uint32]struct{}, 257)
+    w := m.Rect.Dx()
+    for y, h := 0, m.Rect.Dy(); y < h; y++ {
+        row := m.Pix[y*m.Stride : y*m.Stride+w*4]
+        for i := 0; i+4 <= len(row); i += 4 {
+            key := uint32(row[i])<<24 | uint32(row[i+1])<<16 | uint32(row[i+2])<<8 | uint32(row[i+3])
+            if _, ok := seen[key]; !ok {
+                seen[key] = struct{}{}
+                if len(seen) > 256 {
+                    return 257
+                }
+            }
+        }
+    }
+    return len(seen)
+}
+
 func writeBitStream(img image.Image) (*bytes.Buffer, bool, error) {
     if img == nil {
         return nil, false, errors.New("image is nil")
@@ -242,34 +269,72 @@ func writeBitStream(img image.Image) (*bytes.Buffer, bool, error) {
         return nil, false, errors.New("invalid image size")
     }
 
-    _, isIndexed := img.(*image.Paletted)
-
     rgba := image.NewNRGBA(image.Rect(0, 0, img.Bounds().Dx(), img.Bounds().Dy()))
     draw.Draw(rgba, rgba.Bounds(), img, img.Bounds().Min, draw.Src)
+    hasAlpha := !rgba.Opaque()
 
-    b := &bytes.Buffer{}
-    s := &bitWriter{Buffer: b}
+    // Pick the VP8L transform set by distinct-colour count, mirroring libwebp's
+    // EncoderAnalyze / AnalyzeEntropy (vp8l_enc.c). The color-indexing (palette)
+    // transform packs the index to <=4 bit/px for <=16 colours and is then
+    // "better than any other transform" (vp8l_enc.c:109) — the big win for
+    // delta-animation alpha masks (alpha 0/255 = 2 colours -> ~1 bit/px, ~2.7x
+    // smaller ALPH). Above 16 the index is a full byte so the predictor +
+    // subtract-green path competes; above 256 a palette is impossible
+    // (MAX_PALETTE_SIZE) so only predictor applies.
+    //
+    //   <=16  colours -> palette only            (single encode; always wins)
+    //   17..256        -> try both, keep smaller  (libwebp estimates this band;
+    //                     try-both is strictly more accurate and never regresses
+    //                     — e.g. a ~256-value gradient alpha still prefers the
+    //                     predictor, so it stays put)
+    //   >256           -> predictor only          (palette impossible)
+    //
+    // Every common input (binary masks, photos) is a single encode; only the
+    // rare 17..256 band pays for two, so this keeps the GIF path fast.
+    colors := countColors(rgba)
 
-    writeBitStreamHeader(s, rgba.Bounds(), !rgba.Opaque())
+    if colors <= 16 {
+        b, err := encodeVP8L(rgba, hasAlpha, true)
+        return b, hasAlpha, err
+    }
 
-    var transforms [4]bool
-    transforms[transformPredict] = !isIndexed
-    transforms[transformColor] = false
-    transforms[transformSubGreen] = !isIndexed
-    transforms[transformColorIndexing] = isIndexed
-
-    err := writeBitStreamData(s, rgba, maxColorCacheBits, transforms)
+    best, err := encodeVP8L(rgba, hasAlpha, false)
     if err != nil {
         return nil, false, err
     }
-    
-    s.alignByte()
+    if colors <= 256 {
+        if pal, perr := encodeVP8L(rgba, hasAlpha, true); perr == nil && pal.Len() < best.Len() {
+            best = pal
+        }
+    }
+    return best, hasAlpha, nil
+}
 
-    if b.Len() % 2 != 0 {
-        b.Write([]byte{0x00})
+// encodeVP8L encodes rgba as one VP8L bitstream, either with the predictor +
+// subtract-green transforms (usePalette=false) or with the color-indexing
+// palette transform (usePalette=true). Each call re-flattens rgba, so the two
+// variants are independent.
+func encodeVP8L(rgba *image.NRGBA, hasAlpha, usePalette bool) (*bytes.Buffer, error) {
+    b := &bytes.Buffer{}
+    s := &bitWriter{Buffer: b}
+
+    writeBitStreamHeader(s, rgba.Bounds(), hasAlpha)
+
+    var transforms [4]bool
+    transforms[transformPredict] = !usePalette
+    transforms[transformColor] = false
+    transforms[transformSubGreen] = !usePalette
+    transforms[transformColorIndexing] = usePalette
+
+    if err := writeBitStreamData(s, rgba, maxColorCacheBits, transforms); err != nil {
+        return nil, err
     }
 
-    return b, !rgba.Opaque(), nil
+    s.alignByte()
+    if b.Len()%2 != 0 {
+        b.Write([]byte{0x00})
+    }
+    return b, nil
 }
 
 func writeBitStreamHeader(w *bitWriter, bounds image.Rectangle, hasAlpha bool) {
