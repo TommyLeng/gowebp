@@ -51,6 +51,12 @@ type Animation struct {
     BackgroundColor     uint32
 }
 
+// maxColorCacheBits bounds the VP8L color-cache search. libwebp's
+// CalculateBestCacheSize tries every size in 0..MAX_COLOR_CACHE_BITS (10) and
+// keeps the one with the lowest estimated cost; encodeImageData does the same
+// (a fixed value is rarely optimal — flat alpha wants ~0, RGB photos want ~10).
+const maxColorCacheBits = 10
+
 // Encode writes the provided image.Image to the specified io.Writer in WebP format.
 //
 // This function always encodes the image using VP8L (lossless WebP). If `UseExtendedFormat`
@@ -252,7 +258,7 @@ func writeBitStream(img image.Image) (*bytes.Buffer, bool, error) {
     transforms[transformSubGreen] = !isIndexed
     transforms[transformColorIndexing] = isIndexed
 
-    err := writeBitStreamData(s, rgba, 4, transforms)
+    err := writeBitStreamData(s, rgba, maxColorCacheBits, transforms)
     if err != nil {
         return nil, false, err
     }
@@ -347,20 +353,22 @@ func writeBitStreamData(w *bitWriter, img image.Image, colorCacheBits int, trans
     return nil
 }
 
-func writeImageData(w *bitWriter, pixels []color.NRGBA, width, height int, isRecursive bool, colorCacheBits int) {
-    if colorCacheBits > 0 {
+func writeImageData(w *bitWriter, pixels []color.NRGBA, width, height int, isRecursive bool, maxCacheBits int) {
+    // Encode first: encodeImageData searches 0..maxCacheBits and returns the
+    // cache size it chose, which is what gets signalled in the header.
+    encoded, tokenStart, cacheBits := encodeImageData(pixels, width, height, maxCacheBits)
+
+    if cacheBits > 0 {
         w.writeBits(1, 1)
-        w.writeBits(uint64(colorCacheBits), 4)
+        w.writeBits(uint64(cacheBits), 4)
     } else {
         w.writeBits(0, 1)
     }
 
-    encoded, tokenStart := encodeImageData(pixels, width, height, colorCacheBits)
-
     if !isRecursive {
         // Sub-image (transform / entropy data): single Huffman group, no
         // meta-Huffman bit (the decoder only reads it for the top-level image).
-        writeSingleGroup(w, encoded, colorCacheBits)
+        writeSingleGroup(w, encoded, cacheBits)
         return
     }
 
@@ -369,14 +377,14 @@ func writeImageData(w *bitWriter, pixels []color.NRGBA, width, height int, isRec
     // comparison guarantees meta-Huffman can never regress the output.
     single := newTempWriter()
     single.writeBits(0, 1) // use_meta_huffman = 0
-    writeSingleGroup(single, encoded, colorCacheBits)
+    writeSingleGroup(single, encoded, cacheBits)
 
-    if plan := planMetaHuffman(encoded, tokenStart, width, height, colorCacheBits); plan != nil {
+    if plan := planMetaHuffman(encoded, tokenStart, width, height, cacheBits); plan != nil {
         meta := newTempWriter()
         meta.writeBits(1, 1) // use_meta_huffman = 1
         meta.writeBits(uint64(plan.hBits-2), 3)
         writeImageData(meta, buildEntropyImage(plan), plan.bw, plan.bh, false, 0)
-        writeMetaGroups(meta, encoded, tokenStart, plan, width, colorCacheBits)
+        writeMetaGroups(meta, encoded, tokenStart, plan, width, cacheBits)
         if meta.bitLen() < single.bitLen() {
             appendBits(w, meta)
             return
@@ -451,34 +459,149 @@ func writeTokenCodes(w *bitWriter, encoded []int, i int, codes [][]huffmanCode) 
 }
 
 // encodeImageData LZ77+color-cache codes the pixels. It returns the flat symbol
-// stream (encoded) and, parallel to the token sequence, tokenStart[k] = the
-// pixel index at which token k begins. tokenStart is needed by meta-Huffman to
-// map each token to its image tile (and hence its Huffman group).
-func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) ([]int, []int) {
-    // Pass 1: greedy longest-match parse. Always valid on its own and used both
-    // as a fallback and to seed the cost model for the optimal parse.
-    encG, tsG := encodeImageDataGreedy(pixels, width, height, colorCacheBits)
-    histoG := computeHistograms(encG, colorCacheBits)
+// stream (encoded), tokenStart[k] = the pixel index at which token k begins
+// (needed by meta-Huffman to map a token to its image tile), and the color-cache
+// size it chose.
+//
+// The match/literal parse is computed once with the cache OFF — the parse is
+// cache-independent (matches come from the hash chain; the cache only converts
+// some literals to references) — then the best size in 0..maxCacheBits is
+// searched on that fixed parse, a port of libwebp's CalculateBestCacheSize.
+func encodeImageData(pixels []color.NRGBA, width, height, maxCacheBits int) ([]int, []int, int) {
+    // Pass 1: greedy longest-match parse (cache off). Seeds the cost model.
+    encG, tsG := encodeImageDataGreedy(pixels, width, height, 0)
+    histoG := computeHistograms(encG, 0)
 
-    // Pass 2: cost-based optimal parse. The model is derived from the greedy
-    // token statistics, so the optimal parse sees realistic per-symbol bit
-    // costs (crucially including distance-code cost, which greedy ignores).
+    // Pass 2: cost-based optimal parse (cache off). The model is derived from
+    // the greedy token statistics, so it sees realistic per-symbol bit costs
+    // (crucially including distance-code cost, which greedy ignores).
     matchLen, matchOff := fillMatches(pixels, width)
     model := buildCostModel(histoG)
-    encO, tsO := encodeImageDataOptimal(pixels, width, colorCacheBits, model, matchLen, matchOff)
+    encO, tsO := encodeImageDataOptimal(pixels, width, 0, model, matchLen, matchOff)
 
     // Keep whichever parse has the lower estimated cost. The estimate MUST
-    // include the raw length/distance extra bits (streamExtraBits) — the
-    // optimal parse trades many large-distance copies for cheap literals/cache,
-    // which raises symbol entropy but slashes the un-Huffman'd distance extra
-    // bits, so an entropy-only comparison would wrongly keep greedy. Both parses
-    // produce identical pixels, so the choice only affects size, never output.
-    costG := dataCostBits(histoG) + streamExtraBits(encG)
-    costO := dataCostBits(computeHistograms(encO, colorCacheBits)) + streamExtraBits(encO)
-    if costO < costG {
-        return encO, tsO
+    // include the raw length/distance extra bits (streamExtraBits) — the optimal
+    // parse trades large-distance copies for cheap literals, which raises symbol
+    // entropy but slashes the un-Huffman'd distance extra bits, so an
+    // entropy-only comparison would wrongly keep greedy. Both parses produce
+    // identical pixels, so the choice only affects size, never output.
+    enc0, ts0 := encG, tsG
+    cost0 := dataCostBits(histoG) + streamExtraBits(encG)
+    if dataCostBits(computeHistograms(encO, 0))+streamExtraBits(encO) < cost0 {
+        enc0, ts0 = encO, tsO
     }
-    return encG, tsG
+
+    // Color-cache-size search on the fixed parse. Only the histogram cost varies
+    // with cache size — the length/distance extra bits are identical for every
+    // size (copies are unchanged), so they cancel and we compare dataCostBits
+    // alone. cacheCostBits scores a size by walking the stream without
+    // materialising it; only the winning size is actually re-emitted.
+    // Try every cache size 0..maxCacheBits and keep the cheapest, exactly as
+    // libwebp's CalculateBestCacheSize. Each size needs its own cache (one store
+    // per pixel per size) so this is O(maxCacheBits·pixels); cacheCostBits keeps
+    // the constant low by scoring a size without materialising the stream.
+    bestCB := 0
+    bestData := dataCostBits(computeHistograms(enc0, 0))
+    for cb := 1; cb <= maxCacheBits; cb++ {
+        if d := cacheCostBits(enc0, ts0, pixels, cb); d < bestData {
+            bestData, bestCB = d, cb
+        }
+    }
+    bestEnc := enc0
+    if bestCB > 0 {
+        bestEnc = applyColorCache(enc0, ts0, pixels, bestCB)
+    }
+    return bestEnc, ts0, bestCB
+}
+
+// cacheCostBits returns the histogram (entropy) cost of coding the fixed parse
+// enc0 with a color cache of 2^cacheBits entries, building the five token
+// histograms directly while walking the stream — no intermediate stream or
+// reused-buffer allocation beyond the cache and histograms. It mirrors exactly
+// what applyColorCache + computeHistograms would produce, so the size chosen
+// here is the size that gets emitted.
+func cacheCostBits(enc0, tokenStart []int, pixels []color.NRGBA, cacheBits int) float64 {
+    n := len(pixels)
+    cache := make([]color.NRGBA, 1<<cacheBits)
+    histos := [][]int{
+        make([]int, 256+24+(1<<cacheBits)),
+        make([]int, 256),
+        make([]int, 256),
+        make([]int, 256),
+        make([]int, 40),
+    }
+    i := 0
+    for k := 0; k < len(tokenStart); k++ {
+        pos := tokenStart[k]
+        sym := enc0[i]
+        if sym < 256 {
+            p := pixels[pos]
+            h := int(hash(p, cacheBits))
+            if pos > 0 && cache[h] == p {
+                histos[0][h+256+24]++
+            } else {
+                histos[0][sym]++       // green
+                histos[1][enc0[i+1]]++ // red
+                histos[2][enc0[i+2]]++ // blue
+                histos[3][enc0[i+3]]++ // alpha
+            }
+            cache[h] = p
+        } else {
+            histos[0][sym]++       // length code (cache-independent)
+            histos[4][enc0[i+2]]++ // distance code
+            end := n
+            if k+1 < len(tokenStart) {
+                end = tokenStart[k+1]
+            }
+            for j := pos; j < end; j++ {
+                pp := pixels[j]
+                cache[int(hash(pp, cacheBits))] = pp
+            }
+        }
+        i += 4
+    }
+    return dataCostBits(histos)
+}
+
+// applyColorCache rewrites the cache-free stream enc0 into one that uses a color
+// cache of 2^cacheBits entries: a literal whose colour is currently cached
+// becomes a cache reference; copies pass through unchanged. The cache is updated
+// for every emitted pixel (literal, cache hit, and copy-covered) exactly as the
+// decoder does, so the result round-trips. tokenStart gives each token's pixel
+// position and (via the next entry) its length; enc0 is cache-free so every
+// token is 4 ints.
+func applyColorCache(enc0, tokenStart []int, pixels []color.NRGBA, cacheBits int) []int {
+    n := len(pixels)
+    cache := make([]color.NRGBA, 1<<cacheBits)
+    out := make([]int, 0, len(enc0))
+    i := 0
+    for k := 0; k < len(tokenStart); k++ {
+        pos := tokenStart[k]
+        if enc0[i] < 256 {
+            // Literal [G,R,B,A]: emit a cache reference if the colour is cached.
+            p := pixels[pos]
+            h := int(hash(p, cacheBits))
+            if pos > 0 && cache[h] == p {
+                out = append(out, h+256+24)
+            } else {
+                out = append(out, enc0[i], enc0[i+1], enc0[i+2], enc0[i+3])
+            }
+            cache[h] = p
+        } else {
+            // Copy: pass through, but update the cache over its covered pixels.
+            end := n
+            if k+1 < len(tokenStart) {
+                end = tokenStart[k+1]
+            }
+            for j := pos; j < end; j++ {
+                pp := pixels[j]
+                cache[int(hash(pp, cacheBits))] = pp
+            }
+            out = append(out, enc0[i], enc0[i+1], enc0[i+2], enc0[i+3])
+        }
+        i += 4
+    }
+    return out
 }
 
 // encodeImageDataGreedy is the original greedy longest-match LZ77 + color-cache
