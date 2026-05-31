@@ -35,24 +35,36 @@ func applyPredictTransform(pixels []color.NRGBA, width, height int) (int, int, i
     blocks := make([]color.NRGBA, bw * bh)
     deltas := make([]color.NRGBA, width * height)
     
-    accum := [][]int{
-        make([]int, 256),
-        make([]int, 256),
-        make([]int, 256),
-        make([]int, 256),
-        make([]int, 40),
-    }
+    // Accumulated residual histogram over committed tiles, with running totals
+    // that let each per-mode Gini score be evaluated incrementally:
+    //   accumSum      = pixels committed so far (= Σ_b accum[c][b], identical
+    //                   for every channel since each pixel bumps one bin per ch)
+    //   accumSumSq[c] = Σ_b accum[c][b]²
+    // The per-mode score is Gini(accum + tileHisto); expanding the square,
+    // (accum+t)² = accum² + 2·accum·t + t², shows only the bins the tile touches
+    // differ from accumSumSq. So each mode is scored by walking just those bins
+    // instead of all 256×4 — a large win on flat GIF-delta alpha (few distinct
+    // residuals) and byte-identical to the dense scan (arithmetic is integer-
+    // exact; sum = accumSum + tileN is constant across channels and modes).
+    var accum [4][256]int
+    var accumSumSq [4]int
+    accumSum := 0
 
-    histos := make([][]int, len(accum))
-    for i := range accum {
-        histos[i] = make([]int, len(accum[i]))
+    // Per-mode tile histogram (dense for O(1) lookup) and the distinct bins it
+    // touched, so scoring and the inter-mode reset only walk those bins.
+    var tileHisto [4][256]int
+    touched := [4][]int{
+        make([]int, 0, 256),
+        make([]int, 0, 256),
+        make([]int, 0, 256),
+        make([]int, 0, 256),
     }
 
     // Residuals for one tile row, reused across modes/rows. The predictor
     // search runs row-by-row (rather than the old column-major per-pixel loop)
-    // so the interior of each row is a contiguous run that a NEON kernel can
-    // process; histogram counts and written deltas are order-independent, so
-    // the bitstream is byte-identical to the per-pixel version.
+    // so the interior of each row is a contiguous run a NEON kernel can process;
+    // histogram counts and written deltas are order-independent, so the
+    // bitstream is byte-identical to the per-pixel version.
     rowBuf := make([]color.NRGBA, tileSize)
 
     for y := 0; y < bh; y++ {
@@ -62,39 +74,52 @@ func applyPredictTransform(pixels []color.NRGBA, width, height int) (int, int, i
             mx := min((x + 1) << tileBits, width)
             my := min((y + 1) << tileBits, height)
             n := mx - sx
+            tileN := n * (my - sy)
+
+            // sum of (accum + tileHisto) over bins — the same for every channel
+            // and every mode of this tile.
+            sum := accumSum + tileN
+            denom := float64(sum) * float64(sum)
 
             var best int
             var bestEntropy float64
             for i := 0; i < 14; i++ {
-                for j := range accum {
-                    copy(histos[j], accum[j])
-                }
-
+                // Build this mode's tile histogram, recording touched bins.
                 for ty := sy; ty < my; ty++ {
                     predictResidualsRow(pixels, width, i, sx, mx, ty, rowBuf)
                     for k := 0; k < n; k++ {
-                        histos[0][rowBuf[k].R]++
-                        histos[1][rowBuf[k].G]++
-                        histos[2][rowBuf[k].B]++
-                        histos[3][rowBuf[k].A]++
+                        p := rowBuf[k]
+                        if tileHisto[0][p.R] == 0 {
+                            touched[0] = append(touched[0], int(p.R))
+                        }
+                        tileHisto[0][p.R]++
+                        if tileHisto[1][p.G] == 0 {
+                            touched[1] = append(touched[1], int(p.G))
+                        }
+                        tileHisto[1][p.G]++
+                        if tileHisto[2][p.B] == 0 {
+                            touched[2] = append(touched[2], int(p.B))
+                        }
+                        tileHisto[2][p.B]++
+                        if tileHisto[3][p.A] == 0 {
+                            touched[3] = append(touched[3], int(p.A))
+                        }
+                        tileHisto[3][p.A]++
                     }
                 }
 
+                // Incremental Gini, zeroing each touched bin as it is read so
+                // tileHisto is clean for the next mode.
                 var total float64
-                for _, histo := range histos {
-                    sum := 0
-                    sumSquares := 0
-
-                    for _, count := range histo {
-                        sum += count
-                        sumSquares += count * count
+                for ch := 0; ch < 4; ch++ {
+                    sumSquares := accumSumSq[ch]
+                    for _, b := range touched[ch] {
+                        t := tileHisto[ch][b]
+                        sumSquares += 2 * accum[ch][b] * t + t * t
+                        tileHisto[ch][b] = 0
                     }
-
-                    if sum == 0 {
-                        continue
-                    }
-
-                    total += 1.0 - float64(sumSquares) / (float64(sum) * float64(sum))
+                    touched[ch] = touched[ch][:0]
+                    total += 1.0 - float64(sumSquares) / denom
                 }
 
                 if i == 0 || total < bestEntropy {
@@ -103,17 +128,26 @@ func applyPredictTransform(pixels []color.NRGBA, width, height int) (int, int, i
                 }
             }
 
+            // Commit the winning mode: write residuals and fold them into accum
+            // and the running totals (a++ raises Σa² by 2·a+1).
             for ty := sy; ty < my; ty++ {
                 predictResidualsRow(pixels, width, best, sx, mx, ty, rowBuf)
                 base := ty * width + sx
                 for k := 0; k < n; k++ {
-                    deltas[base + k] = rowBuf[k]
-                    accum[0][rowBuf[k].R]++
-                    accum[1][rowBuf[k].G]++
-                    accum[2][rowBuf[k].B]++
-                    accum[3][rowBuf[k].A]++
+                    p := rowBuf[k]
+                    deltas[base + k] = p
+
+                    accumSumSq[0] += 2 * accum[0][p.R] + 1
+                    accum[0][p.R]++
+                    accumSumSq[1] += 2 * accum[1][p.G] + 1
+                    accum[1][p.G]++
+                    accumSumSq[2] += 2 * accum[2][p.B] + 1
+                    accum[2][p.B]++
+                    accumSumSq[3] += 2 * accum[3][p.A] + 1
+                    accum[3][p.A]++
                 }
             }
+            accumSum += tileN
 
             blocks[y * bw + x] = color.NRGBA{0, byte(best), 0, 255}
         }
