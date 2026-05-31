@@ -484,7 +484,8 @@ func encodeImageData(pixels []color.NRGBA, width, height, colorCacheBits int) ([
 // encodeImageDataGreedy is the original greedy longest-match LZ77 + color-cache
 // parser. It returns the flat symbol stream and the per-token start positions.
 func encodeImageDataGreedy(pixels []color.NRGBA, width, height, colorCacheBits int) ([]int, []int) {
-    head := make([]int, 1 << 14)
+    hashBits := lz77HashBits(len(pixels))
+    head := make([]int, 1 << hashBits)
     prev := make([]int, len(pixels))
     cache := make([]color.NRGBA, 1 << colorCacheBits)
 
@@ -493,8 +494,8 @@ func encodeImageDataGreedy(pixels []color.NRGBA, width, height, colorCacheBits i
     cnt := 0
 
     for i := 0; i < len(pixels); i++ {
-        if i + 2 < len(pixels) {
-            h := hash3(pixels, i)
+        if i + 1 < len(pixels) {
+            h := hashPixPair(pixels, i, hashBits)
 
             cur := head[h] - 1
             prev[i] = head[h]
@@ -539,8 +540,8 @@ func encodeImageDataGreedy(pixels []color.NRGBA, width, height, colorCacheBits i
                 // loses matches on repetitive data such as alpha masks.
                 for j := 1; j < streak; j++ {
                     p := i + j
-                    if p+2 < len(pixels) {
-                        hh := hash3(pixels, p)
+                    if p+1 < len(pixels) {
+                        hh := hashPixPair(pixels, p, hashBits)
                         prev[p] = head[hh]
                         head[hh] = p + 1
                     }
@@ -620,13 +621,32 @@ func hash(c color.NRGBA, shifts int) uint32 {
     return (x * 0x1e35a7bd) >> (32 - min(shifts, 32))
 }
 
-// hash3 hashes the 3-pixel sequence starting at i into a 14-bit LZ77 chain
-// bucket. Callers must ensure i+2 < len(pixels).
-func hash3(pixels []color.NRGBA, i int) uint32 {
-    h := hash(pixels[i+0], 14)
-    h ^= hash(pixels[i+1], 14) * 0x9e3779b9
-    h ^= hash(pixels[i+2], 14) * 0x85ebca6b
-    return h % (1 << 14)
+// lz77HashBits picks the LZ77 hash-chain table size (in bits) for an n-pixel
+// image. libwebp fixes this at HASH_BITS=18 (GetPixPairHash64); we start at the
+// previous 14 and grow toward 18 as the image grows, so the large main image
+// (where match quality matters) gets libwebp's full 18-bit table while small
+// transform sub-images keep a 16 KB chain instead of zeroing a 2 MB one.
+func lz77HashBits(n int) int {
+    bits := 14
+    for bits < 18 && (1 << bits) < 2*n {
+        bits++
+    }
+    return bits
+}
+
+// hashPixPair hashes the 2-pixel sequence at i into a `bits`-wide LZ77 chain
+// bucket — a port of libwebp's GetPixPairHash64 (backward_references_enc.c,
+// multipliers kHashMultiplierHi/Lo). The previous hash3 mixed 3 pixels into a
+// 14-bit table; libwebp's 2-pixel / 18-bit hash collides far less, so the chains
+// hold genuinely-related positions and the match finder (greedy and the
+// cost-based fillMatches) lands longer / closer matches. It only changes which
+// matches are found — any match is valid — so output stays round-trip-exact.
+// Callers must ensure i+1 < len(pixels).
+func hashPixPair(pixels []color.NRGBA, i, bits int) uint32 {
+    a0 := uint32(pixels[i].A)<<24 | uint32(pixels[i].R)<<16 | uint32(pixels[i].G)<<8 | uint32(pixels[i].B)
+    a1 := uint32(pixels[i+1].A)<<24 | uint32(pixels[i+1].R)<<16 | uint32(pixels[i+1].G)<<8 | uint32(pixels[i+1].B)
+    key := a1*0xc6a4a793 + a0*0x5bd1e996
+    return key >> (32 - bits)
 }
 
 func computeHistograms(pixels []int, colorCacheBits int) [][]int {

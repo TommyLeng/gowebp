@@ -245,10 +245,11 @@ func fillMatches(pixels []color.NRGBA, width int) (matchLen, matchOff []int) {
 		}
 	}
 
-	head := make([]int, 1<<14)
+	hashBits := lz77HashBits(n)
+	head := make([]int, 1<<hashBits)
 	prev := make([]int, n)
-	for i := 0; i+2 < n; i++ {
-		h := hash3(pixels, i)
+	for i := 0; i+1 < n; i++ {
+		h := hashPixPair(pixels, i, hashBits)
 		cur := head[h] - 1
 		prev[i] = head[h]
 		head[h] = i + 1
