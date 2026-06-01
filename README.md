@@ -115,6 +115,10 @@ go test -bench=BenchmarkEncode -benchtime=5s
 # 與 cwebp 對比（需安裝 cwebp，圖片放於 test_data/original/）
 # Compare vs cwebp (requires cwebp, images in test_data/original/)
 go test -run TestCompareWithCwebp -v -timeout 300s
+
+# 在 Apple Silicon 本地測試 amd64 SSE2 code path（需要 Docker）
+# Test the amd64 SSE2 path locally on Apple Silicon (requires Docker)
+docker run --rm --platform linux/amd64 -v $(pwd):/app -w /app golang:1.25 go test ./...
 ```
 
 ---

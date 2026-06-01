@@ -17,6 +17,9 @@ go test -bench=BenchmarkEncode300x300 -benchtime=5s
 # Run comparison vs cwebp (requires cwebp installed, images in test_data/original/)
 go test -v -run TestCompareWithCwebp -timeout 300s
 
+# Test amd64 SSE2 path locally (M1 Mac, requires Docker)
+docker run --rm --platform linux/amd64 -v $(pwd):/app -w /app golang:1.25 go test ./...
+
 # Tidy dependencies
 go mod tidy
 ```
