@@ -181,16 +181,21 @@ TEXT ·fTransform(SB),NOSPLIT,$64-72
 	MOVOU   X3, 48(SP)              // store t3_vec at SP[48..63]
 
 	// ── VERTICAL PASS (SSE2, fully vectorised) ──────────────────────────────
-	// Lane layout: lane i holds column i (i=0..3) for all 4 output rows.
+	// The horizontal pass stores t-vectors type-indexed:
+	//   SP[ 0..15] = t0_vec = [T0_r0, T0_r1, T0_r2, T0_r3]  (int32×4)
+	//   SP[16..31] = t1_vec = [T1_r0, T1_r1, T1_r2, T1_r3]
+	//   SP[32..47] = t2_vec = [T2_r0, T2_r1, T2_r2, T2_r3]
+	//   SP[48..63] = t3_vec = [T3_r0, T3_r1, T3_r2, T3_r3]
+	// where T_k_r = horizontal output of type k for row r.
 	//
-	// Stack layout (from horizontal pass):
-	//   SP[ 0..15] = t0_vec = [t0_r0, t0_r1, t0_r2, t0_r3]  (int32×4)
-	//   SP[16..31] = t1_vec = [t1_r0, t1_r1, t1_r2, t1_r3]
-	//   SP[32..47] = t2_vec = [t2_r0, t2_r1, t2_r2, t2_r3]
-	//   SP[48..63] = t3_vec = [t3_r0, t3_r1, t3_r2, t3_r3]
+	// The vertical pass for output column k needs type-k values from rows 0..3:
+	//   a0[k] = T_k_r0 + T_k_r3,  a1[k] = T_k_r1 + T_k_r2, ...
+	// To vectorise over k=0..3 simultaneously, transpose the 4×4 int32 matrix
+	// into row-indexed vectors R0..R3 (Rr = [T0_r, T1_r, T2_r, T3_r]) so that
+	// a0 = R0 + R3 gives the correct per-column result in each lane.
 	//
-	// Vertical algorithm (vectorised over all 4 columns simultaneously):
-	//   a0 = t0 + t3,  a1 = t1 + t2,  a2 = t1 - t2,  a3 = t0 - t3
+	// Vertical algorithm (after transpose, all 4 columns in parallel):
+	//   a0 = R0 + R3,  a1 = R1 + R2,  a2 = R1 - R2,  a3 = R0 - R3
 	//   out[ 0..3]  = (a0+a1+7) >> 4             [int32 → int16]
 	//   out[ 4..7]  = ((a2*2217+a3*5352+12000)>>16) + (a3!=0)
 	//   out[ 8..11] = (a0-a1+7) >> 4
@@ -204,17 +209,13 @@ TEXT ·fTransform(SB),NOSPLIT,$64-72
 	//   PADDL=PADDD, PSUBL=PSUBD, PSRAL=PSRAD, PSRLL=PSRLD
 	//   PCMPEQL=PCMPEQD, PUNPCKLWL=PUNPCKLWD, PMADDWL=PMADDWD
 	//   PACKSSLW=PACKSSDW (pack int32→int16), PANDN=PANDN
-	//
-	// PACKSSLW Plan9: "PACKSSLW src, dst" → Intel PACKSSDW(dst,src)
-	//   → dst = [sat16(dst[0..3]) | sat16(src[0..3])]
-	//   So "PACKSSLW X14(zero), Xr" → Xr = [sat16(Xr[0..3]) | zeros]
-	//   → int16×4 values in the low 64 bits of Xr.
-	//
-	// PUNPCKLWL Plan9: "PUNPCKLWL src, dst" → Intel PUNPCKLWD(dst,src)
-	//   → dst = [dst[0],src[0], dst[1],src[1], dst[2],src[2], dst[3],src[3]]
+	//   PUNPCKLLQ=PUNPCKLDQ: PUNPCKLLQ Xa,Xb → Intel PUNPCKLDQ(Xb,Xa)
+	//     → Xb = [Xb[dw0],Xa[dw0],Xb[dw1],Xa[dw1]]
+	//   PUNPCKHLQ=PUNPCKHDQ: PUNPCKHLQ Xa,Xb → Intel PUNPCKHDQ(Xb,Xa)
+	//     → Xb = [Xb[dw2],Xa[dw2],Xb[dw3],Xa[dw3]]
 	//
 	// Register map:
-	//   X0 = t0_vec, X1 = t1_vec, X2 = t2_vec, X3 = t3_vec  (int32×4)
+	//   X0..X3 = t-vecs loaded, then transposed to R0..R3
 	//   X4 = a0,  X5 = a1,  X6 = a2,  X7 = a3              (int32×4)
 	//   X8 = out[0..3]  intermediate, then reused as a2_int16_packed
 	//   X9 = out[8..11] intermediate, then reused as a3_int16_packed
@@ -231,15 +232,33 @@ TEXT ·fTransform(SB),NOSPLIT,$64-72
 	MOVOU   32(SP), X2              // X2 = t2_vec
 	MOVOU   48(SP), X3              // X3 = t3_vec
 
+	// ── Step 1b: Transpose 4×4 int32 (type-indexed → row-indexed) ───────────
+	// PUNPCKLDQ interleaves 32-bit dwords; PUNPCKLQDQ/PUNPCKHQDQ selects 64-bit halves.
+	MOVO    X0, X4                  // X4 = t0 (save)
+	MOVO    X2, X5                  // X5 = t2 (save)
+	PUNPCKLLQ X1, X0                // X0 = [T0R0,T1R0,T0R1,T1R1]
+	PUNPCKHLQ X1, X4                // X4 = [T0R2,T1R2,T0R3,T1R3]
+	PUNPCKLLQ X3, X2                // X2 = [T2R0,T3R0,T2R1,T3R1]
+	PUNPCKHLQ X3, X5                // X5 = [T2R2,T3R2,T2R3,T3R3]
+	MOVO    X0, X6
+	PUNPCKLQDQ X2, X0               // X0 = R0 = [T0R0,T1R0,T2R0,T3R0]
+	PUNPCKHQDQ X2, X6               // X6 = R1 = [T0R1,T1R1,T2R1,T3R1]
+	MOVO    X4, X7
+	PUNPCKLQDQ X5, X4               // X4 = R2 = [T0R2,T1R2,T2R2,T3R2]
+	PUNPCKHQDQ X5, X7               // X7 = R3 = [T0R3,T1R3,T2R3,T3R3]
+	MOVO    X6, X1                  // X1 = R1
+	MOVO    X4, X2                  // X2 = R2
+	MOVO    X7, X3                  // X3 = R3
+
 	// ── Step 2: Butterfly ───────────────────────────────────────────────────
 	MOVO    X0, X4
-	PADDL   X3, X4                  // X4 = a0 = t0 + t3
+	PADDL   X3, X4                  // X4 = a0 = R0 + R3
 	MOVO    X1, X5
-	PADDL   X2, X5                  // X5 = a1 = t1 + t2
+	PADDL   X2, X5                  // X5 = a1 = R1 + R2
 	MOVO    X1, X6
-	PSUBL   X2, X6                  // X6 = a2 = t1 - t2
+	PSUBL   X2, X6                  // X6 = a2 = R1 - R2
 	MOVO    X0, X7
-	PSUBL   X3, X7                  // X7 = a3 = t0 - t3
+	PSUBL   X3, X7                  // X7 = a3 = R0 - R3
 
 	// ── Step 3: out[0..3] = (a0+a1+7) >> 4 → X8 ────────────────────────────
 	MOVOU   ·vbias7<>(SB), X13     // X13 = [7, 7, 7, 7] (int32×4)
@@ -303,9 +322,9 @@ TEXT ·fTransform(SB),NOSPLIT,$64-72
 	// Actually: PSUBL X2, X6 was "X6 = X1 - X2" where X1 was in X6 copy.
 	// X1 and X2 are still intact (we only wrote to X4,X5,X6,X7 in the butterfly).
 	// So a2 = X6_original, but X6 was overwritten by PACKSSLW + PUNPCKLWL.
-	// Re-compute a2 from X1 and X2 which are still intact:
-	MOVO    X1, X6                 // X6 = t1_vec (reloaded from still-intact X1)
-	PSUBL   X2, X6                 // X6 = a2 (re-computed; X1, X2 unchanged)
+	// Re-compute a2 from X1 and X2 which are still intact (X1=R1, X2=R2 after transpose):
+	MOVO    X1, X6                 // X6 = R1 (reloaded from still-intact X1)
+	PSUBL   X2, X6                 // X6 = a2 = R1 - R2 (X1, X2 unchanged)
 
 	// Now pack a3 (X12 = int32×4) and fresh a2 (X6 = int32×4) → int16.
 	MOVO    X12, X11               // X11 = a3 (int32×4)
@@ -729,15 +748,32 @@ TEXT ·fTransform2Plane(SB),NOSPLIT,$192-104
 	MOVOU   32(SP), X2           // t2_b0
 	MOVOU   48(SP), X3           // t3_b0
 
+	// Transpose 4×4 int32 (type-indexed → row-indexed); see fTransform comment.
+	MOVO    X0, X4
+	MOVO    X2, X5
+	PUNPCKLLQ X1, X0            // [T0R0,T1R0,T0R1,T1R1]
+	PUNPCKHLQ X1, X4            // [T0R2,T1R2,T0R3,T1R3]
+	PUNPCKLLQ X3, X2            // [T2R0,T3R0,T2R1,T3R1]
+	PUNPCKHLQ X3, X5            // [T2R2,T3R2,T2R3,T3R3]
+	MOVO    X0, X6
+	PUNPCKLQDQ X2, X0           // X0 = R0
+	PUNPCKHQDQ X2, X6           // X6 = R1
+	MOVO    X4, X7
+	PUNPCKLQDQ X5, X4           // X4 = R2
+	PUNPCKHQDQ X5, X7           // X7 = R3
+	MOVO    X6, X1
+	MOVO    X4, X2
+	MOVO    X7, X3
+
 	// Butterfly
 	MOVO    X0, X4
-	PADDL   X3, X4              // a0 = t0 + t3
+	PADDL   X3, X4              // a0 = R0 + R3
 	MOVO    X1, X5
-	PADDL   X2, X5              // a1 = t1 + t2
+	PADDL   X2, X5              // a1 = R1 + R2
 	MOVO    X1, X6
-	PSUBL   X2, X6              // a2 = t1 - t2
+	PSUBL   X2, X6              // a2 = R1 - R2
 	MOVO    X0, X7
-	PSUBL   X3, X7              // a3 = t0 - t3
+	PSUBL   X3, X7              // a3 = R0 - R3
 
 	// out[0..3] = (a0+a1+7) >> 4
 	MOVOU   ·vbias7<>(SB), X13
@@ -800,6 +836,23 @@ TEXT ·fTransform2Plane(SB),NOSPLIT,$192-104
 	MOVOU   80(SP), X1
 	MOVOU   96(SP), X2
 	MOVOU  112(SP), X3
+
+	// Transpose 4×4 int32 (type-indexed → row-indexed).
+	MOVO    X0, X4
+	MOVO    X2, X5
+	PUNPCKLLQ X1, X0
+	PUNPCKHLQ X1, X4
+	PUNPCKLLQ X3, X2
+	PUNPCKHLQ X3, X5
+	MOVO    X0, X6
+	PUNPCKLQDQ X2, X0           // X0 = R0
+	PUNPCKHQDQ X2, X6           // X6 = R1
+	MOVO    X4, X7
+	PUNPCKLQDQ X5, X4           // X4 = R2
+	PUNPCKHQDQ X5, X7           // X7 = R3
+	MOVO    X6, X1
+	MOVO    X4, X2
+	MOVO    X7, X3
 
 	// Butterfly
 	MOVO    X0, X4
