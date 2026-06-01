@@ -229,31 +229,61 @@ func writeFrames(ani *Animation) (*bytes.Buffer, bool, error) {
     return buf, hasAlpha, nil
 }
 
-// countColors returns the number of distinct RGBA colours in m, capped at 257
-// (it stops scanning and returns 257 once a 257th colour is seen). Only the
-// thresholds matter to the transform choice, not the exact count past them:
-//   - <=16  : the color-indexing transform packs the index to <=4 bit/px
-//             (libwebp xbits 1/2/3), so it dominates every other transform.
-//   - 17..256: a palette is still possible but the index is a full byte, so it
-//             only competes with the predictor path.
-//   - >256  : a palette is impossible (libwebp's MAX_PALETTE_SIZE), predictor
-//             only.
-func countColors(m *image.NRGBA) int {
+// analyzeColors returns the number of distinct RGBA colours in m, capped at 257
+// (the exact count past 256 never matters), and whether the image is effectively
+// single-channel — R and B both constant across the whole image, as in an alpha
+// plane carried as R=B=0, G=alpha, A=255.
+//
+// The thresholds that drive the transform choice:
+//   - <=16   : the color-indexing transform packs the index to <=4 bit/px
+//              (libwebp xbits 1/2/3), so it dominates every other transform.
+//   - 17..256: a palette is possible but the index is a full byte/px (no
+//              packing). It can still beat the predictor for MULTI-channel data
+//              (it collapses R/G/B into one index), but never for single-channel
+//              data — there the predictor's residual entropy is always <= the
+//              raw index entropy (a difference distribution is more peaked than
+//              the values), confirmed by measurement on gradient/noise/real
+//              alpha. So single-channel skips the palette attempt.
+//   - >256   : a palette is impossible (libwebp's MAX_PALETTE_SIZE), predictor.
+func analyzeColors(m *image.NRGBA) (colors int, singleChannel bool) {
     seen := make(map[uint32]struct{}, 257)
     w := m.Rect.Dx()
+    var r0, b0 uint8
+    rConst, bConst, first, capped := true, true, true, false
     for y, h := 0, m.Rect.Dy(); y < h; y++ {
         row := m.Pix[y*m.Stride : y*m.Stride+w*4]
         for i := 0; i+4 <= len(row); i += 4 {
-            key := uint32(row[i])<<24 | uint32(row[i+1])<<16 | uint32(row[i+2])<<8 | uint32(row[i+3])
-            if _, ok := seen[key]; !ok {
-                seen[key] = struct{}{}
-                if len(seen) > 256 {
-                    return 257
+            if first {
+                r0, b0, first = row[i], row[i+2], false
+            } else {
+                if row[i] != r0 {
+                    rConst = false
                 }
+                if row[i+2] != b0 {
+                    bConst = false
+                }
+            }
+            if !capped {
+                key := uint32(row[i])<<24 | uint32(row[i+1])<<16 | uint32(row[i+2])<<8 | uint32(row[i+3])
+                if _, ok := seen[key]; !ok {
+                    seen[key] = struct{}{}
+                    if len(seen) > 256 {
+                        capped = true
+                    }
+                }
+            }
+            // Once colours are capped and the image is known multi-channel, the
+            // remaining scan can change neither result — bail out (keeps the
+            // >256-colour photo path as fast as a plain early-exit count).
+            if capped && !rConst && !bConst {
+                return 257, false
             }
         }
     }
-    return len(seen)
+    if capped {
+        return 257, rConst && bConst
+    }
+    return len(seen), rConst && bConst
 }
 
 func writeBitStream(img image.Image) (*bytes.Buffer, bool, error) {
@@ -273,41 +303,42 @@ func writeBitStream(img image.Image) (*bytes.Buffer, bool, error) {
     draw.Draw(rgba, rgba.Bounds(), img, img.Bounds().Min, draw.Src)
     hasAlpha := !rgba.Opaque()
 
-    // Pick the VP8L transform set by distinct-colour count, mirroring libwebp's
-    // EncoderAnalyze / AnalyzeEntropy (vp8l_enc.c). The color-indexing (palette)
-    // transform packs the index to <=4 bit/px for <=16 colours and is then
-    // "better than any other transform" (vp8l_enc.c:109) — the big win for
-    // delta-animation alpha masks (alpha 0/255 = 2 colours -> ~1 bit/px, ~2.7x
-    // smaller ALPH). Above 16 the index is a full byte so the predictor +
-    // subtract-green path competes; above 256 a palette is impossible
-    // (MAX_PALETTE_SIZE) so only predictor applies.
+    // Pick the VP8L transform set by distinct-colour count (and channel count):
     //
-    //   <=16  colours -> palette only            (single encode; always wins)
-    //   17..256        -> try both, keep smaller  (libwebp estimates this band;
-    //                     try-both is strictly more accurate and never regresses
-    //                     — e.g. a ~256-value gradient alpha still prefers the
-    //                     predictor, so it stays put)
-    //   >256           -> predictor only          (palette impossible)
+    //   <=16 colours              -> palette only   (packs to <=4 bit/px, always
+    //                                wins; vp8l_enc.c:109 — the delta-anim alpha
+    //                                mask win, alpha 0/255 -> ~1 bit/px)
+    //   17..256, MULTI-channel    -> try predictor and palette, keep smaller
+    //                                (an 8-bit index can collapse R/G/B and beat
+    //                                the predictor for few-colour RGB graphics)
+    //   17..256, SINGLE-channel   -> predictor only (palette cannot win on
+    //   >256                         single-channel data; >256 has no palette) —
+    //                                one encode, the fast path for alpha planes
     //
-    // Every common input (binary masks, photos) is a single encode; only the
-    // rare 17..256 band pays for two, so this keeps the GIF path fast.
-    colors := countColors(rgba)
+    // libwebp's default method runs a cheap entropy estimate (AnalyzeEntropy) over
+    // the 17..256 band, but that estimate ignores LZ77 and mis-picks palette for
+    // soft-alpha gradients (measured: i1-a alpha 26452 -> 33384 B). The
+    // single-channel test is both faster and more accurate for the alpha case;
+    // multi-channel few-colour images keep the (rarely-hit) try-both safety net.
+    colors, singleChannel := analyzeColors(rgba)
 
     if colors <= 16 {
         b, err := encodeVP8L(rgba, hasAlpha, true)
         return b, hasAlpha, err
     }
-
-    best, err := encodeVP8L(rgba, hasAlpha, false)
-    if err != nil {
-        return nil, false, err
-    }
-    if colors <= 256 {
+    if colors <= 256 && !singleChannel {
+        best, err := encodeVP8L(rgba, hasAlpha, false)
+        if err != nil {
+            return nil, false, err
+        }
         if pal, perr := encodeVP8L(rgba, hasAlpha, true); perr == nil && pal.Len() < best.Len() {
             best = pal
         }
+        return best, hasAlpha, nil
     }
-    return best, hasAlpha, nil
+    // >256 colours, or 17..256 single-channel (alpha plane): predictor only.
+    b, err := encodeVP8L(rgba, hasAlpha, false)
+    return b, hasAlpha, err
 }
 
 // encodeVP8L encodes rgba as one VP8L bitstream, either with the predictor +
