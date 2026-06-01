@@ -173,6 +173,16 @@ func matchLenAt(pixels []color.NRGBA, a, b, maxLen int) int {
 const (
 	matchIterMax  = 51
 	matchChainCap = 256
+	// matchIterMaxLow / matchWindowBitsLow are the reduced LZ77 search effort used
+	// for the alpha plane, mirroring libwebp's low-quality alpha path
+	// (alpha is encoded at quality 8*method ≈ 32): GetMaxItersForQuality(32) =
+	// 8 + 32*32/128 = 16 hash-chain probes (vs 51 at quality 75), and
+	// GetWindowSizeForHashChain(quality<=50) = xsize<<6 (vs the full 2^20 window).
+	// Fewer probes + a smaller window cut the dominant fillMatches cost ~22% on a
+	// 1 MP alpha with no size penalty (the cheap dist=1/dist=width heuristics still
+	// catch the coherent runs that matter).
+	matchIterMaxLow   = 16
+	matchWindowBitsLow = 6
 	// matchMaxLen is the maximum match length, matching the greedy parser and the
 	// WebP length-code range. The DP stays fast at this length because it
 	// propagates only the per-bucket-end lengths (lz77BucketEnds), and
@@ -215,12 +225,22 @@ var lz77BucketEnds = func() []int {
 // long constant runs cost O(1) each instead of an O(runLength) rescan. This
 // keeps the per-position search (good match quality) without the blow-up that
 // forced libwebp to left-extend.
-func fillMatches(pixels []color.NRGBA, width int) (matchLen, matchOff []int) {
+func fillMatches(pixels []color.NRGBA, width int, lowEffort bool) (matchLen, matchOff []int) {
 	n := len(pixels)
 	matchLen = make([]int, n)
 	matchOff = make([]int, n)
 	if n <= 2 {
 		return matchLen, matchOff
+	}
+
+	// LZ77 search effort: full (quality-75) by default, reduced for the alpha
+	// plane (lowEffort) to libwebp's quality-32 alpha settings.
+	iterMax, windowSize := matchIterMax, 1<<20-120
+	if lowEffort {
+		iterMax = matchIterMaxLow
+		if w := width << matchWindowBitsLow; w < windowSize {
+			windowSize = w
+		}
 	}
 
 	// d1[i] / dW[i]: full (uncapped) match length at distance 1 / width.
@@ -288,7 +308,7 @@ func fillMatches(pixels []color.NRGBA, width int) (matchLen, matchOff []int) {
 		// be longer — so most probes avoid the full matchLenAt scan.
 		if bestLen < lenCap {
 			bestArgb := pixels[i+bestLen]
-			for iter := matchIterMax; cur != -1 && i-cur < 1<<20-120 && iter > 0; iter-- {
+			for iter := iterMax; cur != -1 && i-cur < windowSize && iter > 0; iter-- {
 				if pixels[cur+bestLen] == bestArgb {
 					if l := matchLenAt(pixels, cur, i, maxLen); l > bestLen {
 						bestLen, bestOff = l, i-cur

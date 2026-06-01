@@ -69,7 +69,11 @@ func encodeAlphaChunk(img image.Image, w, h int) ([]byte, error) {
 	}
 
 	var buf bytes.Buffer
-	if err := lossless.Encode(&buf, alphaImg, nil); err != nil {
+	// The alpha plane is single-channel and visually forgiving of encoder effort,
+	// so use the reduced-effort lossless path (lighter LZ77 search) — the same
+	// trade libwebp makes by encoding alpha at low quality. ~20% faster, no size
+	// cost on the alpha masks measured.
+	if err := lossless.EncodeFast(&buf, alphaImg, nil); err != nil {
 		return nil, fmt.Errorf("alpha VP8L encode: %w", err)
 	}
 

@@ -37,7 +37,7 @@ func makeRunHeavy(w, h int) []color.NRGBA {
 func TestFillMatchesValid(t *testing.T) {
 	w, h := 120, 90
 	px := makeRunHeavy(w, h)
-	matchLen, matchOff := fillMatches(px, w)
+	matchLen, matchOff := fillMatches(px, w, false)
 	for i := range matchLen {
 		l, off := matchLen[i], matchOff[i]
 		if l == 0 {
@@ -63,7 +63,7 @@ func TestOptimalNotWorseThanGreedy(t *testing.T) {
 		px := makeRunHeavy(w, h)
 
 		encG, _ := encodeImageDataGreedy(px, w, h, ccBits)
-		matchLen, matchOff := fillMatches(px, w)
+		matchLen, matchOff := fillMatches(px, w, false)
 		model := buildCostModel(computeHistograms(encG, ccBits))
 		encO, _ := encodeImageDataOptimal(px, w, ccBits, model, matchLen, matchOff)
 

@@ -75,7 +75,19 @@ const maxColorCacheBits = 10
 // Returns:
 //   An error if encoding fails or writing to the io.Writer encounters an issue.
 func Encode(w io.Writer, img image.Image, o *Options) error {
-    stream, hasAlpha, err := writeBitStream(img)
+    return encode(w, img, o, false)
+}
+
+// EncodeFast is Encode with a reduced-effort lossless path (lighter LZ77 search),
+// for data where speed matters more than the last few percent of size — notably
+// the alpha plane, which libwebp likewise encodes at low quality. Output is a
+// fully valid VP8L bitstream; only the encoder's search effort differs.
+func EncodeFast(w io.Writer, img image.Image, o *Options) error {
+    return encode(w, img, o, true)
+}
+
+func encode(w io.Writer, img image.Image, o *Options, lowEffort bool) error {
+    stream, hasAlpha, err := writeBitStream(img, lowEffort)
     if err != nil {
         return err
     }
@@ -198,7 +210,7 @@ func writeFrames(ani *Animation) (*bytes.Buffer, bool, error) {
     
     var hasAlpha bool
     for i, img := range ani.Images {
-        stream, alpha, err := writeBitStream(img)
+        stream, alpha, err := writeBitStream(img, false)
         if err != nil {
             return nil, false, err
         }
@@ -286,7 +298,7 @@ func analyzeColors(m *image.NRGBA) (colors int, singleChannel bool) {
     return len(seen), rConst && bConst
 }
 
-func writeBitStream(img image.Image) (*bytes.Buffer, bool, error) {
+func writeBitStream(img image.Image, lowEffort bool) (*bytes.Buffer, bool, error) {
     if img == nil {
         return nil, false, errors.New("image is nil")
     }
@@ -323,21 +335,21 @@ func writeBitStream(img image.Image) (*bytes.Buffer, bool, error) {
     colors, singleChannel := analyzeColors(rgba)
 
     if colors <= 16 {
-        b, err := encodeVP8L(rgba, hasAlpha, true)
+        b, err := encodeVP8L(rgba, hasAlpha, true, lowEffort)
         return b, hasAlpha, err
     }
     if colors <= 256 && !singleChannel {
-        best, err := encodeVP8L(rgba, hasAlpha, false)
+        best, err := encodeVP8L(rgba, hasAlpha, false, lowEffort)
         if err != nil {
             return nil, false, err
         }
-        if pal, perr := encodeVP8L(rgba, hasAlpha, true); perr == nil && pal.Len() < best.Len() {
+        if pal, perr := encodeVP8L(rgba, hasAlpha, true, lowEffort); perr == nil && pal.Len() < best.Len() {
             best = pal
         }
         return best, hasAlpha, nil
     }
     // >256 colours, or 17..256 single-channel (alpha plane): predictor only.
-    b, err := encodeVP8L(rgba, hasAlpha, false)
+    b, err := encodeVP8L(rgba, hasAlpha, false, lowEffort)
     return b, hasAlpha, err
 }
 
@@ -345,7 +357,7 @@ func writeBitStream(img image.Image) (*bytes.Buffer, bool, error) {
 // subtract-green transforms (usePalette=false) or with the color-indexing
 // palette transform (usePalette=true). Each call re-flattens rgba, so the two
 // variants are independent.
-func encodeVP8L(rgba *image.NRGBA, hasAlpha, usePalette bool) (*bytes.Buffer, error) {
+func encodeVP8L(rgba *image.NRGBA, hasAlpha, usePalette, lowEffort bool) (*bytes.Buffer, error) {
     b := &bytes.Buffer{}
     s := &bitWriter{Buffer: b}
 
@@ -357,7 +369,7 @@ func encodeVP8L(rgba *image.NRGBA, hasAlpha, usePalette bool) (*bytes.Buffer, er
     transforms[transformSubGreen] = !usePalette
     transforms[transformColorIndexing] = usePalette
 
-    if err := writeBitStreamData(s, rgba, maxColorCacheBits, transforms); err != nil {
+    if err := writeBitStreamData(s, rgba, maxColorCacheBits, transforms, lowEffort); err != nil {
         return nil, err
     }
 
@@ -383,7 +395,7 @@ func writeBitStreamHeader(w *bitWriter, bounds image.Rectangle, hasAlpha bool) {
     w.writeBits(0, 3)
 }
 
-func writeBitStreamData(w *bitWriter, img image.Image, colorCacheBits int, transforms [4]bool) error {
+func writeBitStreamData(w *bitWriter, img image.Image, colorCacheBits int, transforms [4]bool, lowEffort bool) error {
     pixels, err := flatten(img)
     if err != nil {
         return err
@@ -413,7 +425,7 @@ func writeBitStreamData(w *bitWriter, img image.Image, colorCacheBits int, trans
         width = pw
        
         w.writeBits(uint64(len(pal) - 1), 8);
-        writeImageData(w, pal, len(pal), 1, false, colorCacheBits);
+        writeImageData(w, pal, len(pal), 1, false, colorCacheBits, lowEffort);
     }
 
     if transforms[transformSubGreen] {
@@ -430,7 +442,7 @@ func writeBitStreamData(w *bitWriter, img image.Image, colorCacheBits int, trans
         bits, bw, bh, blocks := applyColorTransform(pixels, width, height)
 
         w.writeBits(uint64(bits - 2), 3);
-        writeImageData(w, blocks, bw, bh, false, colorCacheBits)
+        writeImageData(w, blocks, bw, bh, false, colorCacheBits, lowEffort)
     }
 
     if transforms[transformPredict] {
@@ -440,19 +452,19 @@ func writeBitStreamData(w *bitWriter, img image.Image, colorCacheBits int, trans
         bits, bw, bh, blocks := applyPredictTransform(pixels, width, height)
 
         w.writeBits(uint64(bits - 2), 3);
-        writeImageData(w, blocks, bw, bh, false, colorCacheBits)
+        writeImageData(w, blocks, bw, bh, false, colorCacheBits, lowEffort)
     }
 
     w.writeBits(0, 1) // end of transform
-    writeImageData(w, pixels, width, height, true, colorCacheBits)
+    writeImageData(w, pixels, width, height, true, colorCacheBits, lowEffort)
 
     return nil
 }
 
-func writeImageData(w *bitWriter, pixels []color.NRGBA, width, height int, isRecursive bool, maxCacheBits int) {
+func writeImageData(w *bitWriter, pixels []color.NRGBA, width, height int, isRecursive bool, maxCacheBits int, lowEffort bool) {
     // Encode first: encodeImageData searches 0..maxCacheBits and returns the
     // cache size it chose, which is what gets signalled in the header.
-    encoded, tokenStart, cacheBits := encodeImageData(pixels, width, height, maxCacheBits)
+    encoded, tokenStart, cacheBits := encodeImageData(pixels, width, height, maxCacheBits, lowEffort)
 
     if cacheBits > 0 {
         w.writeBits(1, 1)
@@ -479,7 +491,7 @@ func writeImageData(w *bitWriter, pixels []color.NRGBA, width, height int, isRec
         meta := newTempWriter()
         meta.writeBits(1, 1) // use_meta_huffman = 1
         meta.writeBits(uint64(plan.hBits-2), 3)
-        writeImageData(meta, buildEntropyImage(plan), plan.bw, plan.bh, false, 0)
+        writeImageData(meta, buildEntropyImage(plan), plan.bw, plan.bh, false, 0, lowEffort)
         writeMetaGroups(meta, encoded, tokenStart, plan, width, cacheBits)
         if meta.bitLen() < single.bitLen() {
             appendBits(w, meta)
@@ -563,7 +575,7 @@ func writeTokenCodes(w *bitWriter, encoded []int, i int, codes [][]huffmanCode) 
 // cache-independent (matches come from the hash chain; the cache only converts
 // some literals to references) — then the best size in 0..maxCacheBits is
 // searched on that fixed parse, a port of libwebp's CalculateBestCacheSize.
-func encodeImageData(pixels []color.NRGBA, width, height, maxCacheBits int) ([]int, []int, int) {
+func encodeImageData(pixels []color.NRGBA, width, height, maxCacheBits int, lowEffort bool) ([]int, []int, int) {
     // Pass 1: greedy longest-match parse (cache off). Seeds the cost model.
     encG, tsG := encodeImageDataGreedy(pixels, width, height, 0)
     histoG := computeHistograms(encG, 0)
@@ -571,7 +583,7 @@ func encodeImageData(pixels []color.NRGBA, width, height, maxCacheBits int) ([]i
     // Pass 2: cost-based optimal parse (cache off). The model is derived from
     // the greedy token statistics, so it sees realistic per-symbol bit costs
     // (crucially including distance-code cost, which greedy ignores).
-    matchLen, matchOff := fillMatches(pixels, width)
+    matchLen, matchOff := fillMatches(pixels, width, lowEffort)
     model := buildCostModel(histoG)
     encO, tsO := encodeImageDataOptimal(pixels, width, 0, model, matchLen, matchOff)
 
