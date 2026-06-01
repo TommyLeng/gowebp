@@ -13,6 +13,8 @@ importantly, the **deferred optimisations** so they can be reconsidered later.
 | `ad6d50f` | 2-pixel / 18-bit LZ77 hash | `GetPixPairHash64` | GIF speed −2.5%; size ~neutral |
 | `ea488dc` | color-cache-**size search** 0..10 | `CalculateBestCacheSize` | heidi lossless now **< cwebp**; i1-a lossless −5%; i1-a alpha −3.6% |
 | `7a0a9b4` | auto-palette: ≤16 palette-only / 17–256 try-both / >256 predictor | `EncoderAnalyze`/`AnalyzeEntropy` vp8l_enc.c:109 | 4 anims −1.4..−4.3%; 9710 ALPH 27194→12320; **single-core −42%** (2.338→1.354 s) |
+| `7f3e5db` | single-channel-aware 17–256: alpha→predictor-only, RGB→try-both | own (channel test) | soft-alpha `-a` encode **−43%** (642→367 ms), no size change; fixes auto-palette's alpha slowdown |
+| `75eba41` | low-effort alpha: `EncodeFast` (reduced LZ77 iters/window) for alpha plane | `GetMaxItersForQuality`/`GetWindowSizeForHashChain` (q32) | i1-a alpha **−23%** (283→218 ms), ALPH −0.4%; 9710 GIF **−11%** (1.354→1.201 s); full-lossless unchanged |
 
 Cumulative GIF single-core ≈ 2819 → **~1354 ms (−52%)** (the last −42% is the
 auto-palette commit: binary masks now palette-packed, not predictor-coded).
@@ -77,6 +79,71 @@ encode for rare 17..256 images. Faithful upgrade if ever wanted: port
 `AnalyzeEntropy`'s per-mode entropy estimate (≈80 lines) and pick by estimate.
 
 Throwaway in tree to rm: zz_gifmeasure_test.go.
+
+## FOLLOW-UP — alpha-plane encode speed + single-channel refinement (2026-06-01)
+
+User noticed `-a` (transparent-background) images encode slowly and that the
+auto-palette commit made them SLOWER. Investigated; two findings:
+
+**1. The auto-palette 17..256 try-both was a soft-alpha SPEED regression.**
+Soft-alpha photos (i1-a/i11-a/i18-a) carry a gradient alpha → ~183 distinct
+values → 17..256 band → the committed try-both encoded the alpha plane TWICE.
+Measured (GOMAXPROCS=1): alpha chunk 564 ms, full lossy encode 642 ms — and the
+alpha plane is **83–88% of the whole `-a` encode** (colour VP8-lossy is only
+~78 ms). So the double-encode added ~+45% to every soft-alpha image.
+
+**2. The "faithful" AnalyzeEntropy estimate (spike) FAILS for alpha.** Ported it
+(float port of VP8LBitsEntropy + BitsEntropyRefine + the 5-mode estimate, was in
+analyze.go). It mis-picks palette for i1-a's alpha (estimate: palette 209183 <
+spatial 215169 bits — within 3%) and regressed it 26452 → 33384 B. Root cause:
+the estimate ignores LZ77, so it can't tell a gradient's tiny predictor residuals
+(great LZ77) from its palette indices (poor LZ77). Worse, libwebp's own alpha path
+runs the SAME estimate (alpha_enc.c → VP8LEncodeStream, quality = 8·method = 32),
+so "faithful" would mean matching libwebp's *suboptimal* palette pick — gowebp's
+26452 already BEATS that. Spike reverted.
+
+**Fix that landed — single-channel-aware band (the "scheme 4"):** `analyzeColors`
+returns the colour count AND whether the image is effectively single-channel (R and
+B both constant — an alpha plane is R=B=0). The 17..256 band then splits:
+- **single-channel (alpha) → predictor only** (one encode). Palette can NEVER win
+  on single-channel data: the predictor's residual distribution is more peaked than
+  the raw values, so its entropy is always ≤ the raw index entropy. Verified across
+  gradient / random-noise / real alpha — predictor wins every time, even pure noise.
+- **multi-channel (RGB few-colour graphics) → try-both keep-smaller** (unchanged).
+  Here palette CAN win by collapsing R/G/B into one index; measured on synthetic
+  few-colour RGB it beats predictor by 21–91%, so the try-both safety net stays.
+Result: soft-alpha alpha chunk 564 → 285 ms (**−49%**), full `-a` encode 642 →
+367 ms (**−43%**); i1-a ALPH back to 26452; GIF (≤16) and photos (>256) unchanged;
+round-trip exact. Net vs the committed try-both: alpha is faster, nothing regresses.
+
+**LANDED — low-effort alpha path (reduced LZ77 search).** CPU profile of the alpha
+encode (i1-a): fillMatches (optimal-LZ77 match finder) **38%**, applyPredictTransform
+30.5%, optimal-DP 9.8%, cache-search 6.9%, greedy 5%, meta-Huffman ~0% (alpha too
+uniform). libwebp encodes alpha at quality 32, which gates the LZ77 search:
+GetMaxItersForQuality(32)=16 probes (vs 51 at q75) and GetWindowSizeForHashChain
+=xsize<<6 (vs the full 2^20 window). Ported that as `fillMatches(..., lowEffort)`
+with matchIterMaxLow=16 / matchWindowBitsLow=6, threaded `lowEffort` through
+writeBitStream→encodeVP8L→writeBitStreamData→writeImageData→encodeImageData, and
+added `lossless.EncodeFast` (= Encode with lowEffort) which encodeAlphaChunk now
+uses. Full-image lossless (`lossless.Encode`) keeps full effort — heidi unchanged
+at 1186132. Cache-search was NOT cut (libwebp keeps it at q32: CalculateBestCacheSize
+only disables at q≤25) and predictor search was left alone (30% but size-sensitive;
+libwebp's predictor effort comes from tile size, a separate deferred lever).
+
+Measured (GOMAXPROCS=1): i1-a alpha 283.7 → 218 ms (**−23%**), ALPH 26452 → 26354 B
+(slightly *smaller*); 9710 GIF 1.354 → 1.201 s (**−11%**, its binary masks also
+take the low-effort palette path) with all 4 anims −2..−32 B (no regression);
+heidi/full-lossless unchanged; round-trip exact. The reduced search only changes
+WHICH matches are found (any match is valid), so output stays decodable.
+
+Still open if alpha needs to be even faster: applyPredictTransform (30%) — would
+need a larger predictor tile size (deferred candidate #1) — and the wasted work on
+the 3 constant channels of a single-channel alpha plane (would need a true
+single-channel lossless path, a bigger refactor). Also untried: libwebp's
+WebPCleanupTransparentArea (flatten transparent-region RGB so VP8 colour compresses
+better) — gowebp may not do it for standalone `-a`.
+
+Throwaway to rm: lossless/zz_prof_test.go, zz_alpha_test.go, zz_gifsize_test.go.
 
 ## Quality (RD) sanity-check — GIF→WebP vs gif2webp (2026-05-31)
 
