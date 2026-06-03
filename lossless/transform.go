@@ -5,7 +5,6 @@ import (
     //general
     //------------------------------
     "math"
-    "slices"
     //------------------------------
     //imaging
     //------------------------------
@@ -370,14 +369,17 @@ func histogramEntropy(hist []int, total int) float64 {
 }
 
 func applyPaletteTransform(pixels *[]color.NRGBA, width, height int) ([]color.NRGBA, int, error) {
+    // Build palette with O(1) map lookup; the old slices.Contains was O(palette)
+    // per pixel, giving O(palette·pixels) total — up to 256× slower than a map.
+    colorIndex := make(map[color.NRGBA]int)
     var pal []color.NRGBA
-    for _, p := range (*pixels) {
-        if !slices.Contains(pal, p) {
+    for _, p := range *pixels {
+        if _, exists := colorIndex[p]; !exists {
+            if len(pal) >= 256 {
+                return nil, 0, errors.New("palette exceeds 256 colors")
+            }
+            colorIndex[p] = len(pal)
             pal = append(pal, p)
-        }
-   
-        if len(pal) > 256 {
-            return nil, 0, errors.New("palette exceeds 256 colors")
         }
     }
 
@@ -389,24 +391,22 @@ func applyPaletteTransform(pixels *[]color.NRGBA, width, height int) ([]color.NR
     } else if len(pal) <= 16 {
         size = 2
     }
-    
+
     pw := (width + size - 1) / size
 
-    packed := make([]color.NRGBA, pw * height)
+    packed := make([]color.NRGBA, pw*height)
     for y := 0; y < height; y++ {
         for x := 0; x < pw; x++ {
             pack := 0
             for i := 0; i < size; i++ {
-                px := x * size + i
+                px := x*size + i
                 if px >= width {
                     break
                 }
-
-                idx := slices.Index(pal, (*pixels)[y * width + px])
+                idx := colorIndex[(*pixels)[y*width+px]] // O(1) map lookup
                 pack |= int(idx) << (i * (8 / size))
             }
-
-            packed[y * pw + x] = color.NRGBA{G: uint8(pack), A: 255}
+            packed[y*pw+x] = color.NRGBA{G: uint8(pack), A: 255}
         }
     }
 
