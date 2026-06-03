@@ -23,8 +23,15 @@ const (
     transformPredict        = transform(0)
     transformColor          = transform(1)
     transformSubGreen       = transform(2)
-    transformColorIndexing  = transform(3)     
+    transformColorIndexing  = transform(3)
 )
+
+func iabs(x int) int {
+    if x < 0 {
+        return -x
+    }
+    return x
+}
 
 func applyPredictTransform(pixels []color.NRGBA, width, height int) (int, int, int, []color.NRGBA) {
     tileBits := 4
@@ -237,17 +244,14 @@ func applyFilter(pixels []color.NRGBA, width, x, y, prediction int) color.NRGBA 
     case 10:
         return average2(average2(l, tl), average2(t, tr))
     case 11:
-        pr := float64(l.R) + float64(t.R) - float64(tl.R)
-        pg := float64(l.G) + float64(t.G) - float64(tl.G)
-        pb := float64(l.B) + float64(t.B) - float64(tl.B)
-        pa := float64(l.A) + float64(t.A) - float64(tl.A)
-
-        // Manhattan distances to estimates for left and top pixels.
-        pl := math.Abs(pa - float64(l.A)) + math.Abs(pr - float64(l.R)) +
-              math.Abs(pg - float64(l.G)) + math.Abs(pb - float64(l.B))
-        pt := math.Abs(pa - float64(t.A)) + math.Abs(pr - float64(t.R)) +
-              math.Abs(pg - float64(t.G)) + math.Abs(pb - float64(t.B))
-
+        // Paeth-style predictor: pick l or t based on Manhattan distance to tl.
+        // pa = l.A + t.A - tl.A, so (pa - l.A) = (t.A - tl.A) and
+        // (pa - t.A) = (l.A - tl.A) — the intermediate variables cancel.
+        // All values fit in int; no float64 needed.
+        pl := iabs(int(t.A)-int(tl.A)) + iabs(int(t.R)-int(tl.R)) +
+              iabs(int(t.G)-int(tl.G)) + iabs(int(t.B)-int(tl.B))
+        pt := iabs(int(l.A)-int(tl.A)) + iabs(int(l.R)-int(tl.R)) +
+              iabs(int(l.G)-int(tl.G)) + iabs(int(l.B)-int(tl.B))
         if pl < pt {
             return l
         }
