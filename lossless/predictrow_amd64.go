@@ -22,12 +22,19 @@ func predResSubRowSSE2(pixels []color.NRGBA, dstOff, srcOff int, out []color.NRG
 //go:noescape
 func predResBlackRowSSE2(pixels []color.NRGBA, dstOff int, out []color.NRGBA, n int)
 
-// predictResidualsRow (amd64): SSE2-vectorised for modes 0–4, scalar fallback
-// for modes 5–13 and y==0. Output is byte-identical to predictResidualsRowScalar.
+// predResAvgRowSSE2 computes the averaging predictors 5–10.
+// floor_avg(a,b) = PAVGB(a,b) − PAND(PXOR(a,b), 0x01×16), which equals
+// uint8((a+b)/2) for every (a,b) pair — byte-identical to the scalar.
+//
+//go:noescape
+func predResAvgRowSSE2(pixels []color.NRGBA, mode, curOff, upOff int, out []color.NRGBA, n int)
+
+// predictResidualsRow (amd64): SSE2-vectorised for modes 0–10, scalar fallback
+// for modes 11–13 and y==0. Output is byte-identical to predictResidualsRowScalar.
 func predictResidualsRow(pixels []color.NRGBA, width, mode, xStart, xEnd, y int, out []color.NRGBA) {
 	// Row y==0: boundary rules change per-pixel for every mode — fall to scalar.
-	// Modes 5–13: not yet vectorised; scalar reference.
-	if y == 0 || mode > 4 {
+	// Modes 11–13: not yet vectorised; scalar reference.
+	if y == 0 || mode > 10 {
 		predictResidualsRowScalar(pixels, width, mode, xStart, xEnd, y, out)
 		return
 	}
@@ -69,6 +76,8 @@ func predictResidualsRow(pixels []color.NRGBA, width, mode, xStart, xEnd, y int,
 		predResSubRowSSE2(pixels, curOff, upOff+1, o, n4) // top-right
 	case 4:
 		predResSubRowSSE2(pixels, curOff, upOff-1, o, n4) // top-left
+	default: // modes 5–10: averaging predictors
+		predResAvgRowSSE2(pixels, mode, curOff, upOff, o, n4)
 	}
 
 	// Scalar tail: n & 3 leftover pixels not covered by SSE2 batches.

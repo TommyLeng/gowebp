@@ -97,3 +97,136 @@ loopBlack:
 	SUBQ	$1, SI
 	JNZ	loopBlack
 	RET
+
+// LSB correction mask for floor_avg via PAVGB fixup.
+// PAVGB computes (a+b+1)>>1; subtracting PAND(PXOR(a,b), avgMask) converts
+// it to (a+b)>>1 — matching uint8((a+b)/2) exactly.
+// Proof: (a+b) is odd iff bit-0 of (a XOR b) is 1; that is exactly when
+// PAVGB rounds up by 1. So correction = (a XOR b) & 0x01 per byte.
+DATA	·avgMask<>+0(SB)/8, $0x0101010101010101
+DATA	·avgMask<>+8(SB)/8, $0x0101010101010101
+GLOBL	·avgMask<>(SB), (NOPTR+RODATA), $16
+
+// func predResAvgRowSSE2(pixels []color.NRGBA, mode, curOff, upOff int, out []color.NRGBA, n int)
+//
+// Averaging predictors 5–10.  floor_avg(a,b) is computed as:
+//   PAVGB(a,b) − PAND(PXOR(a,b), avgMask)
+// which is (a+b)>>1 — byte-identical to uint8((a+b)/2) for all 256×256 pairs.
+//
+// Pointer layout (4 bytes per color.NRGBA pixel):
+//   cur = &pixels[curOff]       l  = &pixels[curOff−1]
+//   t   = &pixels[upOff]        tl = &pixels[upOff−1]
+//   tr  = &pixels[upOff+1]
+//
+// FP frame (ABI0):
+//   pixels_base+0(FP)  pixels_len+8(FP)  pixels_cap+16(FP)
+//   mode+24(FP)  curOff+32(FP)  upOff+40(FP)
+//   out_base+48(FP)  out_len+56(FP)  out_cap+64(FP)
+//   n+72(FP)
+//
+// Register map (set before dispatch, live throughout):
+//   AX = pixels.ptr  DI = out.ptr  SI = n/4 (loop counter)
+//   R8 = cur         R9 = t        X4 = avgMask
+//   R10/R11/R12 set per-mode for l/tl/tr as needed.
+//   X0 = cur batch   X1 = first operand / result
+//   X2 = second operand   X3 = third load (mode 10 tr)
+//   X5 = floor_avg temp   X6 = second floor_avg temp (mode 10)
+TEXT ·predResAvgRowSSE2(SB),NOSPLIT,$0-80
+	MOVQ	pixels_base+0(FP), AX
+	MOVQ	mode+24(FP), BX
+	MOVQ	curOff+32(FP), CX
+	MOVQ	upOff+40(FP), DX
+	MOVQ	out_base+48(FP), DI
+	MOVQ	n+72(FP), SI
+
+	LEAQ	(AX)(CX*4), R8		// R8 = cur = &pixels[curOff]
+	LEAQ	(AX)(DX*4), R9		// R9 = t   = &pixels[upOff]
+	SHRQ	$2, SI			// SI = n/4
+	MOVOU	·avgMask<>(SB), X4	// X4 = 0x01×16 correction mask (constant)
+
+	CMPQ	BX, $5;  JEQ	avgMode5
+	CMPQ	BX, $6;  JEQ	avgMode6
+	CMPQ	BX, $7;  JEQ	avgMode7
+	CMPQ	BX, $8;  JEQ	avgMode8
+	CMPQ	BX, $9;  JEQ	avgMode9
+	JMP	avgMode10
+
+// ── mode 5: floor_avg(floor_avg(l, tr), t) ───────────────────────────────
+avgMode5:
+	LEAQ	-4(R8), R10		// R10 = l  = &pixels[curOff−1]
+	LEAQ	4(R9), R12		// R12 = tr = &pixels[upOff+1]
+avgLoop5:
+	MOVOU	(R10), X1
+	MOVOU	(R12), X2
+	MOVO	X1, X5;  PXOR X2, X5;  PAND X4, X5;  PAVGB X2, X1;  PSUBB X5, X1	// X1 = floor_avg(l, tr)
+	MOVOU	(R9), X2
+	MOVO	X1, X5;  PXOR X2, X5;  PAND X4, X5;  PAVGB X2, X1;  PSUBB X5, X1	// X1 = floor_avg(a, t)
+	MOVOU	(R8), X0;  PSUBB X1, X0;  MOVOU X0, (DI)
+	ADDQ	$16, R8;  ADDQ	$16, R10;  ADDQ	$16, R9;  ADDQ	$16, R12;  ADDQ	$16, DI
+	SUBQ	$1, SI;  JNZ	avgLoop5
+	RET
+
+// ── mode 6: floor_avg(l, tl) ─────────────────────────────────────────────
+avgMode6:
+	LEAQ	-4(R8), R10		// R10 = l
+	LEAQ	-4(R9), R11		// R11 = tl = &pixels[upOff−1]
+avgLoop6:
+	MOVOU	(R10), X1
+	MOVOU	(R11), X2
+	MOVO	X1, X5;  PXOR X2, X5;  PAND X4, X5;  PAVGB X2, X1;  PSUBB X5, X1
+	MOVOU	(R8), X0;  PSUBB X1, X0;  MOVOU X0, (DI)
+	ADDQ	$16, R8;  ADDQ	$16, R10;  ADDQ	$16, R11;  ADDQ	$16, DI
+	SUBQ	$1, SI;  JNZ	avgLoop6
+	RET
+
+// ── mode 7: floor_avg(l, t) ──────────────────────────────────────────────
+avgMode7:
+	LEAQ	-4(R8), R10		// R10 = l
+avgLoop7:
+	MOVOU	(R10), X1
+	MOVOU	(R9), X2
+	MOVO	X1, X5;  PXOR X2, X5;  PAND X4, X5;  PAVGB X2, X1;  PSUBB X5, X1
+	MOVOU	(R8), X0;  PSUBB X1, X0;  MOVOU X0, (DI)
+	ADDQ	$16, R8;  ADDQ	$16, R10;  ADDQ	$16, R9;  ADDQ	$16, DI
+	SUBQ	$1, SI;  JNZ	avgLoop7
+	RET
+
+// ── mode 8: floor_avg(tl, t) ─────────────────────────────────────────────
+avgMode8:
+	LEAQ	-4(R9), R11		// R11 = tl
+avgLoop8:
+	MOVOU	(R11), X1
+	MOVOU	(R9), X2
+	MOVO	X1, X5;  PXOR X2, X5;  PAND X4, X5;  PAVGB X2, X1;  PSUBB X5, X1
+	MOVOU	(R8), X0;  PSUBB X1, X0;  MOVOU X0, (DI)
+	ADDQ	$16, R8;  ADDQ	$16, R11;  ADDQ	$16, R9;  ADDQ	$16, DI
+	SUBQ	$1, SI;  JNZ	avgLoop8
+	RET
+
+// ── mode 9: floor_avg(t, tr) ─────────────────────────────────────────────
+avgMode9:
+	LEAQ	4(R9), R12		// R12 = tr
+avgLoop9:
+	MOVOU	(R9), X1
+	MOVOU	(R12), X2
+	MOVO	X1, X5;  PXOR X2, X5;  PAND X4, X5;  PAVGB X2, X1;  PSUBB X5, X1
+	MOVOU	(R8), X0;  PSUBB X1, X0;  MOVOU X0, (DI)
+	ADDQ	$16, R8;  ADDQ	$16, R9;  ADDQ	$16, R12;  ADDQ	$16, DI
+	SUBQ	$1, SI;  JNZ	avgLoop9
+	RET
+
+// ── mode 10: floor_avg(floor_avg(l, tl), floor_avg(t, tr)) ───────────────
+avgMode10:
+	LEAQ	-4(R8), R10		// R10 = l
+	LEAQ	-4(R9), R11		// R11 = tl
+	LEAQ	4(R9), R12		// R12 = tr
+avgLoop10:
+	MOVOU	(R10), X1;  MOVOU	(R11), X2				// a = floor_avg(l, tl)
+	MOVO	X1, X5;  PXOR X2, X5;  PAND X4, X5;  PAVGB X2, X1;  PSUBB X5, X1
+	MOVOU	(R9), X2;  MOVOU	(R12), X3				// b = floor_avg(t, tr)
+	MOVO	X2, X6;  PXOR X3, X6;  PAND X4, X6;  PAVGB X3, X2;  PSUBB X6, X2
+	MOVO	X1, X5;  PXOR X2, X5;  PAND X4, X5;  PAVGB X2, X1;  PSUBB X5, X1	// pred = floor_avg(a, b)
+	MOVOU	(R8), X0;  PSUBB X1, X0;  MOVOU X0, (DI)
+	ADDQ	$16, R8;  ADDQ	$16, R10;  ADDQ	$16, R11;  ADDQ	$16, R9;  ADDQ	$16, R12;  ADDQ	$16, DI
+	SUBQ	$1, SI;  JNZ	avgLoop10
+	RET
