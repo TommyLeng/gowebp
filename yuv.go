@@ -10,6 +10,12 @@ import (
 	"sync"
 )
 
+// computeYNRGBA processes n4 NRGBA/RGBA pixels (n4 a multiple of 4) from
+// pix[srcOff..srcOff+n4*4-1], computing Y = (16839*R + 33059*G + 6420*B +
+// 1081344) >> 16 clamped to [16,235], and stores n4 bytes to dst[dstOff..].
+// Nil if no architecture-specific SIMD implementation is available.
+var computeYNRGBA func(pix []uint8, srcOff, n4 int, dst []uint8, dstOff int)
+
 // yuvImage holds YUV 4:2:0 planar data.
 // The Y plane is padded to the next multiple of 16 in both dimensions by
 // replicating edge pixels (same as libwebp's WebPPictureAlloc in picture_enc.c).
@@ -151,13 +157,40 @@ func rgbaToYUV420(img image.Image, arena *frameArena) *yuvImage {
 		}
 	}
 
+	// NRGBA and RGBA share the [R,G,B,A] per-pixel byte layout, so the same
+	// SIMD Y kernel covers both.  Capture the pointers here (outside the
+	// closure) so the fast path requires no type-switch per row.
+	var nrgbaSrc []uint8
+	var nrgbaStride, nrgbaRowBase, nrgbaN4 int
+	if computeYNRGBA != nil {
+		switch m := img.(type) {
+		case *image.NRGBA:
+			nrgbaSrc = m.Pix
+			nrgbaStride = m.Stride
+			nrgbaRowBase = (oy-m.Rect.Min.Y)*m.Stride + (ox-m.Rect.Min.X)*4
+			nrgbaN4 = w &^ 3
+		case *image.RGBA:
+			nrgbaSrc = m.Pix
+			nrgbaStride = m.Stride
+			nrgbaRowBase = (oy-m.Rect.Min.Y)*m.Stride + (ox-m.Rect.Min.X)*4
+			nrgbaN4 = w &^ 3
+		}
+	}
+
 	// Fill luma plane for the true image region.
 	// Each row writes to non-overlapping indices — safe to parallelise.
 	// On GOMAXPROCS=1 skip goroutine overhead and run sequentially.
 	var yuvWG sync.WaitGroup
 	parallel := runtime.GOMAXPROCS(0) > 1
 	encodeYRow := func(row int) {
-		for px := 0; px < w; px++ {
+		// SIMD fast path for *image.NRGBA / *image.RGBA.
+		pxStart := 0
+		if nrgbaSrc != nil && nrgbaN4 > 0 {
+			computeYNRGBA(nrgbaSrc, nrgbaRowBase+row*nrgbaStride, nrgbaN4, yuv.y, row*mbW)
+			pxStart = nrgbaN4
+		}
+		// Scalar path: full row (generic image types) or n4%4 tail (NRGBA/RGBA).
+		for px := pxStart; px < w; px++ {
 			r, g, b := getPixel(px, row)
 
 			// Y (full resolution)
